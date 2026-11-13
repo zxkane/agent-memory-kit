@@ -4,7 +4,7 @@ import { PATTERNS, scanText } from '../lib/secret-scan.mjs';
 
 test('flags each pattern and reports id and line only', () => {
   const cases = {
-    'aws-access-key-id': 'key AK' + 'IAIOSFODNN7EXAMPLE here',
+    'aws-access-key-id': 'key AK' + 'IAQ3R5T7V9X2Z4B6D8 here',
     'github-token': 'ghp_' + 'a'.repeat(36),
     'slack-token': 'xox' + 'b-123456789012-abcdefghij',
     'api-key-sk': 'sk-' + 'A1b2'.repeat(10),
@@ -36,7 +36,7 @@ test('handles empty input and a very long line', () => {
 });
 
 test('orders findings by line then pattern order, one per pattern per line', () => {
-  const aws = 'AK' + 'IAIOSFODNN7EXAMPLE';
+  const aws = 'AK' + 'IAQ3R5T7V9X2Z4B6D8';
   const text = `${aws} ${aws}\nclean\n${aws} xox` + 'b-123456789012-abcdefghij';
   assert.deepEqual(scanText(text), [
     { id: 'aws-access-key-id', line: 1 },
@@ -117,4 +117,34 @@ test('stays fast on many token-shaped candidates inside one run of token charact
 test('an OpenPGP private key block is flagged', () => {
   assert.deepEqual(scanText(`note\n${'-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----'}\n`), [{ id: 'private-key-block', line: 2 }]);
   assert.deepEqual(scanText('-----BEGIN PGP PUBLIC KEY BLOCK-----\n'), []);
+});
+
+test('visibly fake AWS access key ids are not flagged', () => {
+  for (const tail of ['IOSFODNN7EXAMPLE', 'TESTINVALID00000', 'ABCDFAKE23456789', '0000DUMMY0000000', 'INVALIDKEY234567']) {
+    assert.deepEqual(scanText('key ' + 'AK' + 'IA' + tail), [], tail);
+    assert.deepEqual(scanText('key ' + 'AS' + 'IA' + tail), [], tail);
+  }
+});
+
+test('an ordinary AWS access key id is flagged, also next to a fake one', () => {
+  const real = 'AK' + 'IA' + 'Q3R5T7V9X2Z4B6D8';
+  const fake = 'AK' + 'IA' + 'IOSFODNN7EXAMPLE';
+  assert.deepEqual(scanText(real), [{ id: 'aws-access-key-id', line: 1 }]);
+  assert.deepEqual(scanText(`${fake} then ${real}`), [{ id: 'aws-access-key-id', line: 1 }]);
+  assert.deepEqual(scanText(`${real} # EXAMPLE TEST`), [{ id: 'aws-access-key-id', line: 1 }]);
+});
+
+test('a file, path or directory variable holding a path is not flagged', () => {
+  const cases = ['GH_TOKEN_FILE=/tmp/agent-work/token-file-0001', 'tokenPath: ~/secrets/store/token-2026-01',
+    'password-file = ./config/passwords/db-01.txt', 'SECRET_DIR=../shared/secrets/2026-11-13'];
+  for (const line of cases) assert.deepEqual(scanText(line), [], line);
+});
+
+test('the path exception needs both the name and the value', () => {
+  const slashValue = 'aws_secret_access_key=' + '/' + 'wJalrXUtnFEMI7K7MDENGbPxRfiCY' + 'abc123XYZ0';
+  assert.deepEqual(scanText(slashValue), [{ id: 'secret-assignment', line: 1 }]);
+  const fileNameNotPath = 'API_TOKEN_FILE=' + 'abcDEF1234567890abcDEF1234567890';
+  assert.deepEqual(scanText(fileNameNotPath), [{ id: 'secret-assignment', line: 1 }]);
+  const pathThenReal = 'TOKEN_FILE=/tmp/agent-work/token-file-0001 TOKEN=' + 'abcDEF1234567890abcDEF1234567890';
+  assert.deepEqual(scanText(pathThenReal), [{ id: 'secret-assignment', line: 1 }]);
 });

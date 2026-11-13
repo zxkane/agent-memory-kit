@@ -4,7 +4,11 @@
 // The assignment name may sit inside a longer identifier (CLOUDFLARE_API_TOKEN).
 // Bounded repetition keeps matching linear on very long lines.
 const ASSIGNMENT_RE =
-  /(?:secret|token|password|passwd|api[_-]key|apikey|private_key)[A-Za-z0-9_-]{0,40}["']?\s{0,4}[:=]\s{0,4}["']?([A-Za-z0-9_\-+/=.]{20,})/i;
+  /((?:secret|token|password|passwd|api[_-]key|apikey|private_key)[A-Za-z0-9_-]{0,40})["']?\s{0,4}[:=]\s{0,4}["']?([A-Za-z0-9_\-+/=.]{20,})/i;
+// A variable named ...FILE, ...PATH or ...DIR that holds a location is not a secret. Both the
+// name and the start of the value must say so.
+const LOCATION_NAME_RE = /(?:file|path|dir)$/i;
+const LOCATION_VALUE_RE = /^(?:\/|~\/|\.\/|\.\.\/)/;
 const PLACEHOLDER_RE = /example|placeholder|xxxx|redacted/i;
 
 // A JSON web token at one position, with no limit on any segment. Sticky: it is only tried at
@@ -25,14 +29,26 @@ export const PATTERNS = Object.freeze([
   { id: 'secret-assignment', re: ASSIGNMENT_RE },
 ].map((p) => Object.freeze(p)));
 
-function isRealAssignmentValue(value) {
+// An access key id whose 16 characters contain one of these words is documentation or a fixture.
+const FAKE_KEY_RE = /EXAMPLE|TEST|FAKE|INVALID|DUMMY/;
+const AWS_KEY_RE = /\b(?:AKIA|ASIA)([0-9A-Z]{16})\b/g;
+
+function hasAwsAccessKeyId(line) {
+  for (const m of line.matchAll(AWS_KEY_RE)) {
+    if (!FAKE_KEY_RE.test(m[1])) return true;
+  }
+  return false;
+}
+
+function isRealAssignmentValue(name, value) {
+  if (LOCATION_NAME_RE.test(name) && LOCATION_VALUE_RE.test(value)) return false;
   return /[A-Za-z]/.test(value) && /[0-9]/.test(value) && !PLACEHOLDER_RE.test(value);
 }
 
 function hasSecretAssignment(line) {
   const globalRe = new RegExp(ASSIGNMENT_RE.source, 'gi');
   for (const m of line.matchAll(globalRe)) {
-    if (isRealAssignmentValue(m[1])) return true;
+    if (isRealAssignmentValue(m[1], m[2])) return true;
   }
   return false;
 }
@@ -58,7 +74,7 @@ function hasJwt(line) {
   }
 }
 
-const MATCHERS = { jwt: hasJwt, 'secret-assignment': hasSecretAssignment };
+const MATCHERS = { 'aws-access-key-id': hasAwsAccessKeyId, jwt: hasJwt, 'secret-assignment': hasSecretAssignment };
 
 export function scanText(text) {
   const findings = [];
