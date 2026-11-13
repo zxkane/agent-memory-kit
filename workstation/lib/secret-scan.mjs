@@ -9,10 +9,11 @@ const ASSIGNMENT_RE = new RegExp(
   `(${KEYWORDS}${NAME_TAIL})["']?\\s{0,4}[:=]\\s{0,4}["']?([A-Za-z0-9_\\-+/=.]{20,})`,
   'i',
 );
-// The start of another assignment: a keyword name followed by `:` or `=`.
-const ASSIGNMENT_START_RE = new RegExp(`${KEYWORDS}${NAME_TAIL}["']?\\s{0,4}[:=]`, 'i');
-// Characters after the value that can still complete an assignment start (quote, spaces, `:`/`=`).
+// The start of another assignment: a keyword name followed by `:` or `=`. Group 1 is the name.
+const ASSIGNMENT_START_RE = new RegExp(`(${KEYWORDS}${NAME_TAIL})["']?\\s{0,4}[:=]`, 'gi');
+// Characters after a value run that can still complete an assignment start (quote, 4 spaces, separator).
 const START_LOOKAHEAD = 6;
+const MIN_VALUE_LENGTH = 20;
 // A variable named ...FILE, ...PATH or ...DIR that holds a location is not a secret. Both the
 // name and the start of the value must say so. A value starting with `~` never reaches this
 // test: the value class of the assignment pattern has no `~`.
@@ -49,26 +50,41 @@ function hasAwsAccessKeyId(line) {
   return false;
 }
 
-// The greedy value can swallow a real assignment glued to a path (`DIR=/x/TOKEN=...`); the
-// match then resumes after it and never sees that assignment. One bounded test over the value
-// and the characters after it refuses the exception in that case.
-function isLocationOnly(name, value, after) {
-  if (!LOCATION_NAME_RE.test(name) || !LOCATION_VALUE_RE.test(value)) return false;
-  return !ASSIGNMENT_START_RE.test(value + after.slice(0, START_LOOKAHEAD));
-}
-
-function isRealAssignmentValue(value) {
+function isRealAssignment(name, value) {
+  if (value.length < MIN_VALUE_LENGTH) return false;
+  if (LOCATION_NAME_RE.test(name) && LOCATION_VALUE_RE.test(value)) return false;
   return /[A-Za-z]/.test(value) && /[0-9]/.test(value) && !PLACEHOLDER_RE.test(value);
 }
 
+// The greedy value run can contain the start of another assignment (`DIR=/x/TOKEN=...`), so
+// each assignment is judged on its own name and value. The run is split at every embedded
+// start. The pieces before the last start are judged here; the scan then resumes at the last
+// start, so the ordinary pattern sees it with whatever follows the run. A character lies in at
+// most two matches, because the value of the last start contains no further start.
 function hasSecretAssignment(line) {
   const globalRe = new RegExp(ASSIGNMENT_RE.source, 'gi');
-  for (const m of line.matchAll(globalRe)) {
-    const end = m.index + m[0].length;
-    if (isLocationOnly(m[1], m[2], line.slice(end, end + START_LOOKAHEAD))) continue;
-    if (isRealAssignmentValue(m[2])) return true;
+  let next = 0;
+  for (;;) {
+    globalRe.lastIndex = next;
+    const m = globalRe.exec(line);
+    if (!m) return false;
+    const run = m[2];
+    const matchEnd = m.index + m[0].length;
+    const runStart = matchEnd - run.length;
+    const text = run + line.slice(matchEnd, matchEnd + START_LOOKAHEAD);
+    const starts = [...text.matchAll(ASSIGNMENT_START_RE)].filter((st) => st.index < run.length);
+    if (starts.length === 0) {
+      if (isRealAssignment(m[1], run)) return true;
+      next = matchEnd;
+      continue;
+    }
+    if (isRealAssignment(m[1], text.slice(0, starts[0].index))) return true;
+    for (let i = 0; i + 1 < starts.length; i++) {
+      const valueStart = starts[i].index + starts[i][0].length;
+      if (isRealAssignment(starts[i][1], text.slice(valueStart, starts[i + 1].index))) return true;
+    }
+    next = runStart + starts[starts.length - 1].index;
   }
-  return false;
 }
 
 // Tries the token at each `eyJ` not preceded by a letter, digit or `_` (a hyphen may precede

@@ -157,14 +157,44 @@ test('a value starting with a tilde is not matched as an assignment under any na
 test('a real assignment glued to an excluded path value is still flagged', () => {
   const v = 'abcDEF1234567890abcDEF1234567890';
   for (const line of ['SECRET_DIR=/home/u/x/TOKEN=' + v, 'TOKEN_FILE=./token.txt.TOKEN=' + v,
-    'SECRET_DIR=/home/user2/project/' + 'TOKEN' + ': ' + v]) {
+    'SECRET_DIR=/home/user/project/' + 'TOKEN' + ': ' + v]) {
     assert.deepEqual(scanText(line), [{ id: 'secret-assignment', line: 1 }], line);
   }
 });
 
 test('stays fast on many path assignments with embedded names', () => {
   const start = Date.now();
-  scanText('a_file=/token_file='.repeat(0) + 'a_file=/' + 'token_file=/'.repeat(20000));
   scanText('a_file=/token_file=/'.repeat(20000));
+  assert.ok(Date.now() - start < 1000);
+});
+
+test('every assignment on a line is judged on its own name and value', () => {
+  const v = 'abcDEF1234567890abcDEF1234567890';
+  const K = 'TO' + 'KEN';
+  const flagged = [
+    'X_' + K + '_FILE=/home/example/dir/' + K + '=' + v,
+    'password=/home/user/project/' + K + ': ' + v,
+    'SECRET_DIR=/home/user/project/' + K + ' = ' + v,
+    'SECRET_DIR=/home/user/project/x/' + K + '="' + v + '"',
+    K + '=example-placeholder-value-123456PASSWORD=' + v,
+  ];
+  for (const line of flagged) assert.deepEqual(scanText(line), [{ id: 'secret-assignment', line: 1 }], line);
+});
+
+test('location values are not flagged, also glued or in a colon-separated list', () => {
+  const K = 'TO' + 'KEN';
+  const clean = [
+    'SECRETS_PATH=/home/user01/secrets:/opt/x',
+    'GH_' + K + '_FILE=/tmp/agent-work/token-file-0001',
+    K + '_FILE=/srv/data/' + K + '_DIR=/srv/data/keys-0001/store',
+  ];
+  for (const line of clean) assert.deepEqual(scanText(line), [], line);
+});
+
+test('stays fast on long runs of embedded assignment names', () => {
+  const K = 'TO' + 'KEN';
+  const start = Date.now();
+  scanText('token=/'.repeat(50000));
+  scanText((K + '_FILE=/srv/data/x-0001/').repeat(20000));
   assert.ok(Date.now() - start < 1000);
 });
