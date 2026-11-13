@@ -1,0 +1,206 @@
+# agent-memory-kit
+
+agent-memory-kit keeps the memory notes of coding agents in a private Git repository and syncs them between your machines. Each machine works on its own clone, so a note written on one machine shows up on the others within a few minutes.
+
+## How it works
+
+Each machine keeps a clone of a private notes repository at `~/agent-memory`. Notes live in two places:
+
+- `global/` holds facts that apply everywhere.
+- `projects/<repository directory name>/` holds one folder of notes per repository.
+
+```
+  Claude Code session                       systemd user timer (every 2 minutes)
+  -------------------                       ------------------------------------
+  SessionStart hook                         sync:
+    links the repository's memory folder      1. scan for credentials
+    to projects/<name>/ in the clone          2. commit
+    prints the global index                   3. merge the remote
+  PreToolUse hook                             4. send the result to the remote
+    refuses to write credentials
+    into the clone                                  ~/agent-memory  <---->  remote
+```
+
+- **Clone and links.** The SessionStart hook points Claude Code's per-repository memory folder at the matching project folder in the clone through a symlink. Notes already in that folder are copied over first, and the old folder is kept as a backup. The hook also prints the global index into the session.
+- **Write guard.** The PreToolUse hook refuses to write content that looks like a credential into the clone.
+- **Sync.** A systemd user timer runs a sync every two minutes. The sync scans for credentials, commits, merges the remote and sends the result to the remote. Sessions never run Git on the clone; only the sync does, and it holds a lock while it runs.
+- **Same result on every machine.** The sync commits with a fixed identity (`agent-memory-sync`). Inside the notes clone it ignores your global ignore file (`core.excludesFile`), Git hooks and commit signing settings, so a personal ignore list cannot keep a note or a `.project` file on one machine. Your credential helper and other global settings still apply.
+- **Conflicts.** A note changed on two machines at once is kept twice. The local version is saved as `<name>.conflict-<host>.md` next to the other one.
+- **Secret scan.** Files the scan flags are moved to `~/.local/state/agent-memory/quarantine` instead of being committed.
+
+Nothing happens on a machine until `setup.sh --init` has written `~/.config/agent-memory/config.json`. Without that file every hook exits quietly and the sync does nothing. Hooks are best-effort: an internal error never blocks a session and is appended to `~/.local/state/agent-memory/hook-errors.log`. The only deliberate block is the refusal to write a credential.
+
+## Requirements
+
+- Linux with systemd user units, and user lingering enabled (`loginctl enable-linger`) so that the timer also runs while you are not logged in
+- Node.js 24 or later
+- Git 2.30 or later
+- `flock` (part of util-linux)
+- A private Git repository that the machine can write to without a prompt (an SSH key or a credential helper)
+- Git and the credential helper must be reachable on the timer's `PATH`, which is `<directory of the Node.js binary>:/usr/local/bin:/usr/bin:/bin`. A credential helper installed elsewhere needs an absolute path in your Git configuration.
+
+## Set up the notes repository
+
+Create an empty private repository and add these two files at its root.
+
+`.gitattributes`:
+
+```
+* text=auto eol=lf
+MEMORY.md merge=union
+```
+
+`.gitignore`:
+
+```
+*.tmp.*
+.DS_Store
+```
+
+Also create an empty `global/MEMORY.md`, then commit and push so that the default branch `main` exists before you set up the first machine.
+
+## Install
+
+Clone this repository somewhere permanent. The hooks and the timer call the scripts in this clone by absolute path, so do not move it afterwards without running setup again. The path must not contain a double quote, `$`, a backtick, `%`, a backslash, `#`, `?`, a space or a newline; the same holds for the directory of the Node.js binary.
+
+```
+git clone https://example.com/you/agent-memory-kit.git ~/agent-memory-kit
+cd ~/agent-memory-kit
+./setup.sh --init alpha --repo-url git@example.com:you/agent-notes.git
+```
+
+`alpha` is a short name for this machine: lowercase letters, digits and hyphens, at most 31 characters, starting with a letter or digit. Use a different name on each machine.
+
+`setup.sh` checks everything first and writes nothing if a check fails:
+
+1. Node.js 24 or later, Git and `flock` are installed, and the kit path and the Node.js path contain no unsupported character.
+2. With `--init`, the host name and URL are valid and `~/.config/agent-memory/config.json` does not exist yet.
+3. An existing `~/agent-memory` is a clone on `main`.
+4. An existing `~/.claude/settings.json` is valid JSON holding an object.
+5. With `--init`, or when the clone is missing, the notes repository answers: `git ls-remote --exit-code <url> main` succeeds.
+
+Then it:
+
+1. With `--init`, writes `~/.config/agent-memory/config.json` (mode 600).
+2. Clones the notes repository to `~/agent-memory` if it is missing.
+3. Creates `~/.local/state/agent-memory` (mode 700).
+4. Adds the two hooks to `~/.claude/settings.json`, keeping every other setting, and records the path of the Node.js binary in `workstation/node.local.path` (ignored by Git).
+5. Writes `agent-memory-sync.service` and `agent-memory-sync.timer` to `~/.config/systemd/user/` and enables the timer.
+
+Options:
+
+- `--dry-run` runs the checks, prints what would happen and changes nothing.
+- `--no-enable` writes the units but does not run `systemctl`.
+- `--no-hooks` does everything else but does not register the two hooks, and removes the kit's own hook entries if they are present. Running `setup.sh` later without the flag registers them.
+
+On a machine that already has Claude Code memory, this order lets you move the existing notes and review the result before sessions start adopting folders on their own:
+
+```
+./setup.sh --init alpha --repo-url git@example.com:you/agent-notes.git --no-hooks --no-enable
+workstation/run.sh migrate --dry-run
+workstation/run.sh migrate --apply
+./setup.sh
+```
+
+Running `./setup.sh` again without `--init` is safe. Use it after moving the kit or upgrading Node.js.
+
+## Move existing Claude Code memory
+
+If Claude Code already kept memory notes on this machine before you installed the kit, move them into the notes repository once. Each repository has a folder `~/.claude/projects/<folder name>/memory`. The command finds those folders. For each one that belongs to a repository it copies the notes to `projects/<repository directory name>/` in the clone, renames the old folder to `memory.local-backup-<timestamp>` and puts a link in its place.
+
+```
+workstation/run.sh migrate --dry-run
+workstation/run.sh migrate --apply [--skip-flagged]
+```
+
+Both refuse to run until `~/agent-memory` is a clone (*agent-memory: `<clone>` is not a clone; run setup.sh first.*), and create nothing.
+
+`--dry-run` changes nothing and can be repeated. It prints one line per folder (folder name, number of files, the project it would go to or the reason it is skipped, and the number of secret-scan findings), then a summary. Findings are listed as file, pattern id and line number; the matched text is never shown.
+
+A folder is skipped when:
+
+- it holds anything other than regular files, such as a subfolder or a symlink (`nested-entries`);
+- it is empty (`empty`);
+- no session record names the repository it belongs to (`no-repository`);
+- the repository's directory name is not usable as a project name (`unsafe-project-name`);
+- the repository has no shareable `origin` remote (`no-remote`), see "Day to day";
+- the project folder in the clone is already bound to a different repository, or another folder in the same run claims that name for a different repository (`name-collision`).
+
+A folder whose `memory` is already a link is left out of the list, so running `--apply` again does nothing.
+
+`--apply` holds the sync lock for its whole run. If a sync is running it waits for it, up to two minutes (*agent-memory: a sync is running; try again.*). It then runs one sync, so that the clone and the `.project` files in it are current, and stops without migrating if that sync fails. It refuses to run while any file to be copied is flagged by the secret scan. Remove the credential from the file, or add `--skip-flagged` to leave the flagged files out of the copy; they stay in the backup folder. If `MEMORY.md` itself is flagged it is not copied either, so the copied notes have no index lines: the result lists the folder under `indexNotCopied`, and you need to rebuild the index by hand. The result is printed as JSON; `adoptedFolders` lists, for each folder copied, its `backupDir` and the names of the flagged files left out (`leftOut`).
+
+After a folder is copied, notes whose frontmatter has `type: user` under `metadata:` are moved to `global/`, together with their lines in `MEMORY.md`. If `global/` already has a different file of that name, both are kept as `<name>.<host>.md`.
+
+## Day to day
+
+Write notes as ordinary Markdown files in `global/` or in a project folder; Claude Code's own memory feature does this for you once the link is in place. Each folder may keep a `MEMORY.md` index, and index files from different machines are merged line by line.
+
+Each project folder holds a one-line file named `.project` with the identity of the repository it belongs to: the `origin` URL without scheme, user, password, port or trailing `.git` (for example `example.com/Owner/Repo`). The first session in a repository writes it, and it syncs like any other note. A repository needs an `origin` remote with a shareable URL to share its memory: without one (or with a local path or a `file://` URL) two repositories with the same directory name cannot be told apart, so its memory folder is not linked and stays on this machine. A repository with the same directory name but a different `origin` is not linked to that folder either. If a repository that is already linked changes its remote, the session warns and leaves the link alone. The same repository reached through a different URL form, for example an SSH host alias or different letter case, counts as a different repository. To rebind on purpose, for example after a repository moves to a new remote, delete or edit `.project` in the project folder (`~/agent-memory/projects/<name>/.project`).
+
+The result of the last sync is in `~/.local/state/agent-memory/status.json`: when it last ran, when it last succeeded, whether it committed, merged and pushed, how many files are in quarantine or in conflict, and which project folders had their `.project` claimed by different repositories on two machines (`markerConflicts`).
+
+## Session messages
+
+At the start of a session you may see one of these lines. `<...>` stands for a value filled in by the session.
+
+- *WARNING: shared memory is enabled but `<clone>` is not a usable clone. Notes written now stay local. Run setup.sh from agent-memory-kit.* The clone is missing or broken. Run `setup.sh` again.
+- *This directory is not inside a Git repository, so its memory stays on this machine.*
+- *This repository's directory name cannot be used as a project name, so its memory stays on this machine.* Project names start with a letter or digit and use only letters, digits, `.`, `_` and `-`.
+- *This repository has no shareable "origin" remote, so its memory stays on this machine.* Add an `origin` remote to share it.
+- *This repository's memory folder could not be linked (`<reason>`), so its memory stays on this machine.* The reason is `nested-entries` (the folder holds a subfolder or a symlink; move them out), `foreign-symlink` (it is a link to somewhere else), `not-a-directory`, `link-path-taken` (something appeared at the link path during adoption; the copied notes are in the clone and the old folder is in its backup) or `lock-timeout` (another session was adopting it; the next session retries).
+- *This repository shares its name with another project in shared memory (`<identity>`), so its memory stays on this machine.* See `.project` above.
+- *WARNING: this repository's remote no longer matches the project its memory is linked to (`<identity>`).* The link is left alone; edit `.project` if the repository moved.
+- *WARNING: memory sync has not succeeded since `<time>`. Notes written now stay on this machine until it recovers.* (or *since it was set up*). The timer has not completed a sync recently (default: ten minutes; set `staleAfterSeconds` in the config file to change it). Check `status.json` and `journalctl --user -u agent-memory-sync.service`.
+- *WARNING: the secret scan set aside `<n>` file(s) in `<state directory>`/quarantine. Review them.* See the next section.
+- *WARNING: `<n>` project folder(s) were claimed by a different repository on another machine. Notes written here before that may be mixed in; see `<state directory>`/status.json.* See the next section.
+- *Note: `<n>` note(s) changed on two machines; both versions were kept as \*.conflict-\*.md.*
+
+## When something is set aside
+
+- **Quarantine.** `~/.local/state/agent-memory/quarantine` holds files, or lines taken out of an index file, that the secret scan flagged. They are not committed. Review them, remove the credential, and move the content back into the clone if you still want it. A commit made by hand that contains flagged content is rebuilt by the next sync: its changes are committed again without the flagged files or lines, which go to quarantine.
+- **Conflicts.** A file named `<name>.conflict-<host>.md` is the version from the machine named `<host>`, saved when the same note was changed on two machines at once. Merge the two files by hand and delete the `.conflict-` file.
+- **Project folders claimed twice.** When two machines bound the same project folder to different repositories before they synced, the remote's `.project` is kept and no conflict copy is made, but notes from both repositories may now share the folder. `status.json` lists such folders under `markerConflicts`. Move notes that belong to the other repository by hand. The list, and the session warning with it, stays until you delete `~/.local/state/agent-memory/status.json`; the next sync writes a new one.
+
+## Limits of the secret scan
+
+The scan is a safety net with a fixed list of patterns: cloud access key ids, GitHub and Slack tokens, API keys with a common prefix, private key blocks, JSON web tokens, and assignments such as `password = ...`. It is not a guarantee:
+
+- The pattern list is fixed. A credential in a shape the list does not know will be committed and pushed.
+- Assignments are flagged only when the value is at least 20 characters long and contains both a letter and a digit.
+- Files larger than 5 MiB are set aside in quarantine without being scanned.
+- File names are not scanned.
+
+Keep the notes repository private and do not write credentials into notes.
+
+## If a secret reached the remote
+
+1. Stop the timer on every machine: `systemctl --user stop agent-memory-sync.timer`.
+2. Rotate the credential. Treat it as exposed even after it is removed from the repository.
+3. Rewrite the remote's history to remove it, and force-push the result.
+4. On each machine: move `~/agent-memory` aside (for example to `~/agent-memory.old`), run `./setup.sh --no-enable` to clone afresh, copy over any notes written since the rewrite from the old clone, and start the timer: `systemctl --user start agent-memory-sync.timer`.
+
+A clone that still has the old history refuses to sync with *remote history was rewritten; re-clone `<clone>` (see README)*, so it cannot push the removed commits back.
+
+## Turn it off
+
+On each machine:
+
+1. Delete `~/.config/agent-memory/config.json`. The hooks and the sync stop acting immediately.
+2. Disable the timer: `systemctl --user disable --now agent-memory-sync.timer`.
+3. Remove the two hook entries from `~/.claude/settings.json`: the commands that end with `# agent-memory-kit`, one under `SessionStart` and one under `PreToolUse`. `./setup.sh --no-hooks --no-enable`, run before step 1, does this for you.
+4. To unlink the memory folders: each linked folder `~/.claude/projects/<folder name>/memory` is a symlink into the clone, with a `memory.local-backup-<timestamp>` folder beside it. Remove the symlink, create the `memory` folder again and copy the project's notes from `~/agent-memory/projects/<name>/` into it. Delete the backup folders once you have confirmed that their notes are in the clone.
+
+Your notes stay in `~/agent-memory` and in the remote repository.
+
+## Development
+
+```
+npm test
+```
+
+runs the unit tests (`node --test`, no dependencies) and the setup script test, which uses a temporary home directory and a fake `systemctl`. The tests run Git with a temporary home directory and without the system configuration, so your own Git settings do not change their results. CI also runs them with Git 2.30 in a Debian 11 container.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,397 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { execFile } from 'node:child_process';
+import fs, {
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync,
+  symlinkSync, utimesSync, writeFileSync,
+} from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { mergeIndex, adoptDir, ensureLink } from '../lib/link.mjs';
+import { tempDir } from './helpers.mjs';
+
+const linkModule = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../lib/link.mjs')).href;
+
+const read = (dir, name) => readFileSync(join(dir, name), 'utf8');
+const put = (dir, name, text) => {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), text);
+};
+
+test('mergeIndex unions lines and rewrites renamed links', () => {
+  const out = mergeIndex('- [A](a.md) — one\n', '- [A](a.md) — one\n- [B](b.md) — two\n', new Map([['b.md', 'b.alpha.md']]));
+  assert.equal(out, '- [A](a.md) — one\n- [B](b.alpha.md) — two\n');
+});
+
+test('mergeIndex ignores trailing whitespace, returns empty for empty input', () => {
+  assert.equal(mergeIndex('- [A](a.md)  \n', '- [A](a.md)\n- [C](c.md)', new Map()), '- [A](a.md)  \n- [C](c.md)\n');
+  assert.equal(mergeIndex('', '', new Map()), '');
+});
+
+test('adoptDir copies, skips identical files and keeps both on a collision', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'a.md', 'x');
+  put(src, 'b.md', 'local');
+  put(src, '中文 笔记.md', 'n');
+  put(src, 'MEMORY.md', '- [A](a.md)\n- [B](b.md)\n');
+  put(target, 'a.md', 'x');
+  put(target, 'b.md', 'remote');
+  const r = adoptDir(src, target, 'alpha');
+  assert.deepEqual(r, { copied: 2, renamed: ['b.md -> b.alpha.md'] });
+  assert.equal(read(target, 'b.md'), 'remote');
+  assert.equal(read(target, 'b.alpha.md'), 'local');
+  assert.equal(read(target, '中文 笔记.md'), 'n');
+  assert.match(read(target, 'MEMORY.md'), /\]\(b\.alpha\.md\)/);
+});
+
+test('adoptDir keeps modification time and merges into an existing index', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'a.md', 'x');
+  put(src, 'MEMORY.md', '- [A](a.md)\n- [N](n.md)\n');
+  put(target, 'MEMORY.md', '- [A](a.md)\n');
+  const when = new Date('2026-01-02T03:04:05Z');
+  utimesSync(join(src, 'a.md'), when, when);
+  adoptDir(src, target, 'alpha');
+  assert.equal(statSync(join(target, 'a.md')).mtimeMs, when.getTime());
+  assert.equal(read(target, 'MEMORY.md'), '- [A](a.md)\n- [N](n.md)\n');
+});
+
+test('adoptDir leaves subdirectories and symlinks alone and honours skip', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'a.md', 'x');
+  put(src, 'skipme.md', 's');
+  put(join(src, 'sub'), 'deep.md', 'd');
+  symlinkSync(join(src, 'a.md'), join(src, 'link.md'));
+  const r = adoptDir(src, target, 'alpha', { skip: new Set(['skipme.md']) });
+  assert.deepEqual(r, { copied: 1, renamed: [] });
+  assert.deepEqual(readdirSync(target), ['a.md']);
+});
+
+test('adoptDir picks a free collision name and skips an identical one', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'b.md', 'local');
+  put(src, 'c.md', 'same');
+  put(target, 'b.md', 'remote');
+  put(target, 'b.alpha.md', 'other');
+  put(target, 'c.md', 'different');
+  put(target, 'c.alpha.md', 'same');
+  const r = adoptDir(src, target, 'alpha');
+  assert.deepEqual(r, { copied: 1, renamed: ['b.md -> b.alpha-2.md'] });
+  assert.equal(read(target, 'b.alpha.md'), 'other');
+  assert.equal(read(target, 'b.alpha-2.md'), 'local');
+  assert.deepEqual(readdirSync(target).sort(), ['b.alpha-2.md', 'b.alpha.md', 'b.md', 'c.alpha.md', 'c.md']);
+});
+
+test('adoptDir copies an incoming index through mergeIndex when the target has none', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'b.md', 'local');
+  put(src, 'MEMORY.md', '- [B](b.md)\n');
+  put(target, 'b.md', 'remote');
+  const r = adoptDir(src, target, 'alpha');
+  assert.equal(r.copied, 1);
+  assert.equal(read(target, 'MEMORY.md'), '- [B](b.alpha.md)\n');
+});
+
+test('ensureLink links a missing folder', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha' });
+  assert.equal(r.action, 'linked');
+  assert.equal(realpathSync(linkPath), realpathSync(targetDir));
+});
+
+test('ensureLink adopts a real folder and leaves a backup', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha', now: new Date('2026-11-13T07:00:00Z') });
+  assert.equal(r.action, 'adopted');
+  assert.equal(r.copied, 1);
+  assert.equal(r.backupDir, join(dirname(linkPath), 'memory.local-backup-20261113T070000Z'));
+  assert.ok(lstatSync(linkPath).isSymbolicLink());
+  assert.equal(read(targetDir, 'note.md'), 'hello');
+  assert.equal(read(r.backupDir, 'note.md'), 'hello');
+});
+
+test('ensureLink gives a second backup in the same second a suffix', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  const now = new Date('2026-11-13T07:00:00Z');
+  mkdirSync(join(dirname(linkPath), 'memory.local-backup-20261113T070000Z'), { recursive: true });
+  put(linkPath, 'note.md', 'hello');
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha', now });
+  assert.equal(r.backupDir, join(dirname(linkPath), 'memory.local-backup-20261113T070000Z-2'));
+});
+
+test('ensureLink is idempotent and leaves a foreign symlink alone', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const otherLink = join(base, 'projects', 'q', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  const elsewhere = join(base, 'elsewhere');
+  mkdirSync(elsewhere);
+  const opts = { linkPath, targetDir, host: 'alpha' };
+  ensureLink(opts);
+  assert.equal(ensureLink(opts).action, 'ok');
+  mkdirSync(dirname(otherLink), { recursive: true });
+  symlinkSync(elsewhere, otherLink);
+  const r = ensureLink({ ...opts, linkPath: otherLink });
+  assert.equal(r.action, 'skipped');
+  assert.equal(r.reason, 'foreign-symlink');
+  assert.equal(realpathSync(otherLink), realpathSync(elsewhere));
+});
+
+test('two concurrent adoptions lose nothing and leave one link', async (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  put(linkPath, 'MEMORY.md', '- [N](note.md)\n');
+  const script = `import(${JSON.stringify(linkModule)}).then((m) => {
+    process.stdout.write(JSON.stringify(m.ensureLink(JSON.parse(process.argv[1]))));
+  });`;
+  const run = () => new Promise((resolve, reject) => {
+    execFile(process.execPath, ['-e', script, JSON.stringify({ linkPath, targetDir, host: 'alpha' })], (err, out) => {
+      if (err) reject(err); else resolve(JSON.parse(out));
+    });
+  });
+  const results = await Promise.all([run(), run()]);
+  assert.ok(lstatSync(linkPath).isSymbolicLink());
+  assert.deepEqual(readdirSync(targetDir).sort(), ['MEMORY.md', 'note.md']);
+  assert.equal(read(targetDir, 'note.md'), 'hello');
+  assert.equal(readdirSync(dirname(linkPath)).filter((n) => n.startsWith('memory.local-backup-')).length, 1);
+  assert.deepEqual(readdirSync(dirname(linkPath)).filter((n) => n.endsWith('.adopt-lock')), []);
+  assert.ok(results.every((r) => ['adopted', 'linked', 'ok'].includes(r.action)));
+});
+
+test('a stale adoption lock is removed', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const lock = `${linkPath}.adopt-lock`;
+  mkdirSync(lock);
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(lock, old, old);
+  assert.equal(ensureLink({ linkPath, targetDir, host: 'alpha' }).action, 'adopted');
+  assert.deepEqual(readdirSync(dirname(linkPath)).filter((n) => n.includes('.adopt-lock')), []);
+});
+
+test('works when the folder name begins with a dash', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', '-srv-repos-x', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  assert.equal(ensureLink({ linkPath, targetDir, host: 'alpha' }).action, 'linked');
+});
+
+test('adoptDir keeps index links correct when a collision name is also a source file', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'b.md', 'A');
+  put(src, 'b.alpha.md', 'B');
+  put(src, 'MEMORY.md', '- [x](b.md)\n- [y](b.alpha.md)\n');
+  put(target, 'b.md', 'R');
+  const r = adoptDir(src, target, 'alpha');
+  assert.deepEqual(r, { copied: 2, renamed: ['b.md -> b.alpha-2.md'] });
+  assert.equal(read(target, 'b.md'), 'R');
+  assert.equal(read(target, 'b.alpha.md'), 'B');
+  assert.equal(read(target, 'b.alpha-2.md'), 'A');
+  assert.equal(read(target, 'MEMORY.md'), '- [x](b.alpha-2.md)\n- [y](b.alpha.md)\n');
+});
+
+test('mergeIndex rewrites links in one pass', () => {
+  const out = mergeIndex('', '- [x](a.md)\n- [y](b.md)\n', new Map([['a.md', 'b.md'], ['b.md', 'c.md']]));
+  assert.equal(out, '- [x](b.md)\n- [y](c.md)\n');
+});
+
+test('a held lock makes ensureLink give up within the bound and change nothing', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const lock = `${linkPath}.adopt-lock`;
+  mkdirSync(lock);
+  const started = Date.now();
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha', lockWaitMs: 200 });
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(r.action, 'skipped');
+  assert.equal(r.reason, 'lock-timeout');
+  assert.ok(lstatSync(linkPath).isDirectory());
+  assert.equal(read(linkPath, 'note.md'), 'hello');
+  assert.deepEqual(readdirSync(targetDir), []);
+  assert.ok(lstatSync(lock).isDirectory());
+});
+
+test('ensureLink leaves skipped files in the backup and does not copy them', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'keep.md', 'K');
+  put(linkPath, 'leak.md', 'L');
+  const r = ensureLink({
+    linkPath, targetDir, host: 'alpha', now: new Date('2026-11-13T07:00:00Z'), skip: new Set(['leak.md']),
+  });
+  assert.equal(r.action, 'adopted');
+  assert.equal(r.copied, 1);
+  assert.deepEqual(readdirSync(targetDir), ['keep.md']);
+  assert.equal(read(r.backupDir, 'leak.md'), 'L');
+  assert.ok(lstatSync(linkPath).isSymbolicLink());
+});
+
+// Replaces a node:fs function for the modules under test until the test ends.
+function patchFs(t, name, wrap) {
+  const original = fs[name];
+  fs[name] = wrap(original);
+  syncBuiltinESMExports();
+  t.after(() => {
+    fs[name] = original;
+    syncBuiltinESMExports();
+  });
+}
+
+// Every entry under dir with its kind and content, to show that nothing changed.
+function snapshot(dir) {
+  const out = [];
+  const walk = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true }).sort((x, y) => x.name.localeCompare(y.name))) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) {
+        out.push(`${p}/`);
+        walk(p);
+      } else if (e.isSymbolicLink()) out.push(`${p} -> ${fs.readlinkSync(p)}`);
+      else out.push(`${p}: ${readFileSync(p, 'utf8')}`);
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+test('an interrupted copy leaves no note under its final name', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'a.md', 'the whole note\n');
+  put(src, 'MEMORY.md', '- [A](a.md)\n');
+  patchFs(t, 'copyFileSync', () => (from, to) => {
+    writeFileSync(to, 'the who');
+    throw Object.assign(new Error('interrupted'), { code: 'EINTR' });
+  });
+  assert.throws(() => adoptDir(src, target, 'alpha'), /interrupted/);
+  assert.equal(existsSync(join(target, 'a.md')), false);
+  assert.deepEqual(readdirSync(target).filter((n) => !/\.tmp\./.test(n)), []);
+});
+
+test('an interrupted index write leaves the index as it was', (t) => {
+  const base = tempDir(t);
+  const src = join(base, 'src');
+  const target = join(base, 'target');
+  put(src, 'MEMORY.md', '- [B](b.md)\n');
+  put(target, 'MEMORY.md', '- [A](a.md)\n');
+  patchFs(t, 'renameSync', (original) => (from, to) => {
+    if (String(to) === join(target, 'MEMORY.md')) throw Object.assign(new Error('interrupted'), { code: 'EINTR' });
+    return original(from, to);
+  });
+  assert.throws(() => adoptDir(src, target, 'alpha'), /interrupted/);
+  assert.equal(read(target, 'MEMORY.md'), '- [A](a.md)\n');
+});
+
+test('a note written after the first pass and before the backup reaches the target', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  patchFs(t, 'renameSync', (original) => (from, to) => {
+    if (from === linkPath && String(to).includes('.local-backup-')) writeFileSync(join(linkPath, 'late.md'), 'late\n');
+    return original(from, to);
+  });
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha' });
+  assert.deepEqual([r.action, r.copied], ['adopted', 2]);
+  assert.equal(read(targetDir, 'late.md'), 'late\n');
+  assert.equal(read(r.backupDir, 'late.md'), 'late\n');
+  assert.ok(lstatSync(linkPath).isSymbolicLink());
+});
+
+test('a memory folder holding a subfolder or a symlink is left exactly as it was', (t) => {
+  for (const extra of ['subfolder', 'symlink']) {
+    const base = tempDir(t);
+    const linkPath = join(base, 'projects', 'p', 'memory');
+    const targetDir = join(base, 'clone', 'notes');
+    put(linkPath, 'note.md', 'hello');
+    if (extra === 'subfolder') put(join(linkPath, 'sub'), 'deep.md', 'deep');
+    else symlinkSync(join(linkPath, 'note.md'), join(linkPath, 'alias.md'));
+    const before = snapshot(join(base, 'projects'));
+    const r = ensureLink({ linkPath, targetDir, host: 'alpha' });
+    assert.deepEqual([r.action, r.reason, r.copied, r.backupDir], ['skipped', 'nested-entries', 0, null], extra);
+    assert.deepEqual(snapshot(join(base, 'projects')), before, extra);
+    assert.deepEqual(readdirSync(targetDir), [], extra);
+  }
+});
+
+test('a link path taken by something else after the backup is reported, a matching link is not', (t) => {
+  for (const [what, action, reason] of [['file', 'skipped', 'link-path-taken'], ['link', 'adopted', null]]) {
+    const base = tempDir(t);
+    const linkPath = join(base, 'projects', 'p', 'memory');
+    const targetDir = join(base, 'clone', 'notes');
+    put(linkPath, 'note.md', 'hello');
+    const restore = fs.renameSync;
+    patchFs(t, 'renameSync', (original) => (from, to) => {
+      const out = original(from, to);
+      if (from === linkPath) {
+        if (what === 'file') writeFileSync(linkPath, 'in the way');
+        else symlinkSync(targetDir, linkPath);
+      }
+      return out;
+    });
+    const r = ensureLink({ linkPath, targetDir, host: 'alpha', now: new Date('2026-11-13T07:00:00Z') });
+    fs.renameSync = restore;
+    syncBuiltinESMExports();
+    assert.deepEqual([r.action, r.reason], [action, reason], what);
+    assert.equal(r.backupDir, join(dirname(linkPath), 'memory.local-backup-20261113T070000Z'));
+    assert.equal(read(targetDir, 'note.md'), 'hello');
+    assert.equal(read(r.backupDir, 'note.md'), 'hello');
+  }
+});
+
+test('a stale lock is claimed by one process only', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const lock = `${linkPath}.adopt-lock`;
+  mkdirSync(lock);
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(lock, old, old);
+  let claims = 0;
+  patchFs(t, 'renameSync', (original) => (from, to) => {
+    if (from !== lock) return original(from, to);
+    claims += 1;
+    // Another process claims the stale lock first, then takes a fresh one.
+    original(from, `${lock}.other-claim`);
+    fs.rmSync(`${lock}.other-claim`, { recursive: true });
+    try {
+      return original(from, to);
+    } finally {
+      mkdirSync(lock);
+    }
+  });
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha', lockWaitMs: 300 });
+  assert.equal(claims, 1);
+  assert.deepEqual([r.action, r.reason], ['skipped', 'lock-timeout']);
+  assert.ok(lstatSync(linkPath).isDirectory());
+  assert.ok(lstatSync(lock).isDirectory());
+});

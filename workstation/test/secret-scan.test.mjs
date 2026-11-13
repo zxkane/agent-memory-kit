@@ -1,0 +1,120 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { PATTERNS, scanText } from '../lib/secret-scan.mjs';
+
+test('flags each pattern and reports id and line only', () => {
+  const cases = {
+    'aws-access-key-id': 'key AK' + 'IAIOSFODNN7EXAMPLE here',
+    'github-token': 'ghp_' + 'a'.repeat(36),
+    'slack-token': 'xox' + 'b-123456789012-abcdefghij',
+    'api-key-sk': 'sk-' + 'A1b2'.repeat(10),
+    'private-key-block': '-----BEGIN OPENSSH ' + 'PRIVATE KEY-----',
+    'jwt': 'ey' + 'JhbGciOiJIUzI1NiJ9.ey' + 'JzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop',
+    'secret-assignment': 'CLOUDFLARE_API_TOKEN=' + 'abcDEF1234567890abcDEF1234567890abcdEF12',
+  };
+  for (const [id, line] of Object.entries(cases)) {
+    assert.deepEqual(scanText(`first line\n${line}\n`), [{ id, line: 2 }], id);
+  }
+});
+
+test('does not flag ordinary note content', () => {
+  const clean = [
+    'commit 9fceb02d0ae598e95dc970b74767f19372d61af8 fixed it',
+    'arn:aws:lambda:us-east-1:111122223333:function:my-function',
+    'see https://example.com/a/very/long/path/with/many/segments/0123456789abcdef',
+    'API_KEY=<your-key>',
+    'export TOKEN=${GITHUB_TOKEN}',
+    'the token is stored in SSM under /app/prod/token',
+    'password: example-placeholder-value-123456',
+  ].join('\n');
+  assert.deepEqual(scanText(clean), []);
+});
+
+test('handles empty input and a very long line', () => {
+  assert.deepEqual(scanText(''), []);
+  assert.deepEqual(scanText('a'.repeat(200000)), []);
+});
+
+test('orders findings by line then pattern order, one per pattern per line', () => {
+  const aws = 'AK' + 'IAIOSFODNN7EXAMPLE';
+  const text = `${aws} ${aws}\nclean\n${aws} xox` + 'b-123456789012-abcdefghij';
+  assert.deepEqual(scanText(text), [
+    { id: 'aws-access-key-id', line: 1 },
+    { id: 'aws-access-key-id', line: 3 },
+    { id: 'slack-token', line: 3 },
+  ]);
+});
+
+test('secret-assignment requires a letter and a digit in the value', () => {
+  assert.deepEqual(scanText('token=' + 'a'.repeat(30)), []);
+  assert.deepEqual(scanText('token=' + '1'.repeat(30)), []);
+  assert.deepEqual(scanText('token: "' + 'a1'.repeat(15) + '"'), [{ id: 'secret-assignment', line: 1 }]);
+});
+
+test('secret-assignment finds a real value after an excluded one on the same line', () => {
+  const line = `password=${'xxxx1'.repeat(5)} sec` + `ret=abcDEF1234567890abcDEF1234`;
+  assert.deepEqual(scanText(line), [{ id: 'secret-assignment', line: 1 }]);
+});
+
+test('exposes the pattern table in order', () => {
+  assert.deepEqual(PATTERNS.map((p) => p.id), [
+    'aws-access-key-id', 'github-token', 'slack-token', 'api-key-sk',
+    'private-key-block', 'jwt', 'secret-assignment',
+  ]);
+  assert.ok(PATTERNS.every((p) => p.re instanceof RegExp));
+});
+
+test('stays fast on long runs of a token prefix inside its own character class', () => {
+  for (const unit of ['eyJ-', 'sk-', 'xoxb-', 'ghp_', 'github_pat_', 'AKIA']) {
+    const start = Date.now();
+    scanText(unit.repeat(50000));
+    assert.ok(Date.now() - start < 1000, unit);
+  }
+});
+
+test('stays fast on pathological repeated keywords', () => {
+  const start = Date.now();
+  scanText('token'.repeat(40000));
+  assert.ok(Date.now() - start < 2000);
+});
+
+const jwt = () => 'ey' + 'JhbGciOiJIUzI1NiJ9.ey' + 'JzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop';
+
+test('a JSON web token directly after a hyphen is flagged', () => {
+  for (const line of [`-${jwt()}`, `see -${jwt()}`, `id-${jwt()}`]) {
+    assert.deepEqual(scanText(line), [{ id: 'jwt', line: 1 }], line);
+  }
+});
+
+test('a JSON web token glued to a letter, digit or underscore is not taken for one', () => {
+  for (const prefix of ['a', '7', '_']) assert.deepEqual(scanText(`${prefix}${jwt()}`), [], prefix);
+});
+
+test('a JSON web token with a very long first segment is flagged', () => {
+  const longHeader = 'ey' + 'J' + 'h'.repeat(4997);
+  assert.equal(longHeader.length, 5000);
+  const token = `${longHeader}.ey` + 'JzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop';
+  assert.deepEqual(scanText(`note\nheader ${token} end\n`), [{ id: 'jwt', line: 2 }]);
+});
+
+test('two JSON web tokens on one line give one finding for that line', () => {
+  assert.deepEqual(scanText(`${jwt()} and -${jwt()}`), [{ id: 'jwt', line: 1 }]);
+});
+
+test('stays fast on a hyphen-heavy line with token-shaped segments', () => {
+  const start = Date.now();
+  scanText(`${'-eyJ' + 'a'.repeat(30)}.`.repeat(20000));
+  scanText(`-ey${'J-'.repeat(50000)}`);
+  assert.ok(Date.now() - start < 1000);
+});
+
+test('stays fast on many token-shaped candidates inside one run of token characters', () => {
+  const start = Date.now();
+  scanText(('eyJ' + 'a'.repeat(20) + '-').repeat(10000));
+  assert.ok(Date.now() - start < 1000);
+});
+
+test('an OpenPGP private key block is flagged', () => {
+  assert.deepEqual(scanText(`note\n${'-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----'}\n`), [{ id: 'private-key-block', line: 2 }]);
+  assert.deepEqual(scanText('-----BEGIN PGP PUBLIC KEY BLOCK-----\n'), []);
+});
