@@ -9,17 +9,20 @@ const ASSIGNMENT_RE = new RegExp(
   `(${KEYWORDS}${NAME_TAIL})["']?\\s{0,4}[:=]\\s{0,4}["']?([A-Za-z0-9_\\-+/=.]{20,})`,
   'i',
 );
-// The start of another assignment: a keyword name followed by `:` or `=`. Group 1 is the name.
+// An assignment start: a keyword name, an optional quote, up to four spaces and `:` or `=`.
+// Group 1 is the name. Starts are found anywhere on a line, also inside another value.
 const ASSIGNMENT_START_RE = new RegExp(`(${KEYWORDS}${NAME_TAIL})["']?\\s{0,4}[:=]`, 'gi');
-// Characters after a value run that can still complete an assignment start (quote, 4 spaces, separator).
-const START_LOOKAHEAD = 6;
+// What may stand between the separator and the value.
+const VALUE_LEAD_RE = /\s{0,4}["']?/y;
+const VALUE_CHAR_RE = /[A-Za-z0-9_\-+/=.]/;
 const MIN_VALUE_LENGTH = 20;
 // A variable named ...FILE, ...PATH or ...DIR that holds a location is not a secret. Both the
-// name and the start of the value must say so. A value starting with `~` never reaches this
-// test: the value class of the assignment pattern has no `~`.
+// name and the start of the value must say so. A value starting with `~` is not matched as an
+// assignment in the first place: `~` is not a value character.
 const LOCATION_NAME_RE = /(?:file|path|dir)$/i;
 const LOCATION_VALUE_RE = /^(?:\/|\.\/|\.\.\/)/;
-const PLACEHOLDER_RE = /example|placeholder|xxxx|redacted/i;
+const PLACEHOLDER_WORDS = ['example', 'placeholder', 'xxxx', 'redacted'];
+const PLACEHOLDER_RE = new RegExp(PLACEHOLDER_WORDS.join('|'), 'i');
 
 // A JSON web token at one position, with no limit on any segment. Sticky: it is only tried at
 // the candidate positions that hasJwt picks, so it is not a search pattern on its own.
@@ -50,41 +53,51 @@ function hasAwsAccessKeyId(line) {
   return false;
 }
 
-function isRealAssignment(name, value) {
-  if (value.length < MIN_VALUE_LENGTH) return false;
-  if (LOCATION_NAME_RE.test(name) && LOCATION_VALUE_RE.test(value)) return false;
-  return /[A-Za-z]/.test(value) && /[0-9]/.test(value) && !PLACEHOLDER_RE.test(value);
+function isRealValue(value) {
+  return value.length >= MIN_VALUE_LENGTH && /[A-Za-z]/.test(value) && /[0-9]/.test(value) &&
+    !PLACEHOLDER_RE.test(value);
 }
 
-// The greedy value run can contain the start of another assignment (`DIR=/x/TOKEN=...`), so
-// each assignment is judged on its own name and value. The run is split at every embedded
-// start. The pieces before the last start are judged here; the scan then resumes at the last
-// start, so the ordinary pattern sees it with whatever follows the run. A character lies in at
-// most two matches, because the value of the last start contains no further start.
+// Every assignment start on the line is judged twice: with its whole value, and with the value
+// cut at the next start that begins inside it. A value that is only a location is not judged.
+//
+// All starts are found in one pass. Many starts can share one run of value characters, so the
+// run is scanned once and records its last letter, its last digit and the start of its last
+// placeholder word: a suffix of the run has a letter, a digit or a placeholder exactly when
+// that position lies at or after the suffix's beginning. The cut values lie between one start's
+// value and the next start, so they do not overlap and the work stays linear.
 function hasSecretAssignment(line) {
-  const globalRe = new RegExp(ASSIGNMENT_RE.source, 'gi');
-  let next = 0;
-  for (;;) {
-    globalRe.lastIndex = next;
-    const m = globalRe.exec(line);
-    if (!m) return false;
-    const run = m[2];
-    const matchEnd = m.index + m[0].length;
-    const runStart = matchEnd - run.length;
-    const text = run + line.slice(matchEnd, matchEnd + START_LOOKAHEAD);
-    const starts = [...text.matchAll(ASSIGNMENT_START_RE)].filter((st) => st.index < run.length);
-    if (starts.length === 0) {
-      if (isRealAssignment(m[1], run)) return true;
-      next = matchEnd;
-      continue;
+  const starts = [...line.matchAll(ASSIGNMENT_START_RE)];
+  let runEnd = -1;
+  let lastLetter = -1;
+  let lastDigit = -1;
+  let lastPlaceholder = -1;
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i];
+    VALUE_LEAD_RE.lastIndex = start.index + start[0].length;
+    VALUE_LEAD_RE.exec(line);
+    const valueStart = VALUE_LEAD_RE.lastIndex;
+    if (valueStart >= runEnd) {
+      lastLetter = -1;
+      lastDigit = -1;
+      runEnd = valueStart;
+      while (runEnd < line.length && VALUE_CHAR_RE.test(line[runEnd])) {
+        const code = line.charCodeAt(runEnd);
+        if (code >= 48 && code <= 57) lastDigit = runEnd;
+        else if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) lastLetter = runEnd;
+        runEnd += 1;
+      }
+      const lower = line.slice(valueStart, runEnd).toLowerCase();
+      lastPlaceholder = Math.max(...PLACEHOLDER_WORDS.map((word) => lower.lastIndexOf(word)));
+      if (lastPlaceholder >= 0) lastPlaceholder += valueStart;
     }
-    if (isRealAssignment(m[1], text.slice(0, starts[0].index))) return true;
-    for (let i = 0; i + 1 < starts.length; i++) {
-      const valueStart = starts[i].index + starts[i][0].length;
-      if (isRealAssignment(starts[i][1], text.slice(valueStart, starts[i + 1].index))) return true;
-    }
-    next = runStart + starts[starts.length - 1].index;
+    if (runEnd - valueStart < MIN_VALUE_LENGTH) continue;
+    if (LOCATION_NAME_RE.test(start[1]) && LOCATION_VALUE_RE.test(line.slice(valueStart, valueStart + 3))) continue;
+    if (lastLetter >= valueStart && lastDigit >= valueStart && lastPlaceholder < valueStart) return true;
+    const following = starts[i + 1];
+    if (following && following.index < runEnd && isRealValue(line.slice(valueStart, following.index))) return true;
   }
+  return false;
 }
 
 // Tries the token at each `eyJ` not preceded by a letter, digit or `_` (a hyphen may precede

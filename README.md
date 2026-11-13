@@ -167,7 +167,7 @@ At the start of a session you may see one of these lines. `<...>` stands for a v
 The scan is a safety net with a fixed list of patterns: cloud access key ids, GitHub and Slack tokens, API keys with a common prefix, private key blocks, JSON web tokens, and assignments such as `password = ...`. It is not a guarantee:
 
 - The pattern list is fixed. A credential in a shape the list does not know will be committed and pushed.
-- Assignments are flagged only when the value is at least 20 characters long and contains both a letter and a digit.
+- Assignments are flagged only when the value is at least 20 characters long and contains both a letter and a digit. A `name: value` or `name=value` pair is judged wherever it stands on the line, also when it is written inside another value without a space: once with its whole value, and once with the value cut at the next such name.
 - An access key id is not flagged when its 16 characters after the `AKIA` or `ASIA` prefix contain `EXAMPLE`, `TEST`, `FAKE`, `INVALID` or `DUMMY` in upper case, because documentation and fixtures use such ids.
 - An assignment is not flagged when the name ends with `FILE`, `PATH` or `DIR` (any case) and the value starts with `/`, `./` or `../` (a value starting with `~` is not matched as an assignment in the first place). Both must hold; a value that only starts with `/` under another name is still flagged, and so is a real assignment written directly after the path on the same line.
 - Files larger than 5 MiB are set aside in quarantine without being scanned.

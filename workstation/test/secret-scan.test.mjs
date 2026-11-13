@@ -198,3 +198,60 @@ test('stays fast on long runs of embedded assignment names', () => {
   scanText((K + '_FILE=/srv/data/x-0001/').repeat(20000));
   assert.ok(Date.now() - start < 1000);
 });
+
+test('an assignment written inside another value is judged on its own and on the whole value', () => {
+  const v = 'abcDEF1234567890abcDEF1234567890';
+  const K = 'TO' + 'KEN';
+  const S = 'SEC' + 'RET';
+  const flagged = [
+    'secret=abc123def' + K + '=ghi456jklmno',
+    'password=abc123XYZ' + K.toLowerCase() + 'QWERTY456=',
+    'password=Xy7Qw9Rt2Lm4' + K + '=Pz8Kv3Nb6Hj1',
+    'password="Xy7Qw9Rt2Lm4Pz8K' + S.toLowerCase() + '=Kv3Nb6"',
+    'api_key=Qm9vbGVhbjEy' + K.toLowerCase() + 'U2VjcmV0VmFsdWUx==',
+    'X_FILE=/p/' + K + '=abc1' + S + '=def2ghi3jklmnopq',
+    'password=/home/user/project/' + K + ': /example/' + S + '=abc1' + K + '=def2ghi3jkl',
+    K + '=' + v + S + '=example-value',
+  ];
+  for (const line of flagged) assert.deepEqual(scanText(line), [{ id: 'secret-assignment', line: 1 }], line);
+  assert.deepEqual(scanText(K + '=your-example-token-goes-here-123456'), []);
+});
+
+test('stays fast on long runs of assignment starts', () => {
+  const start = Date.now();
+  scanText('token='.repeat(50000) + 'x'.repeat(100000));
+  scanText(('token' + 'a'.repeat(39) + '=').repeat(8000));
+  scanText('token: '.repeat(50000));
+  assert.ok(Date.now() - start < 1000);
+});
+
+test('no generated line that whole-value judging flags is missed', () => {
+  const fragments = ['TO' + 'KEN=', 'secret: ', 'password = ', 'api_key="', "API_KEY='", 'GH_TOKEN_FILE=', 'tokenPath: ',
+    'SECRET_DIR=', 'abcDEF1234567890abcDEF1234567890', 'abc123def456', 'Xy7Q', '/home/user/', './', '../', '/',
+    'example', 'placeholder', 'xxxx', 'redacted', 'token', 'secret', 'password', '=', ':', ' ', '    ', '"', "'",
+    '-', '_', '.', ';', '?'];
+  const patternSource = PATTERNS.find((p) => p.id === 'secret-assignment').re.source;
+  let seed = 12345;
+  const next = (n) => {
+    seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+    return (seed >>> 8) % n;
+  };
+  const oracle = (line) => {
+    for (const m of line.matchAll(new RegExp(patternSource, 'gi'))) {
+      const [, name, value] = m;
+      if (/(?:file|path|dir)$/i.test(name) && /^(?:\/|\.\/|\.\.\/)/.test(value)) continue;
+      if (/[A-Za-z]/.test(value) && /[0-9]/.test(value) && !/example|placeholder|xxxx|redacted/i.test(value)) return true;
+    }
+    return false;
+  };
+  let expected = 0;
+  for (let i = 0; i < 20000; i++) {
+    const parts = [];
+    for (let n = 2 + next(12); n > 0; n--) parts.push(fragments[next(fragments.length)]);
+    const line = parts.join('');
+    if (!oracle(line)) continue;
+    expected += 1;
+    if (scanText(line).length === 0) assert.fail(`line ${i} (length ${line.length}) is flagged by whole-value judging but not by the scan`);
+  }
+  assert.ok(expected >= 1000, `only ${expected} oracle findings`);
+});
