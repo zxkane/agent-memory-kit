@@ -3,12 +3,21 @@
 
 // The assignment name may sit inside a longer identifier (CLOUDFLARE_API_TOKEN).
 // Bounded repetition keeps matching linear on very long lines.
-const ASSIGNMENT_RE =
-  /((?:secret|token|password|passwd|api[_-]key|apikey|private_key)[A-Za-z0-9_-]{0,40})["']?\s{0,4}[:=]\s{0,4}["']?([A-Za-z0-9_\-+/=.]{20,})/i;
+const KEYWORDS = '(?:secret|token|password|passwd|api[_-]key|apikey|private_key)';
+const NAME_TAIL = '[A-Za-z0-9_-]{0,40}';
+const ASSIGNMENT_RE = new RegExp(
+  `(${KEYWORDS}${NAME_TAIL})["']?\\s{0,4}[:=]\\s{0,4}["']?([A-Za-z0-9_\\-+/=.]{20,})`,
+  'i',
+);
+// The start of another assignment: a keyword name followed by `:` or `=`.
+const ASSIGNMENT_START_RE = new RegExp(`${KEYWORDS}${NAME_TAIL}["']?\\s{0,4}[:=]`, 'i');
+// Characters after the value that can still complete an assignment start (quote, spaces, `:`/`=`).
+const START_LOOKAHEAD = 6;
 // A variable named ...FILE, ...PATH or ...DIR that holds a location is not a secret. Both the
-// name and the start of the value must say so.
+// name and the start of the value must say so. A value starting with `~` never reaches this
+// test: the value class of the assignment pattern has no `~`.
 const LOCATION_NAME_RE = /(?:file|path|dir)$/i;
-const LOCATION_VALUE_RE = /^(?:\/|~\/|\.\/|\.\.\/)/;
+const LOCATION_VALUE_RE = /^(?:\/|\.\/|\.\.\/)/;
 const PLACEHOLDER_RE = /example|placeholder|xxxx|redacted/i;
 
 // A JSON web token at one position, with no limit on any segment. Sticky: it is only tried at
@@ -40,15 +49,24 @@ function hasAwsAccessKeyId(line) {
   return false;
 }
 
-function isRealAssignmentValue(name, value) {
-  if (LOCATION_NAME_RE.test(name) && LOCATION_VALUE_RE.test(value)) return false;
+// The greedy value can swallow a real assignment glued to a path (`DIR=/x/TOKEN=...`); the
+// match then resumes after it and never sees that assignment. One bounded test over the value
+// and the characters after it refuses the exception in that case.
+function isLocationOnly(name, value, after) {
+  if (!LOCATION_NAME_RE.test(name) || !LOCATION_VALUE_RE.test(value)) return false;
+  return !ASSIGNMENT_START_RE.test(value + after.slice(0, START_LOOKAHEAD));
+}
+
+function isRealAssignmentValue(value) {
   return /[A-Za-z]/.test(value) && /[0-9]/.test(value) && !PLACEHOLDER_RE.test(value);
 }
 
 function hasSecretAssignment(line) {
   const globalRe = new RegExp(ASSIGNMENT_RE.source, 'gi');
   for (const m of line.matchAll(globalRe)) {
-    if (isRealAssignmentValue(m[1], m[2])) return true;
+    const end = m.index + m[0].length;
+    if (isLocationOnly(m[1], m[2], line.slice(end, end + START_LOOKAHEAD))) continue;
+    if (isRealAssignmentValue(m[2])) return true;
   }
   return false;
 }

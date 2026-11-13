@@ -135,7 +135,7 @@ test('an ordinary AWS access key id is flagged, also next to a fake one', () => 
 });
 
 test('a file, path or directory variable holding a path is not flagged', () => {
-  const cases = ['GH_TOKEN_FILE=/tmp/agent-work/token-file-0001', 'tokenPath: ~/secrets/store/token-2026-01',
+  const cases = ['GH_TOKEN_FILE=/tmp/agent-work/token-file-0001',
     'password-file = ./config/passwords/db-01.txt', 'SECRET_DIR=../shared/secrets/2026-11-13'];
   for (const line of cases) assert.deepEqual(scanText(line), [], line);
 });
@@ -147,4 +147,24 @@ test('the path exception needs both the name and the value', () => {
   assert.deepEqual(scanText(fileNameNotPath), [{ id: 'secret-assignment', line: 1 }]);
   const pathThenReal = 'TOKEN_FILE=/tmp/agent-work/token-file-0001 TOKEN=' + 'abcDEF1234567890abcDEF1234567890';
   assert.deepEqual(scanText(pathThenReal), [{ id: 'secret-assignment', line: 1 }]);
+});
+
+test('a value starting with a tilde is not matched as an assignment under any name', () => {
+  assert.deepEqual(scanText('tokenPath: ~/secrets/store/token-2026-01'), []);
+  assert.deepEqual(scanText('API_TOKEN=~/secrets/store/token-2026-01'), []);
+});
+
+test('a real assignment glued to an excluded path value is still flagged', () => {
+  const v = 'abcDEF1234567890abcDEF1234567890';
+  for (const line of ['SECRET_DIR=/home/u/x/TOKEN=' + v, 'TOKEN_FILE=./token.txt.TOKEN=' + v,
+    'SECRET_DIR=/home/user2/project/' + 'TOKEN' + ': ' + v]) {
+    assert.deepEqual(scanText(line), [{ id: 'secret-assignment', line: 1 }], line);
+  }
+});
+
+test('stays fast on many path assignments with embedded names', () => {
+  const start = Date.now();
+  scanText('a_file=/token_file='.repeat(0) + 'a_file=/' + 'token_file=/'.repeat(20000));
+  scanText('a_file=/token_file=/'.repeat(20000));
+  assert.ok(Date.now() - start < 1000);
 });

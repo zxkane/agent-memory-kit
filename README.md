@@ -169,7 +169,7 @@ The scan is a safety net with a fixed list of patterns: cloud access key ids, Gi
 - The pattern list is fixed. A credential in a shape the list does not know will be committed and pushed.
 - Assignments are flagged only when the value is at least 20 characters long and contains both a letter and a digit.
 - An access key id is not flagged when its 16 characters after the `AKIA` or `ASIA` prefix contain `EXAMPLE`, `TEST`, `FAKE`, `INVALID` or `DUMMY` in upper case, because documentation and fixtures use such ids.
-- An assignment is not flagged when the name ends with `FILE`, `PATH` or `DIR` (any case) and the value starts with `/`, `~/`, `./` or `../`. Both must hold; a value that only starts with `/` under another name is still flagged.
+- An assignment is not flagged when the name ends with `FILE`, `PATH` or `DIR` (any case) and the value starts with `/`, `./` or `../` (a value starting with `~` is not matched as an assignment in the first place). Both must hold; a value that only starts with `/` under another name is still flagged, and so is a real assignment written directly after the path on the same line.
 - Files larger than 5 MiB are set aside in quarantine without being scanned.
 - File names are not scanned.
 
