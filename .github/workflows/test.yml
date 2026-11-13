@@ -25,4 +25,8 @@ jobs:
     steps:
       - run: git --version
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      # The container runs as root but the checkout belongs to the runner's user.
+      # The tests run Git with a private home directory, so a safe.directory
+      # setting would not reach them; own the files instead.
+      - run: chown -R "$(id -u):$(id -g)" .
       - run: npm test
