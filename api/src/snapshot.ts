@@ -80,36 +80,39 @@ export function createSnapshots(store: Store): { load(): Promise<Note[]> } {
   };
 }
 
-function readSnapshot(snapshotText: string | null): { doc: Record<string, unknown>; notes: Note[] } {
-  let doc: Record<string, unknown> = { version: 1, notes: [] };
-  let notes: Note[] = [];
-  if (snapshotText !== null) {
-    try {
-      const parsed: unknown = JSON.parse(snapshotText);
-      if (
-        typeof parsed === 'object' &&
-        parsed !== null &&
-        !Array.isArray(parsed) &&
-        Array.isArray((parsed as { notes?: unknown }).notes)
-      ) {
-        doc = parsed as Record<string, unknown>;
-        notes = (doc.notes as unknown[]).filter(isNote);
-      }
-    } catch {
-      // unreadable input starts a new snapshot
-    }
+// A missing snapshot (null) starts a new one. Text that is not a snapshot throws the same fixed
+// error as search: a write must never replace what it cannot read.
+function readSnapshot(snapshotText: string | null): { doc: Record<string, unknown>; entries: unknown[]; notes: Note[] } {
+  if (snapshotText === null) return { doc: { version: 1, notes: [] }, entries: [], notes: [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshotText);
+  } catch {
+    throw unreadable();
   }
-  return { doc, notes };
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    !Array.isArray((parsed as { notes?: unknown }).notes)
+  ) {
+    throw unreadable();
+  }
+  const doc = parsed as Record<string, unknown>;
+  const entries = doc.notes as unknown[];
+  return { doc, entries, notes: entries.filter(isNote) };
 }
 
 export function listNotes(snapshotText: string | null): Note[] {
   return readSnapshot(snapshotText).notes;
 }
 
+// Entries that are not well-formed notes are kept as they are, after the sorted notes.
 export function upsertNote(snapshotText: string | null, note: Note): string {
-  const { doc, notes } = readSnapshot(snapshotText);
+  const { doc, entries, notes } = readSnapshot(snapshotText);
   const merged = notes.filter((n) => n.path !== note.path);
   merged.push(note);
   merged.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return JSON.stringify({ ...doc, version: 1, notes: merged });
+  const kept = entries.filter((e) => !isNote(e));
+  return JSON.stringify({ ...doc, version: 1, notes: [...merged, ...kept] });
 }

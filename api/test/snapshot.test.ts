@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ApiError } from '../src/errors.ts';
-import { createSnapshots, upsertNote, type Note } from '../src/snapshot.ts';
+import { createSnapshots, listNotes, upsertNote, type Note } from '../src/snapshot.ts';
 import { fakeStore } from './fake-store.ts';
 
 const note = (path: string, extra: Partial<Note> = {}): Note => ({
@@ -86,11 +86,30 @@ test('load: malformed entries and bad paths are skipped', async () => {
   assert.deepEqual((await createSnapshots(s).load()).map((n) => n.path), ['global/ok.md']);
 });
 
-test('upsertNote: starts from null or unreadable input', () => {
-  for (const input of [null, 'garbage', '{"notes":3}']) {
-    const out = JSON.parse(upsertNote(input, note('global/a.md')));
-    assert.deepEqual(out, { version: 1, notes: [note('global/a.md')] });
+test('upsertNote: starts a new snapshot from null', () => {
+  const out = JSON.parse(upsertNote(null, note('global/a.md')));
+  assert.deepEqual(out, { version: 1, notes: [note('global/a.md')] });
+});
+
+test('upsertNote and listNotes: unreadable text throws 500 internal', () => {
+  for (const input of ['garbage', '{"notes":3}', '{"notes":5}', '{"version":1}', 'null', '[]', '{"notes":[']) {
+    for (const fn of [() => upsertNote(input, note('global/a.md')), () => listNotes(input)]) {
+      assert.throws(
+        fn,
+        (err: unknown) =>
+          err instanceof ApiError &&
+          err.status === 500 &&
+          err.code === 'internal' &&
+          err.message === 'the search snapshot is unreadable',
+      );
+    }
   }
+});
+
+test('upsertNote: malformed entries survive unchanged', () => {
+  const odd = [null, 'str', { path: 'global/x.md', name: 'n' }, 7];
+  const out = JSON.parse(upsertNote(doc([...odd, note('global/b.md')]), note('global/a.md'))) as { notes: unknown[] };
+  assert.deepEqual(out.notes, [note('global/a.md'), note('global/b.md'), ...odd]);
 });
 
 test('upsertNote: adds, replaces by path and sorts', () => {

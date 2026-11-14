@@ -14,7 +14,11 @@ import type { Store } from '../store.ts';
 import { update } from '../store.ts';
 import { parseWrite } from '../validate.ts';
 
+// Quotas that add up: 16 scopes of at most 240,000 bytes is 3,840,000, below the 4,000,000-byte
+// total, so a full scope cannot take room from another one.
 const MAX_SCOPE_NOTES = 200;
+const MAX_SCOPE_BYTES = 240_000;
+const MAX_SCOPES = 16;
 const MAX_SNAPSHOT_BYTES = 4_000_000;
 const SNAPSHOT_KEY = 'index/agents.json';
 
@@ -27,6 +31,7 @@ function refuseCredentials(text: string): void {
 
 export async function memoryWrite(deps: { store: Store }, body: unknown): Promise<{ path: string; created: boolean }> {
   const req = parseWrite(body);
+  refuseCredentials(req.agent);
   refuseCredentials(req.name);
   refuseCredentials(req.description);
   refuseCredentials(req.content);
@@ -39,9 +44,13 @@ export async function memoryWrite(deps: { store: Store }, body: unknown): Promis
 
   await update(store, SNAPSHOT_KEY, (current) => {
     const notes = listNotes(current);
+    const inScope = (n: { path: string }) => n.path.startsWith(scopePrefix);
     created = !notes.some((n) => n.path === path);
-    if (created && notes.filter((n) => n.path.startsWith(scopePrefix)).length >= MAX_SCOPE_NOTES) {
+    if (created && notes.filter(inScope).length >= MAX_SCOPE_NOTES) {
       throw new ApiError(400, 'scope_full', 'this scope already holds the maximum number of notes');
+    }
+    if (!notes.some(inScope) && new Set(notes.filter((n) => n.path.startsWith('agents/')).map((n) => n.path.split('/')[1])).size >= MAX_SCOPES) {
+      throw new ApiError(400, 'store_full', 'the agent memory store is full');
     }
     const next = upsertNote(current, {
       path,
@@ -50,6 +59,9 @@ export async function memoryWrite(deps: { store: Store }, body: unknown): Promis
       type: req.type,
       body: req.content,
     });
+    if (Buffer.byteLength(JSON.stringify(listNotes(next).filter(inScope)), 'utf8') > MAX_SCOPE_BYTES) {
+      throw new ApiError(400, 'scope_full', 'this scope has no room for more note text');
+    }
     if (Buffer.byteLength(next, 'utf8') > MAX_SNAPSHOT_BYTES) {
       throw new ApiError(400, 'store_full', 'the agent memory store is full');
     }

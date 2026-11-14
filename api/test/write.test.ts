@@ -296,3 +296,140 @@ test('a name that looks like a credential is refused and never echoed', async ()
   });
   assert.deepEqual(log, []);
 });
+
+type Entry = { path: string; name: string; description: string; type: string; body: string };
+const entry = (agent: string, name: string, body: string, description = 'd'): Entry => ({
+  path: `agents/${agent}/${name}.md`,
+  name,
+  description,
+  type: 'reference',
+  body,
+});
+const sizeOf = (entries: Entry[]) => Buffer.byteLength(JSON.stringify(entries), 'utf8');
+
+// Entries f0..f4 plus one last entry, whose body is sized so the scope is exactly `target` bytes.
+function scopeOfBytes(agent: string, target: number, lastName = 'zlast', lastDescription = 'd', count = 5): Entry[] {
+  const fillers = Array.from({ length: count }, (_, i) => entry(agent, `f${i}`, 'a'.repeat(40_000)));
+  const probe = [...fillers, entry(agent, lastName, '', lastDescription)];
+  const room = target - sizeOf(probe);
+  assert.ok(room >= 0);
+  return [...fillers, entry(agent, lastName, 'a'.repeat(room), lastDescription)];
+}
+
+const snap = (entries: unknown[]) => JSON.stringify({ version: 1, notes: entries });
+
+test('per-scope byte quota: a write over it is refused, another scope is unaffected', async () => {
+  const initial = snap(scopeOfBytes('hermes', 239_000));
+  const store = fakeStore({ [SNAP_KEY]: initial });
+  const log = logWrites(store);
+  await assert.rejects(memoryWrite({ store }, body({ name: 'extra', content: 'x'.repeat(2_000) })), (e: unknown) => {
+    assert.ok(e instanceof ApiError);
+    assert.equal(e.status, 400);
+    assert.equal(e.code, 'scope_full');
+    return true;
+  });
+  assert.deepEqual(log, []);
+  assert.equal(store.objects.get(SNAP_KEY)!.body, initial);
+  const res = await memoryWrite({ store }, body({ agent: 'roomy', name: 'extra', content: 'x'.repeat(2_000) }));
+  assert.equal(res.created, true);
+});
+
+test('a scope at the byte quota still accepts a replacement that keeps or shrinks it', async () => {
+  const at = scopeOfBytes('hermes', 240_000, 'my-note', 'A note');
+  assert.equal(sizeOf(at), 240_000);
+  const last = at[at.length - 1]!;
+  const store = fakeStore({ [SNAP_KEY]: snap(at) });
+  // Same content: the stored entry is identical, so the size is unchanged.
+  const same = await memoryWrite({ store }, body({ content: last.body }));
+  assert.deepEqual(same, { path: NOTE_KEY, created: false });
+  const shrunk = await memoryWrite({ store }, body({ content: 'short' }));
+  assert.equal(shrunk.created, false);
+  // Growing it by one byte is refused.
+  await assert.rejects(
+    memoryWrite({ store: fakeStore({ [SNAP_KEY]: snap(at) }) }, body({ content: last.body + 'a' })),
+    (e: unknown) => e instanceof ApiError && e.code === 'scope_full',
+  );
+});
+
+test('the byte quota counts UTF-8 bytes, not characters', async () => {
+  const initial = snap(scopeOfBytes('hermes', 200_000, 'zlast', 'd', 4));
+  const store = fakeStore({ [SNAP_KEY]: initial });
+  const content = '记'.repeat(16_000); // 16,000 characters, 48,000 bytes
+  assert.ok(200_000 + content.length < 240_000);
+  await assert.rejects(memoryWrite({ store }, body({ name: 'cjk', content })), (e: unknown) => {
+    return e instanceof ApiError && e.code === 'scope_full';
+  });
+  assert.equal(store.objects.get(SNAP_KEY)!.body, initial);
+});
+
+test('the snapshot backstop counts UTF-8 bytes, not characters', async () => {
+  const initial = snap([entry('big', 'filler', '记'.repeat(1_320_000))]);
+  assert.ok(initial.length < 4_000_000 - 50_000);
+  const store = fakeStore({ [SNAP_KEY]: initial });
+  await assert.rejects(memoryWrite({ store }, body({ content: 'x'.repeat(50_000) })), (e: unknown) => {
+    return e instanceof ApiError && e.code === 'store_full';
+  });
+  assert.equal(store.objects.get(SNAP_KEY)!.body, initial);
+});
+
+test('the 17th scope is refused; an existing scope still works with 16', async () => {
+  const entries = Array.from({ length: 16 }, (_, i) => entry(`s${i}`, 'one', 'b'));
+  const initial = snap(entries);
+  const store = fakeStore({ [SNAP_KEY]: initial });
+  const log = logWrites(store);
+  await assert.rejects(memoryWrite({ store }, body()), (e: unknown) => {
+    assert.ok(e instanceof ApiError);
+    assert.equal(e.status, 400);
+    assert.equal(e.code, 'store_full');
+    return true;
+  });
+  assert.deepEqual(log, []);
+  assert.equal(store.objects.get(SNAP_KEY)!.body, initial);
+  const res = await memoryWrite({ store }, body({ agent: 's3', name: 'two' }));
+  assert.deepEqual(res, { path: 'agents/s3/two.md', created: true });
+});
+
+test('an unreadable snapshot is never rewritten', async () => {
+  for (const text of ['{"version":1,"notes":[{"path":', '{"notes": 5}', 'null']) {
+    const store = fakeStore({ [SNAP_KEY]: text });
+    const log = logWrites(store);
+    await assert.rejects(memoryWrite({ store }, body()), (e: unknown) => {
+      assert.ok(e instanceof ApiError);
+      assert.equal(e.status, 500);
+      assert.equal(e.code, 'internal');
+      assert.equal(e.message, 'the search snapshot is unreadable');
+      return true;
+    });
+    assert.deepEqual(log, []);
+    assert.equal(store.objects.get(SNAP_KEY)!.body, text);
+    assert.equal(store.objects.size, 1);
+  }
+});
+
+test('malformed entries inside a readable snapshot survive a write unchanged', async () => {
+  const odd = [null, 'str', { path: 'agents/x/y.md', name: 'only-a-name' }, 7];
+  const store = fakeStore({ [SNAP_KEY]: snap([...odd, entry('other', 'kept', 'k')]) });
+  await memoryWrite({ store }, body());
+  const notes = (JSON.parse(store.objects.get(SNAP_KEY)!.body) as { notes: unknown[] }).notes;
+  for (const o of odd) assert.ok(notes.some((n) => JSON.stringify(n) === JSON.stringify(o)));
+  assert.equal(notes.length, odd.length + 2);
+});
+
+test('the per-scope count matches the whole agent name: ab does not count against a', async () => {
+  const store = fakeStore({ [SNAP_KEY]: snapshotOf(200, 'ab') });
+  const res = await memoryWrite({ store }, body({ agent: 'a', name: 'first' }));
+  assert.deepEqual(res, { path: 'agents/a/first.md', created: true });
+});
+
+test('an agent name that looks like a credential is refused and never echoed', async () => {
+  const agent = ['sk', '-', 'abcd1234'.repeat(4)].join('');
+  const store = fakeStore();
+  const log = logWrites(store);
+  await assert.rejects(memoryWrite({ store }, body({ agent })), (err: unknown) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.code, 'secret_detected');
+    assert.ok(!err.message.includes(agent));
+    return true;
+  });
+  assert.deepEqual(log, []);
+});
