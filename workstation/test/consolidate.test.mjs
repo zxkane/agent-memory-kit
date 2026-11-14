@@ -645,15 +645,75 @@ test('a model that gives no result still has its valid edits judged and applied'
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^organize p: applied, 3 change\(s\), USD unknown, stopped: no-result$/m);
   assert.equal(existsSync(join(f.repo, 'projects/p/b.md')), false);
-  // A model that did not run and changed nothing does not count as organized.
+  // A model that ran but gave no result spent its budget: the scope counts as tried.
   f.instruct({ p: { silent: true } });
   write(f.repo, 'projects/p/c.md', note('c', 'C', 'Another.'));
   write(f.repo, 'projects/p/MEMORY.md', index('a.md', 'c.md'));
   f.sync();
-  const digest = f.readState().projects.p.organizedDigest;
   const again = f.run('organize');
   assert.match(again.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: no-result$/m);
-  assert.equal(f.readState().projects.p.organizedDigest, digest);
+  assert.equal(f.readState().projects.p.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
+});
+
+test('organize counts a timed-out model as tried, and one that could not start as not tried', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.env.AGENT_MEMORY_MODEL_TIMEOUT_MS = '1000';
+  f.instruct({ p: { sleepMs: 30000 } });
+  let r = f.run('organize');
+  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: timeout$/m);
+  let entry = f.readState().projects.p;
+  assert.equal(entry.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
+  assert.ok(!Number.isNaN(Date.parse(entry.lastOrganize)));
+
+  write(f.repo, 'projects/p/c.md', note('c', 'C', 'Another.'));
+  f.sync();
+  f.setConfig({ command: join(f.tmp, 'no-such-model') });
+  const before = entry;
+  r = f.run('organize');
+  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: spawn-failed$/m);
+  entry = f.readState().projects.p;
+  assert.equal(entry.organizedDigest, before.organizedDigest);
+  assert.equal(entry.lastOrganize, before.lastOrganize);
+});
+
+test('extract orders by lastExtractTried: a project rejected every run does not starve the others', (t) => {
+  const f = extractFixture(t);
+  f.setConfig({ maxProjects: 1 });
+  f.seed({ 'projects/q/MEMORY.md': index('y.md'), 'projects/q/y.md': note('y', 'Y', 'Another project.') });
+  // q's session is older than p's, so p goes first while neither has been tried.
+  f.addSession('-work-q', 'q', 'a question in q', 3 * 3600 * 1000);
+  f.instruct({ p: { writes: { 'a.md': '' } } });
+  let r = f.run('extract');
+  assert.match(r.stdout, /^extract p: rejected, nothing applied/m);
+  let p = f.readState().projects.p;
+  assert.equal(p.lastExtract, undefined);
+  assert.ok(!Number.isNaN(Date.parse(p.lastExtractTried)));
+  r = f.run('extract');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'q']);
+  p = f.readState().projects.p;
+  assert.equal(p.lastExtract, undefined);
+  assert.ok(f.readState().projects.q.lastExtractTried);
+});
+
+test('state without lastExtractTried loads as never tried; unknown keys survive', (t) => {
+  const f = extractFixture(t);
+  f.setConfig({ maxProjects: 1 });
+  f.seed({ 'projects/q/MEMORY.md': index('y.md'), 'projects/q/y.md': note('y', 'Y', 'Another project.') });
+  f.addSession('-work-q', 'q', 'a question in q', 3 * 3600 * 1000);
+  const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.stateFile(), JSON.stringify({
+    // q's window is older, but q was tried recently and p never was (an earlier version wrote no
+    // lastExtractTried): p goes first.
+    format: 'old', projects: { p: { lastExtract: days(1), note: 'kept' }, q: { lastExtract: days(5), lastExtractTried: days(0.05) } },
+  }));
+  f.run('extract');
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
+  const state = f.readState();
+  assert.equal(state.format, 'old');
+  assert.equal(state.projects.p.note, 'kept');
 });
 
 test('the run stops starting scopes once its summed cost reaches maxProjects × maxBudgetUsd', (t) => {
@@ -934,7 +994,13 @@ test('an error in a step is reported as such and stops the run with exit 1', { s
   duplicateProject(f);
   f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
   f.instruct({ p: { chmod: { notes: 0o000 } } });
-  const r = f.run('organize');
+  let r;
+  try {
+    r = f.run('organize');
+  } finally {
+    // The driver removes the work folder; should it not, the temporary folder must still go.
+    spawnSync('chmod', ['-R', 'u+rwx', f.state]);
+  }
   assert.equal(r.status, 1);
   assert.match(r.stdout, /^organize p: error, 0 change\(s\), USD 0\.25, stopped: completed$/m);
   assert.match(r.stdout, /^ {2}- the apply step failed: EACCES/m);
@@ -991,4 +1057,80 @@ test('run folders older than a day are removed at the start unless marked by --k
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(readdirSync(root).sort(), ['fresh-run', 'kept-run']);
+});
+
+// Makes the n-th `git fetch` of the run slow: it touches `<tmp>/in-step`, then sleeps 3 s. Every
+// fetch is counted in `<tmp>/fetches`. Each sync fetches once: the snapshot step's sync is the
+// first fetch of a scope, the sync before applying the second, the sync after applying the third.
+function slowFetch(f, n) {
+  const count = join(f.tmp, 'fetches');
+  const marker = join(f.tmp, 'in-step');
+  wrapGit(f, `for a in "$@"; do if [[ "$a" == fetch ]]; then k=$(cat "${count}" 2>/dev/null || echo 0); k=$((k+1)); echo $k > "${count}"; if [[ $k == ${n} ]]; then touch "${marker}"; sleep 3; fi; fi; done`);
+  return { marker, fetches: () => Number(readFileSync(count, 'utf8').trim()) };
+}
+
+// Starts `run.sh consolidate <args>` and, once `marker` exists (a locked step is then running),
+// sends `signal` to the driver alone, or with `group` to its whole process group as a terminal
+// does (the step dies too). Returns the exit status and stdout.
+async function signalDuringStep(t, f, signal, marker, args, { group = false } = {}) {
+  const child = spawn(RUN_SH, ['consolidate', ...args], { env: f.env, stdio: ['ignore', 'pipe', 'ignore'], detached: group });
+  let stdout = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
+  t.after(() => {
+    try { process.kill(group ? -child.pid : child.pid, 'SIGKILL'); } catch { /* already gone */ }
+  });
+  assert.ok(await waitFor(() => existsSync(marker)), 'the step started');
+  process.kill(group ? -child.pid : child.pid, signal);
+  return { status: await exited, stdout };
+}
+
+test('a signal during a locked step ends the run as aborted; the model is never started', async (t) => {
+  for (const [signal, code, group] of [['SIGINT', 130, true], ['SIGINT', 130, false], ['SIGTERM', 143, false]]) {
+    const f = fixture(t);
+    duplicateProject(f);
+    f.instruct(mergeInstruction());
+    const { marker } = slowFetch(f, 1);
+    const head = f.head();
+    const { status, stdout } = await signalDuringStep(t, f, signal, marker, ['organize'], { group });
+    assert.deepEqual(status, { code, signal: null }, signal);
+    // No model information on the line: the model was never started.
+    assert.match(stdout, /^organize p: aborted, nothing applied, USD 0\.00$/m, signal);
+    assert.match(stdout, new RegExp(`^organize: interrupted by ${signal}; nothing more was applied$`, 'm'));
+    assert.deepEqual(f.calls(), [], signal);
+    assert.equal(f.head(), head, signal);
+    assert.deepEqual(readdirSync(f.workRoot()), [], signal);
+    assert.equal(f.readState().projects.p.lastOutcome.outcome, 'aborted');
+  }
+});
+
+test('a signal while the apply step runs: the finished apply stands and the run stops', async (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
+  f.instruct(mergeInstruction());
+  const { marker } = slowFetch(f, 3);
+  const { status, stdout } = await signalDuringStep(t, f, 'SIGTERM', marker, ['organize']);
+  assert.deepEqual(status, { code: 143, signal: null });
+  assert.match(stdout, /^organize p: applied, 3 change\(s\), USD 0\.25, stopped: completed$/m);
+  assert.match(stdout, /^organize: interrupted by SIGTERM; nothing more was applied$/m);
+  assert.doesNotMatch(stdout, /organize q:/);
+  assert.match(f.subjects()[0], /^consolidate\(alpha\): organize projects\/p/);
+  assert.equal(existsSync(join(f.repo, 'projects/p/b.md')), false);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
+  assert.equal(f.readState().projects.p.lastOutcome.outcome, 'applied');
+});
+
+test('a signal between two scopes: the next snapshot step never runs', async (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
+  // p changes nothing, so its apply step makes two fetches; the signal comes during the second.
+  const { marker, fetches } = slowFetch(f, 2);
+  const { status, stdout } = await signalDuringStep(t, f, 'SIGINT', marker, ['organize']);
+  assert.deepEqual(status, { code: 130, signal: null });
+  assert.match(stdout, /^organize p: no-change, 0 change\(s\)/m);
+  assert.doesNotMatch(stdout, /organize q:/);
+  assert.equal(fetches(), 2);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
 });

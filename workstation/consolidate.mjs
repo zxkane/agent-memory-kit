@@ -587,14 +587,16 @@ const timeOf = (iso) => {
   return Number.isFinite(t) ? t : null;
 };
 
-// Extract: projects with a session file changed since their last extract. The one extracted
-// longest ago goes first (never extracted first), so every project gets its turn across runs;
-// ties go to the newest session.
+// Extract: projects with a session file changed since their last extract. The one whose model
+// run was tried longest ago goes first (never tried first, which includes state written before
+// `lastExtractTried` existed), so every project gets its turn across runs even when one is
+// rejected every time; then the oldest session window, then the newest session.
 function extractScopes(scan, state, opts, now) {
   const dirs = new Map(scan.sessions);
   const names = opts.projects.length > 0 ? opts.projects : [...dirs.keys()];
   const list = [];
   for (const scope of names) {
+    const tried = timeOf(state.projects[scope]?.lastExtractTried) ?? -Infinity;
     const last = timeOf(state.projects[scope]?.lastExtract);
     const files = sessionFilesSince(dirs.get(scope) ?? [], last ?? now - EXTRACT_LOOKBACK_MS);
     if (opts.projects.length === 0 && files.length === 0) continue;
@@ -606,10 +608,11 @@ function extractScopes(scan, state, opts, now) {
         // Vanished: does not count.
       }
     }
-    list.push({ scope, files, newest, last: last ?? -Infinity });
+    list.push({ scope, files, newest, tried, last: last ?? -Infinity });
   }
+  const older = (a, b) => (a === b ? 0 : a - b);
   if (opts.projects.length === 0) {
-    list.sort((x, y) => (x.last === y.last ? 0 : x.last - y.last) || y.newest - x.newest || byName(x.scope, y.scope));
+    list.sort((x, y) => older(x.tried, y.tried) || older(x.last, y.last) || y.newest - x.newest || byName(x.scope, y.scope));
   }
   return list;
 }
@@ -710,6 +713,14 @@ function onSignal(signal) {
   abort.abort();
 }
 
+// Node runs a signal handler only on a turn of the event loop. A signal that arrived while a
+// locked step ran (spawnSync blocks the loop) has not set `interrupted` yet when the step
+// returns: every check of the flag after a step waits for one turn first.
+async function signalsHandled() {
+  await new Promise((resolve) => setImmediate(resolve));
+  return interrupted;
+}
+
 // One scope: snapshot (locked), model run on the copy, apply (locked).
 async function runScope({ config, opts, model, runDir, scope, digest }) {
   const c = config.consolidate;
@@ -718,7 +729,7 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
   chmodSync(work, 0o700);
   try {
     const snap = runStep(['snapshot', '--work', work, '--kind', opts.kind, '--scope', scope]);
-    if (interrupted) return { outcome: 'aborted', work };
+    if (await signalsHandled()) return { outcome: 'aborted', work };
     if (!snap) return { outcome: 'step-failed', step: 'snapshot', work };
     if (snap.outcome !== 'snapshot') return { ...snap, step: 'snapshot', work };
     const planBuf = readFileSync(join(work, 'plan.json'));
@@ -747,7 +758,7 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     const costUsd = typeof m.costUsd === 'number' && m.costUsd >= 0 ? m.costUsd : null;
     const stopReason = STOP_RE.test(m.stopReason) ? m.stopReason : 'unknown';
     const modelInfo = { ran: m.ran, stopReason, costUsd };
-    if (interrupted) return { outcome: 'aborted', model: modelInfo, work };
+    if (await signalsHandled()) return { outcome: 'aborted', model: modelInfo, work };
     const args = [
       'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', stopReason,
       '--cost', costUsd === null ? 'unknown' : String(costUsd), '--turns', Number.isInteger(m.turns) ? String(m.turns) : 'unknown',
@@ -755,7 +766,10 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     ];
     if (opts.dryRun) args.push('--dry-run');
     const res = runStep(args);
-    if (!res) return { outcome: interrupted ? 'aborted' : 'step-failed', step: 'apply', model: modelInfo, work };
+    // An apply step that finished stands, signal or not: its line says what happened to the notes
+    // and the run stops afterwards. One that a signal killed applied nothing the driver knows of.
+    const signalled = await signalsHandled();
+    if (!res) return { outcome: signalled ? 'aborted' : 'step-failed', step: 'apply', model: modelInfo, work };
     return { ...res, step: 'apply', model: modelInfo, work };
   } finally {
     if (!opts.keep) removeTree(work);
@@ -770,20 +784,34 @@ function spentBy(res, c) {
   return ['spawn-failed', 'invalid-timeout'].includes(res.model.stopReason) ? 0 : c.maxBudgetUsd;
 }
 
-// Moves the scope's last-run marks forward, or not. A model that never ran and left nothing does
-// not count. For Organize, `rejected` advances them too (with the digest of the live folder,
-// which then equals the snapshot): the same notes would only give the same rejection, so the
-// scope waits until its content changes, or REVISIT_MS when it is still over the limits.
-// Extract keeps its previous lastExtract after a rejection, so those conversations are read again.
+// Whether the model was given this scope for scheduling purposes: it ran, or it was stopped by
+// its time limit, or it ended without a result. Those spent the scope's budget. A command that
+// could not start (`spawn-failed`, `invalid-timeout`) or a run stopped by a signal (`aborted`)
+// spent nothing that counts.
+function modelTried(res) {
+  return !!res.model && (res.model.ran === true || ['timeout', 'no-result'].includes(res.model.stopReason));
+}
+
+// Moves the scope's marks forward, or not.
+// - Extract: `lastExtract` is the start of the next session window; it moves on after a run that
+//   read the sessions (applied, nothing to change, or no qualifying session). A rejection keeps
+//   it, so those conversations are read again. `lastExtractTried` orders the projects; it moves
+//   on whenever the model was tried, so a project rejected on every run does not stay first.
+// - Organize: `rejected` advances like `applied` and `no-change` (with the digest of the live
+//   folder, which then equals the snapshot): the same notes would only give the same rejection,
+//   so the scope waits until its content changes, or REVISIT_MS while still over the limits.
+// A dry run moves nothing.
 function record(config, state, { kind, scope, res, started, dryRun }) {
   const entry = state.projects[scope] ?? (state.projects[scope] = {});
   const ran = res.model?.ran === true;
+  const tried = modelTried(res);
   let advance;
   if (kind === 'extract') {
     advance = res.outcome === 'no-session' || res.outcome === 'applied' || (res.outcome === 'no-change' && ran);
   } else {
-    advance = res.outcome === 'applied' || ((res.outcome === 'no-change' || res.outcome === 'rejected') && ran);
+    advance = res.outcome === 'applied' || ((res.outcome === 'no-change' || res.outcome === 'rejected') && tried);
   }
+  if (kind === 'extract' && tried && !dryRun) entry.lastExtractTried = started.toISOString();
   if (advance && !dryRun) {
     if (kind === 'extract') {
       entry.lastExtract = started.toISOString();
@@ -853,10 +881,14 @@ async function driverMain(argv) {
   const now = started.getTime();
   removeStaleRuns(config, now);
   const scan = runStep(['scan']);
+  if (await signalsHandled()) {
+    process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing was applied\n`);
+    return SIGNAL_CODES[interrupted];
+  }
   if (!scan || scan.outcome !== 'scan') {
     const why = scan?.outcome === 'error' ? scan.error : 'the scan of the notes could not run';
     process.stderr.write(`agent-memory consolidate: ${why}\n`);
-    return interrupted ? SIGNAL_CODES[interrupted] : 1;
+    return 1;
   }
   const projects = new Set(scan.projects.map((p) => p.name));
   for (const name of opts.projects) {
@@ -880,7 +912,8 @@ async function driverMain(argv) {
   let failed = false;
   try {
     for (const item of list) {
-      if (interrupted || calls >= limit) break;
+      // A signal during the previous scope's apply step stops the run before the next snapshot.
+      if ((await signalsHandled()) || calls >= limit) break;
       if (spent >= ceiling) {
         process.stdout.write(`${opts.kind}: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}\n`);
         break;
@@ -916,7 +949,7 @@ async function driverMain(argv) {
   } finally {
     if (runDir && !opts.keep) removeTree(runDir);
   }
-  if (interrupted) {
+  if (await signalsHandled()) {
     process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
