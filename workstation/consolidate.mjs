@@ -621,7 +621,8 @@ function extractScopes(scan, state, opts, now) {
 // it never was). One that did not change but is still over the index limits or still holds a
 // conflict copy is due again only after REVISIT_MS: the model could not fix it last time, and
 // taking it every week would crowd out the scopes that changed. Over-limit first, then
-// conflicts, then the scope organized longest ago.
+// conflicts, then the others; inside each class by lastOrganizeTried (falling back to
+// lastOrganize), oldest first.
 function organizeScopes(scan, state, opts, now) {
   const infos = [...(scan.global.usable ? [{ name: GLOBAL, ...scan.global }] : []), ...scan.projects];
   if (opts.projects.length > 0) return opts.projects.map((name) => ({ scope: name }));
@@ -633,8 +634,11 @@ function organizeScopes(scan, state, opts, now) {
     return (i.overLimit || i.conflict) && now - last(i) > REVISIT_MS;
   };
   const rank = (i) => (i.overLimit ? 0 : i.conflict ? 1 : 2);
+  // Inside each class: the scope whose model was started longest ago (never first), so one that
+  // fails on every run does not keep the others waiting.
+  const tried = (i) => timeOf(entry(i)?.lastOrganizeTried) ?? last(i);
   const due = infos.filter(isDue);
-  due.sort((x, y) => rank(x) - rank(y) || (last(x) === last(y) ? 0 : last(x) - last(y)) || byName(x.name, y.name));
+  due.sort((x, y) => rank(x) - rank(y) || (tried(x) === tried(y) ? 0 : tried(x) - tried(y)) || byName(x.name, y.name));
   return due.map((i) => ({ scope: i.name }));
 }
 
@@ -770,6 +774,11 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     // and the run stops afterwards. One that a signal killed applied nothing the driver knows of.
     const signalled = await signalsHandled();
     if (!res) return { outcome: signalled ? 'aborted' : 'step-failed', step: 'apply', model: modelInfo, work };
+    // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
+    // `no-change` always means the model completed and found nothing.
+    if (res.outcome === 'no-change' && stopReason !== 'completed') {
+      return { ...res, outcome: 'model-failed', step: 'apply', model: modelInfo, work };
+    }
     return { ...res, step: 'apply', model: modelInfo, work };
   } finally {
     if (!opts.keep) removeTree(work);
@@ -784,34 +793,32 @@ function spentBy(res, c) {
   return ['spawn-failed', 'invalid-timeout'].includes(res.model.stopReason) ? 0 : c.maxBudgetUsd;
 }
 
-// Whether the model was given this scope for scheduling purposes: it ran, or it was stopped by
-// its time limit, or it ended without a result. Those spent the scope's budget. A command that
-// could not start (`spawn-failed`, `invalid-timeout`) or a run stopped by a signal (`aborted`)
-// spent nothing that counts.
-function modelTried(res) {
-  return !!res.model && (res.model.ran === true || ['timeout', 'no-result'].includes(res.model.stopReason));
+// Stop reasons after which the model command never ran: every later scope would fail the same way.
+const NOT_STARTED = ['spawn-failed', 'invalid-timeout'];
+
+// Whether the model process was started for the scope (it may have spent its budget, whatever
+// came of it). Not after a command that could not start, nor after a run stopped by a signal.
+function modelStarted(res) {
+  return !!res.model && ![...NOT_STARTED, 'aborted'].includes(res.model.stopReason);
 }
 
-// Moves the scope's marks forward, or not.
-// - Extract: `lastExtract` is the start of the next session window; it moves on after a run that
-//   read the sessions (applied, nothing to change, or no qualifying session). A rejection keeps
-//   it, so those conversations are read again. `lastExtractTried` orders the projects; it moves
-//   on whenever the model was tried, so a project rejected on every run does not stay first.
-// - Organize: `rejected` advances like `applied` and `no-change` (with the digest of the live
-//   folder, which then equals the snapshot): the same notes would only give the same rejection,
-//   so the scope waits until its content changes, or REVISIT_MS while still over the limits.
-// A dry run moves nothing.
+// Moves the scope's marks forward, or not. A dry run moves nothing.
+// - Content marks: `lastExtract` (the start of the next session window), and `lastOrganize` with
+//   `organizedDigest`. They move after `applied`, `no-session` (Extract) and `no-change` (which
+//   means the model completed and found nothing). For Organize also after `rejected` when the
+//   model completed: the same notes would only give the same rejection, so the scope waits until
+//   its content changes, or REVISIT_MS while still over the limits. Half-finished edits of a
+//   model that did not complete prove nothing, and `model-failed` never moves them, so the
+//   conversations are read again and the scope is organized again.
+// - Ordering marks: `lastExtractTried` and `lastOrganizeTried` move whenever the model process
+//   was started, so a scope that fails or is rejected on every run does not stay first.
 function record(config, state, { kind, scope, res, started, dryRun }) {
   const entry = state.projects[scope] ?? (state.projects[scope] = {});
-  const ran = res.model?.ran === true;
-  const tried = modelTried(res);
-  let advance;
-  if (kind === 'extract') {
-    advance = res.outcome === 'no-session' || res.outcome === 'applied' || (res.outcome === 'no-change' && ran);
-  } else {
-    advance = res.outcome === 'applied' || ((res.outcome === 'no-change' || res.outcome === 'rejected') && tried);
-  }
-  if (kind === 'extract' && tried && !dryRun) entry.lastExtractTried = started.toISOString();
+  const completed = res.model?.stopReason === 'completed';
+  let advance = res.outcome === 'applied' || res.outcome === 'no-change';
+  if (kind === 'extract') advance ||= res.outcome === 'no-session';
+  else advance ||= res.outcome === 'rejected' && completed;
+  if (modelStarted(res) && !dryRun) entry[kind === 'extract' ? 'lastExtractTried' : 'lastOrganizeTried'] = started.toISOString();
   if (advance && !dryRun) {
     if (kind === 'extract') {
       entry.lastExtract = started.toISOString();
@@ -832,6 +839,7 @@ function headline(kind, scope, res) {
   if (res.outcome === 'rejected') what = `rejected, nothing applied (${res.errors?.length ?? 0} rule violation(s))`;
   else if (res.outcome === 'changed-meanwhile') what = 'changed meanwhile, nothing applied';
   else if (res.outcome === 'aborted') what = 'aborted, nothing applied';
+  else if (res.outcome === 'model-failed') what = 'model-failed, nothing applied';
   else what = `${res.outcome}, ${res.changes?.length ?? 0} change(s)`;
   let line = `${kind} ${scope}: ${what}, ${usd(res.model ? res.model.costUsd : 0)}`;
   if (res.model) line += `, stopped: ${res.model.stopReason}`;
@@ -944,6 +952,15 @@ async function driverMain(argv) {
       if (res.outcome === 'sync-failed') {
         process.stdout.write(`${opts.kind}: stopped; the sync failed, and the remaining scopes would wait for it too\n`);
         break;
+      }
+      // A failed model run makes the whole run fail (exit 1) once the other scopes are done. A
+      // command that could not start would fail the same way for every scope: stop now.
+      if (res.outcome === 'model-failed') {
+        failed = true;
+        if (NOT_STARTED.includes(res.model.stopReason)) {
+          process.stdout.write(`${opts.kind}: stopped; the model command could not be started (${res.model.stopReason})\n`);
+          break;
+        }
       }
     }
   } finally {

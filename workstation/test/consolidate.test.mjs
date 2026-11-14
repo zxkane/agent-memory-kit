@@ -629,10 +629,12 @@ test('a model run that changed nothing is no-change, with no commit', (t) => {
   const head = f.head();
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\)/m);
+  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\), USD 0\.25, stopped: completed$/m);
   assert.equal(f.head(), head);
   assert.deepEqual(f.reports(), []);
-  assert.equal(f.readState().projects.p.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
+  const p = f.readState().projects.p;
+  assert.equal(p.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
+  assert.ok(p.lastOrganize && p.lastOrganizeTried);
 });
 
 test('a model that gives no result still has its valid edits judged and applied', (t) => {
@@ -651,30 +653,86 @@ test('a model that gives no result still has its valid edits judged and applied'
   write(f.repo, 'projects/p/MEMORY.md', index('a.md', 'c.md'));
   f.sync();
   const again = f.run('organize');
-  assert.match(again.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: no-result$/m);
-  assert.equal(f.readState().projects.p.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
+  // The same model leaving nothing is a failed run: no content mark moves, the run exits 1.
+  const digest = f.readState().projects.p.organizedDigest;
+  assert.match(again.stdout, /^organize p: model-failed, nothing applied, USD unknown, stopped: no-result$/m);
+  assert.equal(again.status, 1);
+  assert.equal(f.readState().projects.p.organizedDigest, digest);
 });
 
-test('organize counts a timed-out model as tried, and one that could not start as not tried', (t) => {
+const ERROR_RESULT = { subtype: 'error_during_execution', is_error: true, total_cost_usd: 0.01, num_turns: 1 };
+
+test('a model that gives no result or an error result and changed nothing is model-failed (extract)', (t) => {
+  for (const instruction of [{ silent: true }, { result: ERROR_RESULT }]) {
+    const f = extractFixture(t);
+    f.instruct({ p: instruction });
+    const r = f.run('extract', '--project', 'p');
+    const reason = instruction.silent ? 'no-result' : 'error_during_execution';
+    const cost = instruction.silent ? 'unknown' : '0.01';
+    assert.match(r.stdout, new RegExp(`^extract p: model-failed, nothing applied, USD ${cost}, stopped: ${reason}$`, 'm'));
+    assert.equal(r.status, 1);
+    const p = f.readState().projects.p;
+    assert.equal(p.lastExtract, undefined);
+    assert.ok(p.lastExtractTried);
+    assert.equal(p.lastOutcome.outcome, 'model-failed');
+  }
+});
+
+test('a model with an error result that changed nothing is model-failed (organize); a timeout too', (t) => {
   const f = fixture(t);
   duplicateProject(f);
+  f.instruct({ p: { result: ERROR_RESULT } });
+  let r = f.run('organize');
+  assert.match(r.stdout, /^organize p: model-failed, nothing applied, USD 0\.01, stopped: error_during_execution$/m);
+  assert.equal(r.status, 1);
+  let p = f.readState().projects.p;
+  assert.equal(p.organizedDigest, undefined);
+  assert.equal(p.lastOrganize, undefined);
+  assert.ok(p.lastOrganizeTried);
+
   f.env.AGENT_MEMORY_MODEL_TIMEOUT_MS = '1000';
   f.instruct({ p: { sleepMs: 30000 } });
-  let r = f.run('organize');
-  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: timeout$/m);
-  let entry = f.readState().projects.p;
-  assert.equal(entry.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
-  assert.ok(!Number.isNaN(Date.parse(entry.lastOrganize)));
-
-  write(f.repo, 'projects/p/c.md', note('c', 'C', 'Another.'));
-  f.sync();
-  f.setConfig({ command: join(f.tmp, 'no-such-model') });
-  const before = entry;
   r = f.run('organize');
-  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: spawn-failed$/m);
-  entry = f.readState().projects.p;
-  assert.equal(entry.organizedDigest, before.organizedDigest);
-  assert.equal(entry.lastOrganize, before.lastOrganize);
+  assert.match(r.stdout, /^organize p: model-failed, nothing applied, USD unknown, stopped: timeout$/m);
+  assert.equal(r.status, 1);
+  p = f.readState().projects.p;
+  assert.equal(p.organizedDigest, undefined);
+});
+
+test('a model that stops on a limit after an invalid change is rejected and the scope stays unorganized', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct({ p: { writes: { 'notes/b.md': 'MOVED TO [[nothere]]\n' }, result: { subtype: 'error_max_turns', is_error: true } } });
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(\d+ rule violation\(s\)\), USD 0\.25, stopped: error_max_turns$/m);
+  const p = f.readState().projects.p;
+  assert.equal(p.organizedDigest, undefined);
+  assert.equal(p.lastOrganize, undefined);
+  assert.ok(!Number.isNaN(Date.parse(p.lastOrganizeTried)));
+});
+
+test('with maxProjects 1, an organize scope that always fails does not keep the other waiting', (t) => {
+  const f = fixture(t, { consolidate: { maxProjects: 1 } });
+  f.seed({ 'projects/p/a.md': note('a', 'A', 'One.'), 'projects/q/a.md': note('a', 'A', 'Two.') });
+  f.instruct({ p: { silent: true } });
+  let r = f.run('organize');
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: model-failed/m);
+  r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'q']);
+});
+
+test('a dry run with a failing model is model-failed, exits 1 and moves no mark', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct({ p: { silent: true } });
+  const r = f.run('organize', '--dry-run');
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: model-failed, nothing applied, USD unknown, stopped: no-result$/m);
+  const p = f.readState().projects.p;
+  assert.deepEqual(Object.keys(p), ['lastOutcome']);
 });
 
 test('extract orders by lastExtractTried: a project rejected every run does not starve the others', (t) => {
@@ -943,16 +1001,20 @@ test('a model that timed out still has its valid edits judged and applied', (t) 
   assert.equal(alive(f.calls()[0].pid), false);
 });
 
-test('a model command that cannot start still goes through the apply step', (t) => {
+test('a model command that cannot start is model-failed and ends the run at once', (t) => {
   const f = fixture(t);
   duplicateProject(f);
+  f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
   f.setConfig({ command: join(f.tmp, 'no-such-model') });
   const r = f.run('organize');
-  assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: spawn-failed$/m);
-  const entry = f.readState().projects.p;
-  assert.equal(entry.lastOutcome.outcome, 'no-change');
-  assert.equal(entry.organizedDigest, undefined);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: model-failed, nothing applied, USD unknown, stopped: spawn-failed$/m);
+  assert.doesNotMatch(r.stdout, /organize q:/);
+  const state = f.readState().projects;
+  assert.equal(state.p.lastOutcome.outcome, 'model-failed');
+  assert.equal(state.p.organizedDigest, undefined);
+  assert.equal(state.p.lastOrganizeTried, undefined);
+  assert.equal(state.q, undefined);
 });
 
 test('a project folder named global is reported and never used', (t) => {
