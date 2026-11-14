@@ -206,6 +206,32 @@ check 'no-hooks again removes the kit hooks' bash -c '! grep -q "# agent-memory-
 check 'no-hooks again keeps other settings' grep -q '"model": *"kept"' "$settings"
 check 'no-hooks again keeps other hooks' grep -q '/srv/other.sh' "$settings"
 
+# Codex and Kiro: with ~/.codex and ~/.kiro present, a dry run says what it would register and
+# changes nothing; a real run writes the launcher and the Kiro hook file and prints the trust notice.
+fresh_home
+mkdir "$home/.codex" "$home/.kiro"
+run_setup --dry-run --init alpha --repo-url "$remote"
+check 'agents dry run exits 0' test "$status" -eq 0
+check 'agents dry run names the Codex hook' has_text "$out" "would register the Codex session-start hook ($home/.codex/hooks.json)"
+check 'agents dry run names the Kiro file' has_text "$out" "would write $home/.kiro/hooks/agent-memory-kit.json"
+check 'agents dry run changes nothing' test -z "$(ls -A "$home/.codex")$(ls -A "$home/.kiro")"
+check 'agents dry run writes no launcher' test ! -e "$home/.config"
+run_setup --init alpha --repo-url "$remote" --no-enable
+check 'agents run exits 0' test "$status" -eq 0
+check 'launcher is executable' test -x "$home/.config/agent-memory/run.sh"
+check 'launcher runs the kit' grep -qF "exec \"$kit/workstation/run.sh\" \"\$@\"" "$home/.config/agent-memory/run.sh"
+check 'kiro hook file exists' test -f "$home/.kiro/hooks/agent-memory-kit.json"
+check 'codex hooks file exists' test -f "$home/.codex/hooks.json"
+check 'codex trust notice is printed' has_text "$out" 'Codex: start a session and run /hooks to trust the new hook; Codex skips it until then.'
+run_setup --no-enable
+check 'agents rerun exits 0' test "$status" -eq 0
+check 'agents rerun prints no trust notice' bash -c '! grep -qF "run /hooks" <<< "$1"' _ "$out"
+run_setup --no-hooks --no-enable
+check 'agents no-hooks exits 0' test "$status" -eq 0
+check 'agents no-hooks removes the kiro file' test ! -e "$home/.kiro/hooks/agent-memory-kit.json"
+check 'agents no-hooks keeps the launcher' test -x "$home/.config/agent-memory/run.sh"
+check 'agents no-hooks removes the codex entry' bash -c '! grep -q "# agent-memory-kit" "$1"' _ "$home/.codex/hooks.json"
+
 # Node.js 24 or later is accepted, an older one is not.
 real_node="$(command -v node)"
 for version in 25 23; do

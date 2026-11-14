@@ -6,8 +6,8 @@
 # --init writes ~/.config/agent-memory/config.json (first run only).
 # --dry-run prints what would happen and changes nothing.
 # --no-enable writes the systemd units but does not enable the timer.
-# --no-hooks does everything else but does not register the Claude Code hooks
-#   (and removes the kit's own entries if present).
+# --no-hooks does everything else but does not register the Claude Code, Codex and
+#   Kiro hooks (and removes the kit's own entries if present).
 set -euo pipefail
 
 die() {
@@ -153,6 +153,8 @@ if [[ $dry_run -eq 1 ]]; then
     [[ $clone_needed -eq 1 ]] && printf 'would clone %s into %s\n' "$repo_url" "$repo_dir"
     if [[ $hooks -eq 1 ]]; then
         printf 'would run node %s/workstation/install.mjs (hooks in %s)\n' "$kit_dir" "$settings_file"
+        [[ -d "$HOME/.codex" ]] && printf 'would register the Codex session-start hook (%s/.codex/hooks.json)\n' "$HOME"
+        [[ -d "$HOME/.kiro" ]] && printf 'would write %s/.kiro/hooks/agent-memory-kit.json\n' "$HOME"
     else
         printf 'would run node %s/workstation/install.mjs --no-hooks (no hooks in %s)\n' "$kit_dir" "$settings_file"
     fi

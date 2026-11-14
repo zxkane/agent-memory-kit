@@ -84,14 +84,14 @@ Then it:
 1. With `--init`, writes `~/.config/agent-memory/config.json` (mode 600).
 2. Clones the notes repository to `~/agent-memory` if it is missing.
 3. Creates `~/.local/state/agent-memory` (mode 700).
-4. Adds the two hooks to `~/.claude/settings.json`, keeping every other setting, and records the path of the Node.js binary in `workstation/node.local.path` (ignored by Git).
+4. Adds the two hooks to `~/.claude/settings.json`, keeping every other setting, records the path of the Node.js binary in `workstation/node.local.path` (ignored by Git), writes the launcher `~/.config/agent-memory/run.sh` and, when `~/.codex` or `~/.kiro` exists, registers their session-start hook (see "Codex and Kiro").
 5. Writes `agent-memory-sync.service` and `agent-memory-sync.timer` to `~/.config/systemd/user/` and enables the timer.
 
 Options:
 
 - `--dry-run` runs the checks, prints what would happen and changes nothing.
 - `--no-enable` writes the units but does not run `systemctl`.
-- `--no-hooks` does everything else but does not register the two hooks, and removes the kit's own hook entries if they are present. Running `setup.sh` later without the flag registers them.
+- `--no-hooks` does everything else but does not register the Claude Code, Codex and Kiro hooks, and removes the kit's own hook entries if they are present. Running `setup.sh` later without the flag registers them.
 
 On a machine that already has Claude Code memory, this order lets you move the existing notes and review the result before sessions start adopting folders on their own:
 
@@ -131,6 +131,39 @@ A folder whose `memory` is already a link is left out of the list, so running `-
 `--apply` holds the sync lock for its whole run. If a sync is running it waits for it, up to two minutes (*agent-memory: a sync is running; try again.*). It then runs one sync, so that the clone and the `.project` files in it are current, and stops without migrating if that sync fails. It refuses to run while any file to be copied is flagged by the secret scan. Remove the credential from the file, or add `--skip-flagged` to leave the flagged files out of the copy; they stay in the backup folder. If `MEMORY.md` itself is flagged it is not copied either, so the copied notes have no index lines: the result lists the folder under `indexNotCopied`, and you need to rebuild the index by hand. The result is printed as JSON; `adoptedFolders` lists, for each folder copied, its `backupDir` and the names of the flagged files left out (`leftOut`).
 
 After a folder is copied, notes whose frontmatter has `type: user` under `metadata:` are moved to `global/`, together with their lines in `MEMORY.md`. If `global/` already has a different file of that name, both are kept as `<name>.<host>.md`.
+
+## Codex and Kiro
+
+If `~/.codex` or `~/.kiro` exists when `setup.sh` runs, it also registers a session-start hook for that tool. At the start of a session the tool then sees a plain-text summary: the shared-memory indexes (global and, for a repository that has project notes, that project's), where to write new notes and the same sync warnings as in Claude Code. Notes themselves are the same Markdown files in the clone.
+
+Only this session-start text is provided for these tools. There is no write guard: a credential written into the clone is caught by the sync's secret scan, which moves the file to quarantine instead of committing it.
+
+- **Launcher.** Setup writes `~/.config/agent-memory/run.sh`, a small script that calls this clone's `workstation/run.sh`. The hook command calls that fixed path and exits silently when the file or a valid, enabled configuration is missing, so one hook file can be shared between machines. Running `setup.sh` again after moving the kit refreshes the launcher.
+- **Codex.** The entry goes into `SessionStart` in `~/.codex/hooks.json`; other hooks and settings in the file are kept. Codex skips a new or changed hook until you review it: start a session and run `/hooks`.
+- **Kiro.** Setup writes `~/.kiro/hooks/agent-memory-kit.json`. Kiro runs hook files only with its V3 agent engine.
+- **Symbolic links.** If `~/.codex/hooks.json` is a symbolic link (for example into a repository you manage), setup does not write it. It prints the entry to add to the file the link points to:
+
+  ```
+  {
+    "hooks": {
+      "SessionStart": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "r=\"$HOME/.config/agent-memory/run.sh\"; [ ! -x \"$r\" ] || \"$r\" session-start codex # agent-memory-kit",
+              "timeout": 20
+            }
+          ]
+        }
+      ]
+    }
+  }
+  ```
+
+  A symbolic link at the Kiro hook path is replaced by a regular file; its target is not touched.
+
+`--no-hooks` removes these entries again (the launcher stays). A `hooks.json` that is not valid JSON stops setup with an error naming the file.
 
 ## Day to day
 
@@ -190,7 +223,7 @@ On each machine:
 
 1. Delete `~/.config/agent-memory/config.json`. The hooks and the sync stop acting immediately.
 2. Disable the timer: `systemctl --user disable --now agent-memory-sync.timer`.
-3. Remove the two hook entries from `~/.claude/settings.json`: the commands that end with `# agent-memory-kit`, one under `SessionStart` and one under `PreToolUse`. `./setup.sh --no-hooks --no-enable`, run before step 1, does this for you.
+3. Remove the two hook entries from `~/.claude/settings.json`: the commands that end with `# agent-memory-kit`, one under `SessionStart` and one under `PreToolUse`. `./setup.sh --no-hooks --no-enable`, run before step 1, does this for you, and also removes the Codex and Kiro hook entries (a symbolic-linked `~/.codex/hooks.json` is not edited; setup prints what to remove).
 4. To unlink the memory folders: each linked folder `~/.claude/projects/<folder name>/memory` is a symlink into the clone, with a `memory.local-backup-<timestamp>` folder beside it. Remove the symlink, create the `memory` folder again and copy the project's notes from `~/agent-memory/projects/<name>/` into it. Delete the backup folders once you have confirmed that their notes are in the clone.
 
 Your notes stay in `~/agent-memory` and in the remote repository.
