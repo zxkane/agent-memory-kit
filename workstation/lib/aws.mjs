@@ -150,6 +150,22 @@ const KEY_ID_RE = /^[A-Za-z0-9]{1,128}$/;
 const SECRET_RE = /^[A-Za-z0-9+/=_.-]{1,16384}$/;
 const EXPIRATION_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
 
+// The temporary credentials a GitHub Actions job holds after its OIDC login step. Read from the
+// environment each time, nothing stored. A session token is required, so long-lived credentials are
+// never accepted; a value is never part of an error. No request is made.
+export function environmentCredentials(env = process.env) {
+  const accessKeyId = env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = env.AWS_SECRET_ACCESS_KEY;
+  const sessionToken = env.AWS_SESSION_TOKEN;
+  if (![accessKeyId, secretAccessKey, sessionToken].every((v) => typeof v === 'string' && v !== '')) {
+    throw new AwsError('credentials', 0, 'NoEnvironment');
+  }
+  if (!KEY_ID_RE.test(accessKeyId) || !SECRET_RE.test(secretAccessKey) || !SECRET_RE.test(sessionToken)) {
+    throw new AwsError('credentials', 0, 'BadEnvironment');
+  }
+  return { accessKeyId, secretAccessKey, sessionToken };
+}
+
 // The text of the first <name> element of an XML answer, or null.
 const xmlValue = (xml, name) => new RegExp(`<${name}>([^<]*)</${name}>`).exec(xml)?.[1] ?? null;
 
