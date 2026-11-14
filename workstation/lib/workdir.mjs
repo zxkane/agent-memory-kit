@@ -14,6 +14,7 @@ import { scanText } from './secret-scan.mjs';
 
 const MAX_NOTE_BYTES = 100000;
 const NOTE_MIN_TERMS = 40;
+const RUN_MIN_TERMS = 200;
 const GLOBAL = 'global';
 const HASH_RE = /^[0-9a-f]{64}$/;
 
@@ -339,7 +340,13 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.3 }) {
       errors.push(`${loc(c.label, c.file)}: most of this note's content is missing after the run (kept ${Math.floor(noteShare * 100)}% of its distinct terms, at least ${Math.round(minRetention * 100)}% required)`);
     }
   }
-  stats.retention = { termsBefore, termsKept, share: termsBefore === 0 ? 1 : termsKept / termsBefore, checked, lowest };
+  const share = termsBefore === 0 ? 1 : termsKept / termsBefore;
+  stats.retention = { termsBefore, termsKept, share, checked, lowest };
+  // The same measure over all touched notes, short ones included, so that many small notes
+  // cannot be gutted one by one below the per-note minimum.
+  if (minRetention > 0 && termsBefore >= RUN_MIN_TERMS && share < minRetention) {
+    errors.push(`the run would drop too much of the touched notes' content (kept ${Math.floor(share * 100)}% of their distinct terms, at least ${Math.round(minRetention * 100)}% required)`);
+  }
   const watched = changes.filter((c) => c.kind === 'add').map((c) => `${c.label}/${c.file}`);
   const liveChanged = liveDiffers(pairs, snap, watched);
   return { ok: errors.length === 0 && liveChanged.length === 0, errors, changes, ignored, stats, liveChanged };

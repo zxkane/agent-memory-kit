@@ -847,9 +847,12 @@ test('rule 7: ten notes retired into one short summary give an error for each no
   s.work('notes', 'MEMORY.md', indexWithout(1, 2, 3, 4, 5, 6, 7, 8, 9));
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.equal(r.ok, false);
-  assert.equal(r.errors.length, 10);
-  for (const e of r.errors) assert.match(e, MISSING);
-  assert.deepEqual(r.errors.map((e) => MISSING.exec(e)[1]).sort(), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9']);
+  // Ten per-note errors, plus the run-level one (600 terms, 10 kept).
+  assert.equal(r.errors.length, 11);
+  const perNote = r.errors.filter((e) => e.startsWith("notes/"));
+  for (const e of perNote) assert.match(e, MISSING);
+  assert.deepEqual(perNote.map((e) => MISSING.exec(e)[1]).sort(), ["n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"]);
+  assert.equal(r.errors.filter((e) => !e.startsWith("notes/")).length, 1);
   assert.equal(r.stats.retention.checked, 10);
   assert.equal(r.stats.retention.lowest, 0);
   assert.equal(r.stats.retention.termsKept, 10);
@@ -938,4 +941,45 @@ test('live folder missing at snapshot time but now a plain file is reported by l
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.equal(r.ok, false);
   assert.deepEqual(r.liveChanged, ['notes/']);
+});
+
+// ---- round 4 ----
+
+function shortNotes(t, count, extra = {}) {
+  const notes = { 'MEMORY.md': Array.from({ length: count }, (_, i) => `- [S${i}](s${i}.md) — s${i}\n`).join(''), ...extra };
+  for (let i = 0; i < count; i++) notes[`s${i}.md`] = `${terms(`sh${String(i).padStart(2, '0')}x`, 0, 20)}\n`;
+  return setup(t, { notes });
+}
+
+const RUN_ERROR = /^the run would drop too much of the touched notes' content \(kept \d+% of their distinct terms, at least 30% required\)$/;
+
+test('run level: thirty short notes gutted give one run-level error and no per-note error', (t) => {
+  const s = shortNotes(t, 30);
+  for (let i = 0; i < 30; i++) s.work('notes', `s${i}.md`, 'two words\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], RUN_ERROR);
+  assert.match(r.errors[0], /kept 0% /);
+  assert.equal(r.stats.retention.checked, 0);
+  assert.equal(r.stats.retention.termsBefore, 600);
+  const off = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention: 0 });
+  assert.deepEqual(off.errors, []);
+});
+
+test('run level: five short notes gutted (under 200 terms in total) pass', (t) => {
+  const s = shortNotes(t, 5);
+  for (let i = 0; i < 5; i++) s.work('notes', `s${i}.md`, 'two words\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.termsBefore, 100);
+});
+
+test('run level: one long note honestly tightened beside untouched short notes passes', (t) => {
+  const s = shortNotes(t, 10, { 'long.md': `${terms('long', 0, 240)}\n` });
+  s.work('notes', 'long.md', `${terms('long', 0, 240).split(' ').filter((_, i) => i % 3 !== 2).join(' ')}\n`);
+  s.work('notes', 'MEMORY.md', `${s.readLive('notes', 'MEMORY.md')}- [L](long.md) — l\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.termsBefore, 240);
 });
