@@ -239,7 +239,20 @@ The `api/` directory holds an optional HTTP API for tools that cannot reach your
   (one-way copy)                  agents/<agent>/  <-----------  memory_write
 ```
 
-The notes in the bucket are a replica of the workstation notes. The API reads the replica and writes only under `agents/<agent>/`. Those agent scopes are not part of the clone on your machines.
+The notes in the bucket are meant to be a replica of the workstation notes. The API reads the replica and writes only under `agents/<agent>/`. Those agent scopes are not part of the clone on your machines.
+
+**The replica writer is not part of this repository yet.** Nothing here copies workstation notes into `mem/` or builds `index/mem.json`, so a fresh deployment has an empty replica: `memory_scopes` lists only agent scopes, and reads and searches of `global` and `projects/<project>` find nothing until a writer (the roles named in `AGENT_MEMORY_WORKSTATION_ROLE_ARNS`) fills it. A writer must produce:
+
+- the notes as objects under `mem/`: `mem/global/<file>.md` and `mem/projects/<project>/<file>.md`, with each scope's index at `mem/<scope>/MEMORY.md`;
+- the search snapshot `index/mem.json`:
+
+  ```
+  { "version": 1, "notes": [ { "path": "global/n.md", "name": "n", "description": "...", "type": "reference", "body": "..." } ] }
+  ```
+
+  `path` is the note's path in the client-scope form that `memory_read` takes (`global/<file>.md` or `projects/<project>/<file>.md`, without the `mem/` prefix). `MEMORY.md` files are not listed. Entries outside `global/` and `projects/` are ignored.
+
+The API writes the matching agent-side objects itself: `agents/<agent>/<name>.md`, `agents/<agent>/MEMORY.md` and `index/agents.json`.
 
 ### Operations
 
@@ -257,6 +270,8 @@ The notes in the bucket are a replica of the workstation notes. The API reads th
 
 - The API reads a replica of the workstation notes and can write only under `agents/<agent>/`. It has no delete operation.
 - The API cannot tell callers apart. The gateway presents one machine identity, so any caller the gateway lets use `memory_write` can write to any agent's scope, including replacing another agent's note. Which callers may use which tool is the gateway's job. Earlier versions of a replaced note remain available through the bucket's object versions for 90 days.
+- The function may list the bucket's keys. It never does so itself; the permission exists only so that S3 answers a request for a missing note with "not found" instead of "access denied", which the API reports as 404 `not_found`. Without it a missing note would end as a 500.
+- Two writes of the same note name at the same moment can leave the note file and the search snapshot holding different text (the file from one request, the snapshot from the other) until the next write of that note. Reading the note and searching it may then disagree briefly. No data is lost: S3 keeps the earlier versions.
 - Each agent scope holds at most 200 notes and about 240 KB of text, and there are at most 16 agent scopes. A write that would exceed the first two limits fails with `scope_full`; a write that would exceed the number of scopes or the total size of the agent store fails with `store_full`. There is no way to free space through the API, because it cannot delete. An operator removes notes in the bucket directly.
 - Credentials: a note, a name or a description that looks like a credential is refused with `secret_detected`. This is a safety net with a fixed list of patterns, so a credential in an unusual shape can pass. It is not a guarantee.
 - Notes are data, not instructions. Anything an agent reads through the API was written by a person or an agent and may be wrong or hostile.
@@ -269,14 +284,17 @@ Run from `api/`. You need AWS credentials that may create the resources of the s
 ```
 cd api
 npm install
+npm run typecheck:infra
 AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>
 ```
+
+The infrastructure program is not type-checked in CI, so run `npm run typecheck:infra` before each deploy.
 
 `AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of IAM role ARNs that may write the replica (the `mem/` and `index/` prefixes) and read the agent scopes, for the job that copies the workstation notes into the bucket. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
 
 The deployment creates:
 
-- a versioned bucket that holds the replica and the agent scopes; superseded versions expire after 90 days;
+- a versioned bucket that holds the replica and the agent scopes; superseded versions expire after 90 days (after 1 day for the search snapshots under `index/`, which are rewritten on every write);
 - a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes; read-only on `prod`), and two scopes, `agent-memory/read` and `agent-memory/write`;
 - an HTTP API with one route per operation and a function behind it;
 - SSM parameters under `/agent-memory/<stage>/mcp/`: `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string) and `bucket/name`.
@@ -294,13 +312,13 @@ The script reads the `probe` client's parameters, asks the token endpoint for to
 1. Every route refuses a request without a token (401).
 2. Every route refuses a malformed token (401).
 3. Every route refuses a well-formed token signed by another issuer (401). The script makes the key for it.
-4. A token with only `agent-memory/read` gets 403 on `POST /v1/notes`.
-5. Two steps. 5a always runs: with a read-only token, `memory_scopes` answers 200 with a `scopes` array and `memory_search` answers 200 with `results` and `total`. 5b runs only when the probe client can get the write scope: a token with both scopes writes a note `deployed-check` in agent `probe`, then reads it, finds it in the index and in the list of scopes. When the token endpoint refuses the write scope, 5b is reported as `SKIP` and does not change the exit code. 5b is also skipped when the write answers 400 `scope_full` or `store_full`. Any other answer to the write, including a network error or a timeout, is a failure.
-6. Each response the run received has the fields that `openapi.json` documents.
+4. A token with only `agent-memory/read` gets 403 on `POST /v1/notes`, and the 403 comes from API Gateway itself (its body is `{"message":"Forbidden"}`), not from the function (whose body has `error.code`). A 403 from the function means the gateway let the request through and the route may have lost its scope.
+5. Two steps. 5a always runs: with a read-only token, `memory_scopes` answers 200 with a `scopes` array and `memory_search` answers 200 with `results` and `total`; `memory_read` of a note that cannot exist and `memory_index` of a scope that cannot exist answer 404 `not_found` (a 500 or 403 there means the function probably lacks the list permission). 5b runs only when the probe client can get the write scope: a token with both scopes writes a note `deployed-check` in agent `probe`, then reads it, finds it in the index and in the list of scopes. When the token endpoint refuses the write scope, 5b is reported as `SKIP` and does not change the exit code. 5b is also skipped when the write answers 400 `scope_full` or `store_full`. Any other answer to the write, including a network error or a timeout, is a failure.
+6. Each response the run received has the fields in the `required` list of its schema in `openapi.json`.
 7. An unknown path (`GET /v1/nope`) answers 404 or 401, never 200.
 8. With `--expired`, the script waits about five minutes until a probe token has expired and expects 401.
 
-On the `prod` stage the probe client is read-only, so the write path is exercised by `verify-deployed` only on other stages. When 5b runs, the check note stays in the bucket as `agents/probe/deployed-check.md` and is replaced by the next run.
+On the `prod` stage the probe client must be read-only: if a token with the write scope can be issued there, the script reports a failure and does not run 5b. The write path is exercised only on other stages. When 5b runs, the check note stays in the bucket as `agents/probe/deployed-check.md` and is replaced by the next run.
 
 ### Register the API with an MCP gateway
 
