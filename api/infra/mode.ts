@@ -46,7 +46,7 @@ export function parseDeployMode(env: Record<string, string | undefined>): Deploy
   }
   for (const subject of githubSubjects) {
     if (!isGithubSubject(subject)) {
-      throw new Error("Each entry of AGENT_MEMORY_GITHUB_SUBJECTS must be repo:<owner>/<repository>:ref:refs/heads/<branch>.");
+      throw new Error("Each entry of AGENT_MEMORY_GITHUB_SUBJECTS must be repo:<owner>/<repository>:ref:refs/heads/<branch> or repo:<owner>@<owner-id>/<repository>@<repository-id>:ref:refs/heads/<branch>.");
     }
   }
   return { direct: invokerRoleArns.length > 0, invokerRoleArns, workstationRoleArns, githubSubjects };

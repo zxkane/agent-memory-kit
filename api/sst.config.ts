@@ -7,7 +7,8 @@
 //                                        role that those roles (and the GitHub jobs of the next variable) may
 //                                        assume. Without this and the next variable, it creates neither.
 //   AGENT_MEMORY_GITHUB_SUBJECTS         optional, comma-separated exact GitHub Actions subjects, for example
-//                                        repo:<owner>/<repository>:ref:refs/heads/main. When set, the same two
+//                                        repo:<owner>/<repository>:ref:refs/heads/main or, in GitHub's
+//                                        immutable form, repo:<owner>@<owner-id>/<repository>@<repository-id>:ref:refs/heads/main. When set, the same two
 //                                        roles also trust those jobs through the account's existing GitHub
 //                                        OIDC provider, which must exist. Either variable creates the roles.
 //   AGENT_MEMORY_INVOKER_ROLE_ARNS       optional, comma-separated ARNs of the IAM roles that may invoke the
