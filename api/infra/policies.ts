@@ -145,10 +145,10 @@ export function canaryRolePolicy(parameterArns: string[]): PolicyDocument {
   };
 }
 
-const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:ref:refs\/heads\/[A-Za-z0-9._\/-]+$/;
+const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:ref:refs\/heads\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
 // The immutable form: the owner and the repository each carry their numeric ID.
 const IMMUTABLE_SUBJECT_RE =
-  /^repo:[A-Za-z0-9_.-]+@[0-9]{1,20}\/[A-Za-z0-9_.-]+@[0-9]{1,20}:ref:refs\/heads\/[A-Za-z0-9._\/-]+$/;
+  /^repo:[A-Za-z0-9_.-]+@[0-9]{1,20}\/[A-Za-z0-9_.-]+@[0-9]{1,20}:ref:refs\/heads\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
 /** True for a GitHub Actions subject of exactly one branch of one repository, in the classic or the immutable form. */
 export function isGithubSubject(value: string): boolean {
   return SUBJECT_RE.test(value) || IMMUTABLE_SUBJECT_RE.test(value);

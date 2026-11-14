@@ -319,6 +319,12 @@ describe('immutable GitHub subjects', () => {
     'repo:o@123456789012345678901/r@2:ref:refs/heads/main',
     '*',
     'repo:o@1/r@2:ref:refs/heads/ma?n',
+    'repo:o@1/r@2:ref:refs/heads//main',
+    'repo:o@1/r@2:ref:refs/heads/a//b',
+    'repo:o@1/r@2:ref:refs/heads/main/',
+    'repo:o/r:ref:refs/heads//main',
+    'repo:o/r:ref:refs/heads/a//b',
+    'repo:o/r:ref:refs/heads/main/',
     '\nrepo:o@1/r@2:ref:refs/heads/main',
     'repo:o@1/r@2:ref:refs/heads/main\n',
     'repo:o@1/r@2:ref:refs/heads/main\nrepo:o@1/r@2:ref:refs/heads/dev',
@@ -329,6 +335,11 @@ describe('immutable GitHub subjects', () => {
 
   it('isGithubSubject accepts the immutable form and refuses every other variant', () => {
     assert.equal(isGithubSubject(IMMUTABLE), true);
+    for (const prefix of ['repo:o/r', 'repo:o@1/r@2']) {
+      for (const branch of ['main', 'release/1.0', 'feature/a-b_c.d']) {
+        assert.equal(isGithubSubject(`${prefix}:ref:refs/heads/${branch}`), true, `${prefix} ${branch}`);
+      }
+    }
     assert.equal(isGithubSubject('repo:o@1/r@2:ref:refs/heads/release/1.0'), true);
     assert.equal(isGithubSubject(CLASSIC), true);
     for (const bad of REFUSED) assert.equal(isGithubSubject(bad), false, bad);

@@ -65,6 +65,12 @@ describe('parseDeployMode', () => {
       'repo:o@/r@2:ref:refs/heads/main',
       'repo:o@1/r@2:environment:production',
       'repo:o@1/r@2:ref:refs/heads/ma?n',
+      'repo:o@1/r@2:ref:refs/heads//main',
+      'repo:o@1/r@2:ref:refs/heads/a//b',
+      'repo:o@1/r@2:ref:refs/heads/main/',
+      'repo:o/r:ref:refs/heads//main',
+      'repo:o/r:ref:refs/heads/a//b',
+      'repo:o/r:ref:refs/heads/main/',
     ]) {
       assert.throws(
         () => parseDeployMode({ AGENT_MEMORY_GITHUB_SUBJECTS: bad }),
