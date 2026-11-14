@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, realpathSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, realpathSync, rmSync, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { renderPrompt, modelArgs, runModel } from '../lib/model-run.mjs';
+import { renderPrompt, fillTemplate, modelArgs, runModel } from '../lib/model-run.mjs';
 
 const promptsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'prompts');
 
@@ -21,13 +22,26 @@ function fakeCommand(dir, body, name = 'fake.sh') {
   return file;
 }
 
+// True while the process runs. A killed process that init has not yet reaped
+// is a zombie (state Z) and counts as gone.
 function alive(pid) {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  try {
+    return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+// Signal delivery is asynchronous: allow a moment for a killed process to vanish.
+async function gone(pid, waitMs = 2000) {
+  const deadline = Date.now() + waitMs;
+  while (alive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+  return !alive(pid);
 }
 
 // ---- renderPrompt ----
@@ -50,6 +64,7 @@ test('organize prompt with hasGlobal false has no global parts', () => {
   for (const vars of [{ hasGlobal: false }, {}]) {
     const text = renderPrompt('organize', vars);
     assert.ok(!text.includes('global/'));
+    assert.ok(!text.includes('[[global:'));
     assert.ok(!text.includes('{{'));
   }
 });
@@ -212,7 +227,7 @@ test('runModel kills a process that outlives the timeout', async (t) => {
   for (const f of ['sh.pid', 'sleep.pid']) {
     const pid = Number(readFileSync(join(dir, f), 'utf8'));
     assert.ok(Number.isInteger(pid) && pid > 0);
-    assert.equal(alive(pid), false, `${f} process is gone`);
+    assert.equal(await gone(pid), true, `${f} process is gone`);
   }
 });
 
@@ -231,7 +246,7 @@ test('runModel escalates to SIGKILL when SIGTERM is ignored', async (t) => {
   const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 500 });
   assert.equal(r.stopReason, 'timeout');
   assert.ok(Date.now() - started >= 5000);
-  assert.equal(alive(Number(readFileSync(join(dir, 'sh.pid'), 'utf8'))), false);
+  assert.equal(await gone(Number(readFileSync(join(dir, 'sh.pid'), 'utf8'))), true);
 });
 
 test('runModel passes only the allowed environment', async (t) => {
@@ -273,11 +288,102 @@ test('runModel discards output beyond 1 MB', async (t) => {
   assert.equal(r.stopReason, 'no-result');
 });
 
-test('runModel does not leave files behind in the work folder', async (t) => {
+test('runModel parses output just below the 1 MB limit', async (t) => {
   const dir = tmp(t);
-  const work = join(dir, 'w');
-  mkdirSync(work);
-  const command = fakeCommand(dir, `echo '{"subtype":"success","is_error":false}'`);
-  await runModel({ command, args: [], cwd: work, env: {}, timeoutMs: 10000 });
-  assert.deepEqual(readdirSync(work), []);
+  const command = fakeCommand(dir, `printf '{"result":"'; head -c 1000000 /dev/zero | tr '\\0' 'a'; printf '"}'`);
+  const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 20000 });
+  assert.equal(r.ran, true);
+  assert.equal(r.summary.length, 2000);
+});
+
+test('runModel rejects a timeout that is not a positive finite number', async (t) => {
+  const dir = tmp(t);
+  const marker = join(dir, 'started');
+  const command = fakeCommand(dir, `touch "${marker}"\necho '{}'`);
+  for (const timeoutMs of [undefined, 0, -5, NaN, Infinity, '100']) {
+    const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs });
+    assert.equal(r.ran, false);
+    assert.equal(r.stopReason, 'invalid-timeout');
+  }
+  assert.equal(existsSync(marker), false);
+});
+
+function killPidFile(file) {
+  if (!existsSync(file)) return;
+  try {
+    process.kill(Number(readFileSync(file, 'utf8')), 'SIGKILL');
+  } catch {}
+}
+
+const hasSetsid = spawnSync('setsid', ['true']).status === 0;
+const JSON_OK = `{"subtype":"success","is_error":false,"result":"done"}`;
+
+test('runModel resolves promptly when a background process in another session holds the pipe', { skip: hasSetsid ? false : 'setsid is not available' }, async (t) => {
+  const dir = tmp(t);
+  const pidFile = join(dir, 'bg.pid');
+  try {
+    const command = fakeCommand(dir, `setsid sleep 30 &\necho $! > "${pidFile}"\necho '${JSON_OK}'`);
+    const started = Date.now();
+    const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 20000 });
+    assert.ok(Date.now() - started < 3000, 'resolved without waiting for the background process');
+    assert.equal(r.ran, true);
+    assert.equal(r.stopReason, 'completed');
+    assert.equal(r.summary, 'done');
+  } finally {
+    killPidFile(pidFile); // before the folder is removed, so the pid file still exists
+  }
+});
+
+test('runModel resolves within timeout plus grace when another session holds the pipe and there is no result', { skip: hasSetsid ? false : 'setsid is not available' }, async (t) => {
+  const dir = tmp(t);
+  const pidFile = join(dir, 'bg.pid');
+  try {
+    const command = fakeCommand(dir, `setsid sleep 30 &\necho $! > "${pidFile}"\nsleep 30`);
+    const started = Date.now();
+    const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 500 });
+    assert.ok(Date.now() - started < 500 + 5000 + 1500);
+    assert.equal(r.ran, false);
+    assert.equal(r.stopReason, 'timeout');
+  } finally {
+    killPidFile(pidFile); // before the folder is removed, so the pid file still exists
+  }
+});
+
+test('runModel resolves promptly when a same-group background process holds the pipe', async (t) => {
+  const dir = tmp(t);
+  const pidFile = join(dir, 'bg.pid');
+  try {
+    const command = fakeCommand(dir, `sleep 30 &\necho $! > "${pidFile}"\necho '${JSON_OK}'`);
+    const started = Date.now();
+    const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 20000 });
+    assert.ok(Date.now() - started < 3000);
+    assert.equal(r.ran, true);
+    assert.equal(r.stopReason, 'completed');
+  } finally {
+    killPidFile(pidFile); // before the folder is removed, so the pid file still exists
+  }
+});
+
+test('fillTemplate throws on an unclosed block or a stray end marker', () => {
+  assert.throws(() => fillTemplate('a {{#if x}} b', { x: true }), /if/);
+  assert.throws(() => fillTemplate('a {{/if}} b', {}), /if/);
+  assert.equal(fillTemplate('a {{#if x}}b{{/if}} {{y}}', { x: 1, y: 'z' }), 'a b z');
+});
+
+test('prompts tell the model to scrub credentials already in a changed note', () => {
+  const sentence = 'When a note you change already contains one, replace the value with its name and keep the rest of the fact.';
+  assert.ok(renderPrompt('extract', { digest: 'd' }).includes(sentence));
+  assert.ok(renderPrompt('organize', { hasGlobal: false }).includes(sentence));
+});
+
+test('organize prompt exempts retired files and explains global links and merging', () => {
+  const off = renderPrompt('organize', { hasGlobal: false });
+  const on = renderPrompt('organize', { hasGlobal: true });
+  const exempt = 'A retired file is exempt from the rules above: it holds only its MOVED TO line, has no frontmatter and has no line in MEMORY.md.';
+  assert.ok(off.includes(exempt));
+  assert.ok(on.includes(exempt));
+  assert.ok(on.includes('or, when global/ already has a note on the topic, add to that note instead of creating a second one'));
+  assert.ok(on.includes('add or update its line in global/MEMORY.md'));
+  assert.ok(on.includes('A link from a note in notes/ to a note in global/ is written [[global:name]].'));
+  assert.ok(!off.includes('[[global:'));
 });

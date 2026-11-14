@@ -10,26 +10,34 @@ const PROMPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'prompts
 const MAX_STDOUT_BYTES = 1024 * 1024;
 const MAX_SUMMARY_CHARS = 2000;
 const KILL_GRACE_MS = 5000;
+const DRAIN_MS = 200;
 const INHERITED_ENV = ['HOME', 'PATH', 'LANG', 'TZ'];
 const TOOLS = 'Read,Write,Edit,Glob,Grep';
 
 // Fills a prompt template. `{{#if name}}...{{/if}}` blocks (not nested) are kept
 // when vars[name] is truthy and dropped otherwise; `{{name}}` must be in vars.
-export function renderPrompt(kind, vars = {}) {
-  if (kind !== 'extract' && kind !== 'organize') {
-    throw new Error(`unknown prompt kind: ${kind}`);
-  }
-  const template = readFileSync(join(PROMPTS_DIR, `${kind}.md`), 'utf8');
+// An unclosed block or a stray end marker is an error.
+export function fillTemplate(template, vars = {}) {
   const withBlocks = template.replace(
     /\{\{#if (\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g,
     (_, name, body) => (vars[name] ? body : ''),
   );
+  if (withBlocks.includes('{{#if') || withBlocks.includes('{{/if}}')) {
+    throw new Error('prompt template has an unclosed or stray if marker');
+  }
   return withBlocks.replace(/\{\{(\w+)\}\}/g, (_, name) => {
     if (!Object.hasOwn(vars, name) || vars[name] === undefined) {
       throw new Error(`prompt variable missing: ${name}`);
     }
     return String(vars[name]);
   });
+}
+
+export function renderPrompt(kind, vars = {}) {
+  if (kind !== 'extract' && kind !== 'organize') {
+    throw new Error(`unknown prompt kind: ${kind}`);
+  }
+  return fillTemplate(readFileSync(join(PROMPTS_DIR, `${kind}.md`), 'utf8'), vars);
 }
 
 export function modelArgs({ prompt, model, maxTurns, maxBudgetUsd, addDirs = [] }) {
@@ -111,6 +119,10 @@ function killGroup(pid, signal) {
 
 export function runModel({ command, args = [], cwd, env, timeoutMs }) {
   return new Promise((resolve) => {
+    if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      resolve(failure('invalid-timeout'));
+      return;
+    }
     let child;
     try {
       child = spawn(command, args, {
@@ -131,13 +143,26 @@ export function runModel({ command, args = [], cwd, env, timeoutMs }) {
     let settled = false;
     let termTimer = null;
     let killTimer = null;
+    let drainTimer = null;
 
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(termTimer);
       clearTimeout(killTimer);
+      clearTimeout(drainTimer);
       resolve(result);
+    };
+
+    // Called once the child has exited (or its pipe closed): stop reading, tidy
+    // the process group, and answer with what was read.
+    const conclude = () => {
+      if (settled) return;
+      child.stdout.destroy();
+      if (timedOut && child.pid !== undefined) killGroup(child.pid, 'SIGKILL');
+      const data = overflow ? null : parseOutput(Buffer.concat(chunks).toString('utf8'));
+      if (data) finish(summarize(data, timedOut));
+      else finish(failure(timedOut ? 'timeout' : 'no-result'));
     };
 
     child.on('error', () => {
@@ -157,18 +182,21 @@ export function runModel({ command, args = [], cwd, env, timeoutMs }) {
     });
     child.stdout.on('error', () => {});
 
-    child.on('close', () => {
-      if (settled) return;
-      if (timedOut && child.pid !== undefined) killGroup(child.pid, 'SIGKILL');
-      const data = overflow ? null : parseOutput(Buffer.concat(chunks).toString('utf8'));
-      if (data) finish(summarize(data, timedOut));
-      else finish(failure(timedOut ? 'timeout' : 'no-result'));
+    // A background process that inherited stdout can hold the pipe open after the
+    // child is gone, so 'close' alone may never come: after 'exit', drain briefly.
+    child.on('exit', () => {
+      clearTimeout(termTimer);
+      drainTimer = setTimeout(conclude, DRAIN_MS);
     });
+    child.on('close', conclude);
 
     termTimer = setTimeout(() => {
       timedOut = true;
       killGroup(child.pid, 'SIGTERM');
-      killTimer = setTimeout(() => killGroup(child.pid, 'SIGKILL'), KILL_GRACE_MS);
+      killTimer = setTimeout(() => {
+        killGroup(child.pid, 'SIGKILL');
+        drainTimer = setTimeout(conclude, DRAIN_MS);
+      }, KILL_GRACE_MS);
     }, timeoutMs);
   });
 }
