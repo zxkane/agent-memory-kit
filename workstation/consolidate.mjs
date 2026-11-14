@@ -329,12 +329,18 @@ function buildReport({ config, kind, scope, date, model, stopReason, costUsd, tu
   section('Changed', sorted.filter((c) => c.kind === 'change').map((c) => `- ${shown(display(c.label, c.file))}`));
   section('Retired', sorted.filter((c) => c.kind === 'retire')
     .map((c) => `- ${shown(display(c.label, c.file))} → ${shown(display(c.target.label, c.target.file))}`));
-  section('Not applied', ev.ignored.map((entry) => {
+  // Entries that are not notes at all are counted per folder, never named.
+  const notNotes = labels.filter((l) => ev.ignoredEntries?.[l] > 0).map((l) => {
+    const n = ev.ignoredEntries[l];
+    const what = n === 1 ? '1 entry that is not a note file' : `${n} entries that are not note files`;
+    return `- ${l === GLOBAL ? 'global/' : ''}(${what}): ignored`;
+  });
+  section('Not applied', [...ev.ignored.map((entry) => {
     const { label, file } = splitLoc(entry);
     const known = snap[label] && Object.hasOwn(snap[label], file);
     const why = known ? 'retiring a note is not part of an extract run' : 'a new file cannot be a retirement';
     return `- ${display(label, file)}: ${why}`;
-  }));
+  }), ...notNotes]);
   return `${lines.join('\n')}\n`;
 }
 
