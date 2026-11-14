@@ -111,6 +111,8 @@ test('an invalid consolidate block gives null without disabling the config', (t)
     { ...ok, extract: 'Mon; rm' },
     { ...ok, extract: 'Mon\n03:00' },
     { ...ok, organize: '' },
+    { ...ok, organize: '   ' },
+    { ...ok, extract: ' ' },
     { ...ok, organize: 'x'.repeat(81) },
     { ...ok, maxProjects: 0 },
     { ...ok, maxProjects: 51 },

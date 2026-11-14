@@ -363,6 +363,20 @@ set_consolidate '{"command":"relative/claude","model":"model-id","extract":"Sat 
 run_setup --no-enable
 check 'an invalid block writes no unit' test ! -e "$udir/agent-memory-extract.timer"
 
+# A failing daemon-reload after a removal under --no-enable does not abort setup.
+set_consolidate "$both"
+run_setup --no-enable
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00"}'
+failbin="$tmp/failbin"
+mkdir -p "$failbin"
+printf '%s\n' '#!/bin/bash' "printf '%s\\n' \"\$*\" >> \"$calls\"" 'if [[ "$*" == *daemon-reload* ]]; then exit 1; fi' > "$failbin/systemctl"
+chmod +x "$failbin/systemctl"
+rm -f "$calls"
+setup_path="$failbin:$PATH" run_setup --no-enable
+check 'failing reload after a removal exits 0' test "$status" -eq 0
+check 'failing reload still removed the organize files' test ! -e "$udir/agent-memory-organize.timer" -a ! -e "$udir/agent-memory-organize.service"
+check 'failing reload is reported' has_text "$out" 'could not reload systemd'
+
 # Node.js 24 or later is accepted, an older one is not.
 real_node="$(command -v node)"
 for version in 25 23; do

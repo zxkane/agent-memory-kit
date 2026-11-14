@@ -14,7 +14,7 @@ function intIn(value, fallback, min, max) {
 
 function calendar(value) {
   if (value === undefined || value === null) return null;
-  return typeof value === 'string' && CALENDAR_RE.test(value) ? value : undefined;
+  return typeof value === 'string' && CALENDAR_RE.test(value) && value.trim() !== '' ? value : undefined;
 }
 
 // The optional consolidation block. Any problem gives null: it never disables the rest of the config.

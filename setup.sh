@@ -306,6 +306,8 @@ if [[ $enable -eq 1 ]]; then
         printf 'enabled %s\n' "$t"
     done
 else
-    [[ $removed -eq 0 ]] || systemctl --user daemon-reload
+    if [[ $removed -ne 0 ]] && ! systemctl --user daemon-reload; then
+        printf '%s\n' 'could not reload systemd (systemctl --user daemon-reload failed); run it by hand'
+    fi
     printf '%s\n' 'timer not enabled (--no-enable)'
 fi
