@@ -766,6 +766,55 @@ test('a model that stops on a limit after an invalid change is rejected and the 
   assert.ok(!Number.isNaN(Date.parse(p.lastOrganizeTried)));
 });
 
+const overLimitIndex = () => Array.from({ length: 205 }, (_, i) => `- [n${i}](n${i}.md) — line ${i}`).join('\n') + '\n';
+
+test('F2: an over-limit scope whose model fails does not go first again; a changed scope gets its turn', (t) => {
+  const f = fixture(t, { consolidate: { maxProjects: 1 } });
+  f.seed({
+    'projects/p/MEMORY.md': overLimitIndex(),
+    'projects/p/n0.md': note('n0', 'N0', 'One note.'),
+    'projects/q/a.md': note('a', 'A', 'Changed.'),
+  });
+  f.instruct({ p: { silent: true } });
+  for (let i = 0; i < 3; i++) f.run('organize');
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'q', 'p']);
+});
+
+test('F2: failing scopes of every class rotate among themselves', (t) => {
+  const f = fixture(t, { consolidate: { maxProjects: 2 } });
+  const files = {};
+  for (const name of ['s1', 's2']) {
+    files[`projects/${name}/MEMORY.md`] = overLimitIndex();
+    files[`projects/${name}/n0.md`] = note('n0', 'N0', `Over the limit ${name}.`);
+  }
+  for (const name of ['s3', 's4']) {
+    files[`projects/${name}/a.md`] = note('a', 'A', `One side ${name}.`);
+    files[`projects/${name}/a.conflict-beta.md`] = note('a', 'A', `Other side ${name}.`);
+  }
+  for (const name of ['s5', 's6']) files[`projects/${name}/a.md`] = note('a', 'A', `Plain ${name}.`);
+  f.seed(files);
+  f.instruct({ '*': { silent: true } });
+  for (let i = 0; i < 3; i++) assert.equal(f.run('organize').status, 1);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['s1', 's2', 's3', 's4', 's5', 's6']);
+  f.run('organize');
+  assert.deepEqual(f.calls().slice(6).map((c) => c.scope), ['s1', 's2']);
+});
+
+test('F2: a scope that was organized successfully goes before one whose last run failed', (t) => {
+  const f = fixture(t, { consolidate: { maxProjects: 1 } });
+  f.seed({ 'projects/p/a.md': note('a', 'A', 'Changed since.'), 'projects/q/a.md': note('a', 'A', 'Also changed.') });
+  const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.stateFile(), JSON.stringify({
+    projects: {
+      p: { lastOrganize: days(10), lastOrganizeTried: days(10), organizedDigest: 'f'.repeat(64) },
+      q: { lastOrganize: days(20), lastOrganizeTried: days(15), organizedDigest: 'e'.repeat(64) },
+    },
+  }));
+  f.run('organize');
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
+});
+
 test('with maxProjects 1, an organize scope that always fails does not keep the other waiting', (t) => {
   const f = fixture(t, { consolidate: { maxProjects: 1 } });
   f.seed({ 'projects/p/a.md': note('a', 'A', 'One.'), 'projects/q/a.md': note('a', 'A', 'Two.') });

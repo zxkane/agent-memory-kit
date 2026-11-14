@@ -636,9 +636,14 @@ function extractScopes(scan, state, opts, now) {
 // Organize: a scope with notes is due when its content changed since it was last organized (or
 // it never was). One that did not change but is still over the index limits or still holds a
 // conflict copy is due again only after REVISIT_MS: the model could not fix it last time, and
-// taking it every week would crowd out the scopes that changed. Over-limit first, then
-// conflicts, then the others; inside each class by lastOrganizeTried (falling back to
-// lastOrganize), oldest first.
+// taking it every week would crowd out the scopes that changed.
+// Order, in two groups:
+// - A, every due scope except those of group B: by class (over the limits, then a conflict copy,
+//   then the others), then by lastOrganizeTried (falling back to lastOrganize), oldest first,
+//   never tried first;
+// - B, scopes whose last model run left them unorganized (lastOrganizeTried is set and lastOrganize
+//   is absent or older): after all of A, by lastOrganizeTried only, whatever their class, so that
+//   scopes failing every run rotate among themselves and cannot keep the others waiting.
 function organizeScopes(scan, state, opts, now) {
   const infos = [...(scan.global.usable ? [{ name: GLOBAL, ...scan.global }] : []), ...scan.projects];
   if (opts.projects.length > 0) return opts.projects.map((name) => ({ scope: name }));
@@ -650,11 +655,20 @@ function organizeScopes(scan, state, opts, now) {
     return (i.overLimit || i.conflict) && now - last(i) > REVISIT_MS;
   };
   const rank = (i) => (i.overLimit ? 0 : i.conflict ? 1 : 2);
-  // Inside each class: the scope whose model was started longest ago (never first), so one that
-  // fails on every run does not keep the others waiting.
   const tried = (i) => timeOf(entry(i)?.lastOrganizeTried) ?? last(i);
+  const leftUnorganized = (i) => {
+    const t = timeOf(entry(i)?.lastOrganizeTried);
+    const l = timeOf(entry(i)?.lastOrganize);
+    return t !== null && (l === null || t > l);
+  };
+  const older = (a, b) => (a === b ? 0 : a - b);
   const due = infos.filter(isDue);
-  due.sort((x, y) => rank(x) - rank(y) || (tried(x) === tried(y) ? 0 : tried(x) - tried(y)) || byName(x.name, y.name));
+  due.sort((x, y) => {
+    const gx = leftUnorganized(x);
+    const gy = leftUnorganized(y);
+    if (gx !== gy) return gx ? 1 : -1;
+    return (gx ? 0 : rank(x) - rank(y)) || older(tried(x), tried(y)) || byName(x.name, y.name);
+  });
   return due.map((i) => ({ scope: i.name }));
 }
 
