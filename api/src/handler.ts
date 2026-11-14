@@ -1,22 +1,20 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
-import { scanText } from '../../workstation/lib/secret-scan.mjs';
 import { ApiError } from './errors.ts';
-import { memoryIndex } from './ops/index.ts';
-import { memoryRead } from './ops/read.ts';
-import { memoryScopes } from './ops/scopes.ts';
-import { memorySearch } from './ops/search.ts';
-import { memoryWrite } from './ops/write.ts';
+import { handleGateway, isGatewayInvocation } from './gateway.ts';
+import type { GatewayContext } from './gateway.ts';
+import { failure, runOperation, writeLine } from './run.ts';
+import type { Line, Query } from './run.ts';
 import { RESOURCE_SERVER, ROUTES } from './routes.ts';
 import { createSnapshots } from './snapshot.ts';
 import { s3Store } from './store.ts';
 import type { Store } from './store.ts';
-import { onlyParams, parseNotePath, parseScope, scopeName } from './validate.ts';
 
 const MAX_BODY_BYTES = 100_000;
 
-type Query = Record<string, string | undefined>;
-type Line = { op: string | null; clientId: string | null; scope: string | null; path: string | null; status: number; ms: number; error?: string };
-type Handler = (event: APIGatewayProxyEventV2WithJWTAuthorizer) => Promise<APIGatewayProxyStructuredResultV2>;
+type HttpHandler = (event: APIGatewayProxyEventV2WithJWTAuthorizer) => Promise<APIGatewayProxyStructuredResultV2>;
+// The first signature is the HTTP API event; the second is what Lambda passes in general, which
+// may be a gateway invocation (answered with a plain object).
+type Handler = HttpHandler & ((event: unknown, context?: GatewayContext) => Promise<unknown>);
 
 function reply(status: number, body: unknown): APIGatewayProxyStructuredResultV2 {
   return {
@@ -24,10 +22,6 @@ function reply(status: number, body: unknown): APIGatewayProxyStructuredResultV2
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
     body: JSON.stringify(body),
   };
-}
-
-function errorBody(code: string, message: string): { error: { code: string; message: string } } {
-  return { error: { code, message } };
 }
 
 function parseBody(event: APIGatewayProxyEventV2WithJWTAuthorizer): unknown {
@@ -42,37 +36,11 @@ function parseBody(event: APIGatewayProxyEventV2WithJWTAuthorizer): unknown {
   }
 }
 
-// Scope and path for the log line: only values that pass the same validation as the operations.
-function logTargets(operationId: string | null, query: Query, body: unknown): { scope: string | null; path: string | null } {
-  let scope: string | null = null;
-  let path: string | null = null;
-  try {
-    if (query.scope !== undefined) scope = scopeName(parseScope(query.scope));
-    if (operationId === 'memory_read') {
-      const note = parseNotePath(query.path);
-      scope = scopeName(note.scope);
-      path = `${scope}/${note.file}`;
-    }
-    if (operationId === 'memory_write' && typeof body === 'object' && body !== null) {
-      const { agent, name } = body as Record<string, unknown>;
-      scope = scopeName(parseScope(`agents/${String(agent)}`));
-      const note = parseNotePath(`${scope}/${String(name)}.md`);
-      path = `${scopeName(note.scope)}/${note.file}`;
-    }
-  } catch {
-    // Invalid input is simply not logged.
-  }
-  // A value the credential scan flags is not logged either, whichever route it came in on.
-  const flagged = (value: string | null) => value !== null && (scanText(value) as unknown[]).length > 0;
-  if (flagged(scope) || flagged(path)) return { scope: null, path: null };
-  return { scope, path };
-}
-
-export function createHandler(deps: { store: Store; log?: (line: object) => void }): Handler {
+export function createHandler(deps: { store: Store; log?: (line: object) => void; direct?: boolean }): Handler {
   const log = deps.log ?? ((line: object) => console.log(JSON.stringify(line)));
-  const snapshots = createSnapshots(deps.store);
+  const ops = { store: deps.store, snapshots: createSnapshots(deps.store) };
 
-  return async (event) => {
+  const http: HttpHandler = async (event) => {
     const started = Date.now();
     const route = ROUTES.find((r) => `${r.method} ${r.path}` === event.routeKey);
     const query: Query = event.queryStringParameters ?? {};
@@ -96,49 +64,28 @@ export function createHandler(deps: { store: Store; log?: (line: object) => void
       if (!granted.includes(`${RESOURCE_SERVER}/${route.scope}`)) {
         throw new ApiError(403, 'forbidden', 'the token does not allow this operation');
       }
-      let result: unknown;
-      switch (route.operationId) {
-        case 'memory_scopes':
-          onlyParams(query, []);
-          result = await memoryScopes({ snapshots });
-          break;
-        case 'memory_index':
-          result = await memoryIndex({ store: deps.store }, query);
-          break;
-        case 'memory_search':
-          result = await memorySearch({ snapshots }, query);
-          break;
-        case 'memory_read':
-          result = await memoryRead({ store: deps.store }, query);
-          break;
-        case 'memory_write':
-          onlyParams(query, []);
-          body = parseBody(event);
-          result = await memoryWrite({ store: deps.store }, body);
-          break;
-      }
+      const result = await runOperation(ops, route.operationId, query, () => (body = parseBody(event)));
       response = reply(200, result);
     } catch (err) {
-      if (err instanceof ApiError) {
-        line.status = err.status;
-        response = reply(err.status, errorBody(err.code, err.message));
-      } else {
-        line.status = 500;
-        line.error = err instanceof Error ? err.name : 'unknown';
-        response = reply(500, errorBody('internal', 'internal error'));
-      }
+      const failed = failure(err, line);
+      response = reply(failed.status, failed.body);
     }
-    Object.assign(line, logTargets(line.op, query, body));
-    line.ms = Date.now() - started;
-    log(line);
+    writeLine(log, line, started, query, body);
     return response;
   };
+
+  // Only the platform's context can say that this is a gateway invocation; an HTTP API event
+  // carries no such context, and nothing inside an event can make it take the direct path.
+  return ((event: unknown, context?: GatewayContext) =>
+    isGatewayInvocation(context)
+      ? handleGateway({ ops, log, direct: deps.direct === true }, event, context)
+      : http(event as APIGatewayProxyEventV2WithJWTAuthorizer)) as Handler;
 }
 
 // Built on first use, so importing this module needs neither the BUCKET variable nor AWS.
 let shared: Handler | undefined;
 
-export const handler: Handler = (event) => {
-  shared ??= createHandler({ store: s3Store(process.env.BUCKET!) });
-  return shared(event);
-};
+export const handler = ((event: unknown, context?: GatewayContext) => {
+  shared ??= createHandler({ store: s3Store(process.env.BUCKET!), direct: process.env.DIRECT_INVOCATION === 'on' });
+  return shared(event, context);
+}) as Handler;

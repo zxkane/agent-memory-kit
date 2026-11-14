@@ -634,6 +634,8 @@ The API writes the matching agent-side objects itself: `agents/<agent>/<name>.md
 
 `api/openapi.json` describes the operations, including the text the gateway shows to the model. Errors are `{ "error": { "code", "message" } }`.
 
+The same five operations are also available to a gateway that invokes the function directly (a Lambda target), once the deployment enables direct invocation (`DIRECT_INVOCATION=on`; otherwise the function answers such an invocation with `forbidden`). `api/gateway-tools.json` holds their tool definitions: name, description and input schema, written to match `openapi.json`. The gateway names the tool in the client context of the invocation (`bedrockAgentCoreToolName`, in the form `<target name>___<tool name>`; only the caller of the Lambda `Invoke` API can set it) and sends the arguments as the event: for the four read tools the query parameters of the route (a string each; `limit` may be an integer), for `memory_write` the request body. The function runs the same checks as for the HTTP API and returns a plain JSON object: the same body as the HTTP answer on success, and `{ "error": { "code", "message" } }` on failure (an unknown tool is `not_found`). It does not throw. There is no token scope check on this path; the gateway decides which callers may use which tool.
+
 ### Limits and trust
 
 - The API reads a replica of the workstation notes and can write only under `agents/<agent>/`. It has no delete operation.
