@@ -27,11 +27,12 @@ const CONSOLIDATE_KEYS = [
 ];
 
 // Whether an unknown key may be printed by name (the driver and setup.sh echo the problem field):
-// a plain short name that the secret scan does not flag, alone or as the name of an assignment. A
-// token pasted where a key should be is reported only as "(an unknown key)".
+// only a word-shaped key (a misspelling is a word), and not one that the secret scan flags, such
+// as a letters-only access key ID. Anything else, for example a token pasted where a key should
+// be, is reported only as "(an unknown key)".
+const WORD_KEY_RE = /^[A-Za-z][A-Za-z_-]{0,31}$/;
 function echoable(key) {
-  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(key)) return false;
-  return [key, `${key}=x`, `${key}: x`].every((form) => scanText(form).length === 0);
+  return WORD_KEY_RE.test(key) && scanText(key).length === 0;
 }
 
 // The optional consolidation block: `{ value, problem }`. An absent block gives no value and no
