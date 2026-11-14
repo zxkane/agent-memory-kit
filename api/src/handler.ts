@@ -5,7 +5,7 @@ import { memoryRead } from './ops/read.ts';
 import { memoryScopes } from './ops/scopes.ts';
 import { memorySearch } from './ops/search.ts';
 import { memoryWrite } from './ops/write.ts';
-import { ROUTES } from './routes.ts';
+import { RESOURCE_SERVER, ROUTES } from './routes.ts';
 import { createSnapshots } from './snapshot.ts';
 import { s3Store } from './store.ts';
 import type { Store } from './store.ts';
@@ -30,10 +30,10 @@ function errorBody(code: string, message: string): { error: { code: string; mess
 }
 
 function parseBody(event: APIGatewayProxyEventV2WithJWTAuthorizer): unknown {
-  const bad = () => new ApiError(400, 'invalid_request', 'The request body must be a JSON object of at most 100000 bytes.');
+  const bad = () => new ApiError(400, 'invalid_request', 'The request body must be a JSON object.');
   if (typeof event.body !== 'string' || event.body === '') throw bad();
   const raw = event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body, 'utf8');
-  if (raw.length > MAX_BODY_BYTES) throw bad();
+  if (raw.length > MAX_BODY_BYTES) throw new ApiError(400, 'invalid_request', 'the request body is too large');
   try {
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
   } catch {
@@ -85,6 +85,13 @@ export function createHandler(deps: { store: Store; log?: (line: object) => void
     let response: APIGatewayProxyStructuredResultV2;
     try {
       if (!route) throw new ApiError(404, 'not_found', 'unknown route');
+      // API Gateway enforces the scope per route; this makes the function fail closed if a route
+      // is ever deployed without it. It does not verify the token itself.
+      const scopes = (event.requestContext?.authorizer?.jwt?.claims as Record<string, unknown> | undefined)?.scope;
+      const granted = typeof scopes === 'string' ? scopes.split(/\s+/) : [];
+      if (!granted.includes(`${RESOURCE_SERVER}/${route.scope}`)) {
+        throw new ApiError(403, 'forbidden', 'the token does not allow this operation');
+      }
       let result: unknown;
       switch (route.operationId) {
         case 'memory_scopes':

@@ -2,7 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { ApiError } from '../src/errors.ts';
+import { memoryIndex } from '../src/ops/index.ts';
+import { memoryRead } from '../src/ops/read.ts';
+import { memorySearch } from '../src/ops/search.ts';
 import { ROUTES } from '../src/routes.ts';
+import { createSnapshots } from '../src/snapshot.ts';
+import { parseWrite } from '../src/validate.ts';
+import { fakeStore } from './fake-store.ts';
 
 const DOC_URL = new URL('../openapi.json', import.meta.url);
 const SCRIPT = new URL('../scripts/render-openapi.ts', import.meta.url).pathname;
@@ -58,7 +65,7 @@ test('no forbidden keys anywhere', () => {
 });
 
 test('only application/json content', () => {
-  const containers: any[] = [...Object.values(doc.components.responses)];
+  const containers: any[] = [];
   for (const { op } of operations()) containers.push(op.requestBody, ...Object.values(op.responses));
   let seen = 0;
   for (const c of containers) {
@@ -95,19 +102,119 @@ test('required query parameters match validation', () => {
   assert.deepEqual(required('memory_read'), ['path']);
 });
 
-test('write request body matches parseWrite', () => {
+const SAMPLE: Record<string, string> = {
+  agent: 'hermes',
+  name: 'my-note',
+  description: 'A note',
+  content: 'Hello',
+  type: 'reference',
+  scope: 'global',
+  q: 'hello',
+  limit: '5',
+  path: 'global/n.md',
+};
+
+function accepts(fn: () => unknown): boolean {
+  try {
+    fn();
+    return true;
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'invalid_request') return false;
+    throw err;
+  }
+}
+
+test('write request body behaves as the document says', () => {
   const op = operations().find((o) => o.op.operationId === 'memory_write')!.op;
   const schema = op.requestBody.content['application/json'].schema;
-  assert.deepEqual(Object.keys(schema.properties).sort(), ['agent', 'content', 'description', 'name', 'type']);
-  assert.deepEqual([...schema.required].sort(), ['agent', 'content', 'description', 'name']);
   assert.equal(schema.additionalProperties, false);
-  assert.deepEqual([...schema.properties.type.enum].sort(), ['feedback', 'project', 'reference', 'user']);
+  const names: string[] = Object.keys(schema.properties);
+  for (const n of names) assert.ok(n in SAMPLE, `no sample for ${n}`);
+  const full = Object.fromEntries(names.map((n) => [n, SAMPLE[n]]));
+  assert.ok(accepts(() => parseWrite(full)), 'full body');
+  for (const n of names) {
+    const without = { ...full };
+    delete without[n];
+    const required = (schema.required as string[]).includes(n);
+    assert.equal(accepts(() => parseWrite(without)), !required, `dropping ${n}`);
+  }
+  assert.equal(accepts(() => parseWrite({ ...full, extra: 'x' })), false, 'extra key');
+  for (const value of schema.properties.type.enum) {
+    assert.ok(accepts(() => parseWrite({ ...full, type: value })), `type ${value}`);
+  }
+  assert.equal(accepts(() => parseWrite({ ...full, type: 'bogus' })), false);
+});
+
+test('query parameters behave as the document says', async () => {
+  const store = fakeStore({
+    'index/agents.json': JSON.stringify({ notes: [] }),
+    'mem/global/MEMORY.md': '- i',
+    'mem/global/n.md': 'x',
+  });
+  const snapshots = createSnapshots(store);
+  const run: Record<string, (q: Record<string, string | undefined>) => Promise<unknown>> = {
+    memory_index: (q) => memoryIndex({ store }, q),
+    memory_search: (q) => memorySearch({ snapshots }, q),
+    memory_read: (q) => memoryRead({ store }, q),
+  };
+  const ok = async (fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+      return true;
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'invalid_request') return false;
+      if (err instanceof ApiError && err.code === 'not_found') return true;
+      throw err;
+    }
+  };
+  for (const { op } of operations()) {
+    const params: any[] = op.parameters ?? [];
+    if (op.operationId === 'memory_scopes') {
+      assert.deepEqual(params, []);
+      continue;
+    }
+    if (op.operationId === 'memory_write') continue;
+    const call = run[op.operationId]!;
+    const full = Object.fromEntries(params.map((p) => [p.name, SAMPLE[p.name]]));
+    assert.ok(await ok(() => call(full)), `${op.operationId} full`);
+    for (const p of params) {
+      const without = { ...full };
+      delete without[p.name];
+      assert.equal(await ok(() => call(without)), !p.required, `${op.operationId} without ${p.name}`);
+    }
+    assert.equal(await ok(() => call({ ...full, unknown: 'x' })), false, `${op.operationId} unknown parameter`);
+  }
+});
+
+test('no $ref and no components', () => {
+  assert.equal('components' in doc, false);
+  const found: string[] = [];
+  walk(doc, (k) => {
+    if (k === '$ref' || k === 'components') found.push(k);
+  });
+  assert.deepEqual(found, []);
+});
+
+test('every operation documents 403 forbidden with the error body', () => {
+  for (const { op } of operations()) {
+    const res = op.responses['403'];
+    assert.ok(res, op.operationId);
+    assert.deepEqual(Object.keys(res.content['application/json'].schema.properties), ['error']);
+    assert.match(res.description, /scope/);
+  }
+  assert.match(text, /forbidden/);
+});
+
+test('memory_scopes has no 400 and memory_write says it cannot delete', () => {
+  const by = (id: string) => operations().find((o) => o.op.operationId === id)!.op;
+  assert.equal(by('memory_scopes').responses['400'], undefined);
+  assert.match(by('memory_write').description, /cannot delete/);
 });
 
 test('responses list 200 and the documented errors', () => {
   for (const { op } of operations()) {
     assert.ok(op.responses['200']);
-    assert.ok(op.responses['400']);
+    if (op.operationId !== 'memory_scopes') assert.ok(op.responses['400']);
   }
   const by = (id: string) => operations().find((o) => o.op.operationId === id)!.op;
   assert.ok(by('memory_index').responses['404']);

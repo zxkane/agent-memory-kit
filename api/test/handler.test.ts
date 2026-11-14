@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda';
 import { ApiError } from '../src/errors.ts';
 import { createHandler } from '../src/handler.ts';
+import { RESOURCE_SERVER, ROUTES } from '../src/routes.ts';
 import type { Store } from '../src/store.ts';
 import { fakeStore } from './fake-store.ts';
 
@@ -15,9 +16,15 @@ function event(
     body?: string;
     base64?: boolean;
     clientId?: string | null;
+    scope?: unknown;
   } = {},
 ): APIGatewayProxyEventV2WithJWTAuthorizer {
-  const claims = opts.clientId === null ? {} : { client_id: opts.clientId ?? 'client-1' };
+  const claims: Record<string, unknown> = opts.clientId === null ? {} : { client_id: opts.clientId ?? 'client-1' };
+  if ('scope' in opts) {
+    if (opts.scope !== undefined) claims.scope = opts.scope;
+  } else {
+    claims.scope = 'agent-memory/read agent-memory/write';
+  }
   return {
     routeKey,
     queryStringParameters: opts.query,
@@ -84,13 +91,69 @@ test('invalid JSON and a missing or empty body give 400 invalid_request', async 
   }
 });
 
-test('an oversized body is 400 invalid_request', async () => {
+const TOO_LARGE = 'the request body is too large';
+
+function throwingStore(touched: string[]): Store {
+  return {
+    async get(key) {
+      touched.push(key);
+      throw new Error('store touched');
+    },
+    async put(key) {
+      touched.push(key);
+      throw new Error('store touched');
+    },
+  };
+}
+
+// A valid write body whose serialized size is exactly `bytes` (content is padded with `fill`).
+function bodyOfSize(bytes: number, fill = 'x'): string {
+  const base = JSON.stringify({ agent: 'hermes', name: 'my-note', description: 'A note', content: '' });
+  const fillBytes = Buffer.byteLength(fill);
+  const room = bytes - Buffer.byteLength(base);
+  const count = Math.floor(room / fillBytes);
+  const content = 'x'.repeat(room - count * fillBytes) + fill.repeat(count);
+  const out = JSON.stringify({ agent: 'hermes', name: 'my-note', description: 'A note', content });
+  assert.equal(Buffer.byteLength(out), bytes);
+  return out;
+}
+
+test('an oversized body is rejected by the size limit before anything else', async () => {
+  const touched: string[] = [];
+  const lines: Line[] = [];
+  const handler = createHandler({ store: throwingStore(touched), log: (l) => lines.push(l as Line) });
+  const cases: Array<[string, Parameters<typeof event>[1]]> = [
+    ['one byte over', { body: bodyOfSize(100_001) }],
+    ['multi-byte characters', { body: bodyOfSize(100_002, '\u00e9') }],
+    ['base64 of an oversized body', { body: Buffer.from(bodyOfSize(100_001)).toString('base64'), base64: true }],
+  ];
+  for (const [label, opts] of cases) {
+    const res = await handler(event('POST /v1/notes', opts));
+    assert.equal(res.statusCode, 400, label);
+    assert.equal(json(res).error.code, 'invalid_request', label);
+    assert.equal(json(res).error.message, TOO_LARGE, label);
+  }
+  assert.deepEqual(touched, []);
+  assert.ok(lines.every((l) => l.status === 400));
+});
+
+test('a body of exactly 100000 bytes passes the size limit (even multi-byte)', async () => {
+  const handler = createHandler({ store: throwingStore([]), log: () => {} });
+  for (const opts of [
+    { body: bodyOfSize(100_000) },
+    { body: bodyOfSize(100_000, '\u00e9') },
+    { body: Buffer.from(bodyOfSize(100_000)).toString('base64'), base64: true },
+  ]) {
+    const res = await handler(event('POST /v1/notes', opts));
+    // The size check let it through; parseWrite then refuses the content (over 50000 bytes).
+    assert.equal(res.statusCode, 400);
+    assert.notEqual(json(res).error.message, TOO_LARGE);
+    assert.match(json(res).error.message, /content/);
+  }
+});
+
+test('base64 inflation does not count against the limit', async () => {
   const { handler } = setup();
-  const big = JSON.stringify({ content: 'x'.repeat(100_001) });
-  const res = await handler(event('POST /v1/notes', { body: big }));
-  assert.equal(res.statusCode, 400);
-  assert.equal(json(res).error.code, 'invalid_request');
-  // base64 inflates, so the limit applies to the decoded bytes.
   const small = Buffer.from(writeBody()).toString('base64');
   const ok = await handler(event('POST /v1/notes', { body: small, base64: true }));
   assert.equal(ok.statusCode, 200);
@@ -190,4 +253,36 @@ test('ApiError thrown by an operation keeps its status', async () => {
   const res = await handler(event('GET /v1/note', { query: { path: 'global/n.md' } }));
   assert.equal(res.statusCode, 409);
   assert.equal(json(res).error.code, 'conflict');
+});
+
+const OTHER: Record<string, string> = { read: 'agent-memory/write', write: 'agent-memory/read' };
+const ROUTE_EVENTS: Record<string, Parameters<typeof event>[1]> = {
+  'GET /v1/scopes': {},
+  'GET /v1/index': { query: { scope: 'global' } },
+  'GET /v1/search': { query: { q: 'hello' } },
+  'GET /v1/note': { query: { path: 'global/n.md' } },
+  'POST /v1/notes': { body: writeBody() },
+};
+
+test('the token scope is checked per route (fail closed, store untouched on 403)', async () => {
+  for (const route of ROUTES) {
+    const key = `${route.method} ${route.path}`;
+    const base = ROUTE_EVENTS[key]!;
+    const own = `${RESOURCE_SERVER}/${route.scope}`;
+    const { handler: ok } = setup({ 'index/agents.json': SNAPSHOT, 'mem/global/MEMORY.md': '- i', 'mem/global/n.md': 'x' });
+    assert.equal((await ok(event(key, { ...base, scope: own }))).statusCode, 200, `${key} own`);
+    assert.equal((await ok(event(key, { ...base, scope: 'agent-memory/read agent-memory/write' }))).statusCode, 200, `${key} both`);
+
+    const touched: string[] = [];
+    const lines: Line[] = [];
+    const handler = createHandler({ store: throwingStore(touched), log: (l) => lines.push(l as Line) });
+    const denied: unknown[] = [OTHER[route.scope], undefined, 42, ['agent-memory/read', 'agent-memory/write'], '', `x${own}`];
+    for (const scope of denied) {
+      const res = await handler(event(key, { ...base, scope }));
+      assert.equal(res.statusCode, 403, `${key} ${JSON.stringify(scope)}`);
+      assert.deepEqual(json(res), { error: { code: 'forbidden', message: 'the token does not allow this operation' } });
+    }
+    assert.deepEqual(touched, [], key);
+    assert.ok(lines.every((l) => l.status === 403 && l.op === route.operationId));
+  }
 });

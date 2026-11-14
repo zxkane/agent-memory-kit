@@ -5,7 +5,11 @@
     "version": "1.0.0",
     "description": "Read and search shared memory notes, and write notes into an agent's own scope."
   },
-  "servers": [{ "url": "https://example.com" }],
+  "servers": [
+    {
+      "url": "https://example.com"
+    }
+  ],
   "paths": {
     "/v1/scopes": {
       "get": {
@@ -25,8 +29,14 @@
                       "items": {
                         "type": "object",
                         "properties": {
-                          "scope": { "type": "string", "description": "Scope name: global, projects/<project> or agents/<agent>." },
-                          "notes": { "type": "integer", "description": "Number of notes in the scope." }
+                          "scope": {
+                            "type": "string",
+                            "description": "Scope name: global, projects/<project> or agents/<agent>."
+                          },
+                          "notes": {
+                            "type": "integer",
+                            "description": "Number of notes in the scope."
+                          }
                         }
                       }
                     }
@@ -35,7 +45,31 @@
               }
             }
           },
-          "400": { "$ref": "#/components/responses/InvalidRequest" }
+          "403": {
+            "description": "forbidden: the token lacks the scope this operation needs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -50,7 +84,9 @@
             "in": "query",
             "required": true,
             "description": "Scope name: global, projects/<project> or agents/<agent>.",
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -61,16 +97,98 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "scope": { "type": "string", "description": "The scope that was read." },
-                    "index": { "type": "string", "description": "Markdown text of MEMORY.md, possibly cut." },
-                    "truncated": { "type": "boolean", "description": "True when the index was cut at 25000 bytes." }
+                    "scope": {
+                      "type": "string",
+                      "description": "The scope that was read."
+                    },
+                    "index": {
+                      "type": "string",
+                      "description": "Markdown text of MEMORY.md, possibly cut."
+                    },
+                    "truncated": {
+                      "type": "boolean",
+                      "description": "True when the index was cut at 25000 bytes."
+                    }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/InvalidRequest" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "400": {
+            "description": "invalid_request: an argument is missing, malformed or unknown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden: the token lacks the scope this operation needs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: the scope index or note does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -85,21 +203,29 @@
             "in": "query",
             "required": true,
             "description": "Search words, 1 to 200 characters, separated by spaces.",
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           },
           {
             "name": "scope",
             "in": "query",
             "required": false,
             "description": "Only search this scope: global, projects/<project> or agents/<agent>. Omit to search all scopes.",
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           },
           {
             "name": "limit",
             "in": "query",
             "required": false,
             "description": "Maximum number of results, 1 to 20. Defaults to 10.",
-            "schema": { "type": "integer", "minimum": 1, "maximum": 20 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20
+            }
           }
         ],
         "responses": {
@@ -115,22 +241,92 @@
                       "items": {
                         "type": "object",
                         "properties": {
-                          "path": { "type": "string", "description": "Note path <scope>/<file>.md, usable with memory_read." },
-                          "scope": { "type": "string", "description": "Scope of the note." },
-                          "name": { "type": "string", "description": "Note name." },
-                          "description": { "type": "string", "description": "One-line description of the note." },
-                          "snippet": { "type": "string", "description": "Text around the first match." },
-                          "score": { "type": "integer", "description": "Relevance score; higher is better." }
+                          "path": {
+                            "type": "string",
+                            "description": "Note path <scope>/<file>.md, usable with memory_read."
+                          },
+                          "scope": {
+                            "type": "string",
+                            "description": "Scope of the note."
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "Note name."
+                          },
+                          "description": {
+                            "type": "string",
+                            "description": "One-line description of the note."
+                          },
+                          "snippet": {
+                            "type": "string",
+                            "description": "Text around the first match."
+                          },
+                          "score": {
+                            "type": "integer",
+                            "description": "Relevance score; higher is better."
+                          }
                         }
                       }
                     },
-                    "total": { "type": "integer", "description": "Number of notes that matched, which may exceed the results returned." }
+                    "total": {
+                      "type": "integer",
+                      "description": "Number of notes that matched, which may exceed the results returned."
+                    }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/InvalidRequest" }
+          "400": {
+            "description": "invalid_request: an argument is missing, malformed or unknown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden: the token lacks the scope this operation needs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -145,7 +341,9 @@
             "in": "query",
             "required": true,
             "description": "Note path: <scope>/<file>.md where scope is global, projects/<project> or agents/<agent>.",
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -156,16 +354,98 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "path": { "type": "string", "description": "The note path that was read." },
-                    "content": { "type": "string", "description": "Markdown text of the note, possibly cut." },
-                    "truncated": { "type": "boolean", "description": "True when the note was cut at 100000 bytes." }
+                    "path": {
+                      "type": "string",
+                      "description": "The note path that was read."
+                    },
+                    "content": {
+                      "type": "string",
+                      "description": "Markdown text of the note, possibly cut."
+                    },
+                    "truncated": {
+                      "type": "boolean",
+                      "description": "True when the note was cut at 100000 bytes."
+                    }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/InvalidRequest" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "400": {
+            "description": "invalid_request: an argument is missing, malformed or unknown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden: the token lacks the scope this operation needs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: the scope index or note does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -173,7 +453,7 @@
       "post": {
         "operationId": "memory_write",
         "summary": "Create or replace a note in your own agent scope.",
-        "description": "Writes a note to agents/<agent>/<name>.md and adds it to that scope's index. It writes only to agents/<agent>/ scopes: global and projects/<project> cannot be written. Writing a name that already exists replaces that note (created is false); a new name creates it (created is true). Each agent scope holds at most 200 notes, and the whole agent store has a size limit, so keep notes short and few. Content that looks like a credential, token or key is refused with secret_detected; never write secrets. Write durable facts worth recalling later, not transcripts.",
+        "description": "Writes a note to agents/<agent>/<name>.md and adds it to that scope's index. It writes only to agents/<agent>/ scopes: global and projects/<project> cannot be written, and this tool cannot delete notes. Writing a name that already exists replaces that note (created is false); a new name creates it (created is true). Each agent scope holds at most 200 notes, and the whole agent store has a size limit, so keep notes short and few. Content that looks like a credential, token or key is refused with secret_detected; never write secrets. Write durable facts worth recalling later, not transcripts.",
         "requestBody": {
           "required": true,
           "content": {
@@ -181,7 +461,12 @@
               "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["agent", "name", "description", "content"],
+                "required": [
+                  "agent",
+                  "name",
+                  "description",
+                  "content"
+                ],
                 "properties": {
                   "agent": {
                     "type": "string",
@@ -197,7 +482,12 @@
                   },
                   "type": {
                     "type": "string",
-                    "enum": ["user", "feedback", "project", "reference"],
+                    "enum": [
+                      "user",
+                      "feedback",
+                      "project",
+                      "reference"
+                    ],
                     "description": "Kind of note: user (about the person), feedback (guidance on how to work), project (ongoing work) or reference (pointer to a resource). Defaults to reference."
                   },
                   "content": {
@@ -217,8 +507,14 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "path": { "type": "string", "description": "Path of the stored note, usable with memory_read." },
-                    "created": { "type": "boolean", "description": "True when the note is new, false when it replaced an existing note." }
+                    "path": {
+                      "type": "string",
+                      "description": "Path of the stored note, usable with memory_read."
+                    },
+                    "created": {
+                      "type": "boolean",
+                      "description": "True when the note is new, false when it replaced an existing note."
+                    }
                   }
                 }
               }
@@ -226,42 +522,80 @@
           },
           "400": {
             "description": "The request was refused: invalid_request (bad or unknown field, bad JSON, body over 100000 bytes), secret_detected (the text looks like a credential), scope_full (200 notes in this agent scope) or store_full (the agent store is full).",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden: the token lacks the scope this operation needs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           },
           "409": {
             "description": "conflict: a concurrent write kept the update from applying. Retry the same request.",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
-          }
-        }
-      }
-    }
-  },
-  "components": {
-    "schemas": {
-      "Error": {
-        "type": "object",
-        "properties": {
-          "error": {
-            "type": "object",
-            "properties": {
-              "code": {
-                "type": "string",
-                "description": "One of invalid_request, secret_detected, scope_full, store_full, not_found, conflict, internal."
-              },
-              "message": { "type": "string", "description": "Short human-readable explanation." }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
-      }
-    },
-    "responses": {
-      "InvalidRequest": {
-        "description": "invalid_request: an argument is missing, malformed or unknown.",
-        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
-      },
-      "NotFound": {
-        "description": "not_found: the scope index or note does not exist.",
-        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       }
     }
   }
