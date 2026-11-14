@@ -13,7 +13,7 @@ import { INDEX, NOTE_NAME_RE, indexRefs, indexStats, stubTarget } from './notes.
 import { scanText } from './secret-scan.mjs';
 
 const MAX_NOTE_BYTES = 100000;
-const SHRINK_MIN_BYTES = 20000;
+const RETENTION_MIN_TERMS = 200;
 const GLOBAL = 'global';
 const HASH_RE = /^[0-9a-f]{64}$/;
 
@@ -26,8 +26,8 @@ const isStub = (buf) => stubTarget(text(buf)) !== null;
 // is quoted (it may hold a newline), and a name that looks like a credential is not shown.
 function loc(label, name) {
   const s = String(name);
-  if (!NOTE_NAME_RE.test(s)) return `${label}/${JSON.stringify(s.slice(0, 80))}`;
   if (scanText(s).length > 0) return `${label}/"(file name withheld)"`;
+  if (!NOTE_NAME_RE.test(s)) return `${label}/${JSON.stringify(s.slice(0, 80))}`;
   return `${label}/${s}`;
 }
 
@@ -131,26 +131,58 @@ function notesBytes(files, { skipStubs = false } = {}) {
   return n;
 }
 
-export function liveDiffers(pairs, snap) {
+// Note files whose live state differs from the snapshot. `watched` (optional) lists further
+// `<label>/<file>` names, such as those a change set is about to write: an entry that exists under
+// one of them but is not a regular file (a link, a folder) is listed too.
+export function liveDiffers(pairs, snap, watched = []) {
   const diff = [];
   for (const { label, liveDir } of pairs) {
     const known = snap[label] ?? {};
-    const live = scanDir(liveDir).files;
+    const { files: live, other } = scanDir(liveDir);
     for (const [name, buf] of live) {
       if (known[name] !== sha256(buf)) diff.push(`${label}/${name}`);
     }
     for (const name of Object.keys(known)) {
       if (!live.has(name)) diff.push(`${label}/${name}`);
     }
+    for (const name of other) {
+      const key = `${label}/${name}`;
+      if (watched.includes(key) && !diff.includes(key)) diff.push(key);
+    }
   }
   return diff;
+}
+
+// The distinct terms of a note: lower-cased runs of four or more letters, digits or underscores,
+// plus, for Han script, every pair of adjacent characters (a lone character stands for itself).
+export function noteTokens(input) {
+  const tokens = new Set();
+  const lower = String(input).toLowerCase();
+  for (const m of lower.matchAll(/\p{Script=Han}+/gu)) {
+    const chars = Array.from(m[0]);
+    if (chars.length === 1) tokens.add(chars[0]);
+    for (let i = 0; i + 1 < chars.length; i++) tokens.add(chars[i] + chars[i + 1]);
+  }
+  for (const m of lower.replace(/\p{Script=Han}/gu, ' ').matchAll(/[\p{L}\p{N}_]{4,}/gu)) tokens.add(m[0]);
+  return tokens;
+}
+
+function folderTokens(maps) {
+  const all = new Set();
+  for (const files of maps) {
+    for (const [name, buf] of files) {
+      if (name === INDEX || isStub(buf)) continue;
+      for (const t of noteTokens(text(buf))) all.add(t);
+    }
+  }
+  return all;
 }
 
 // Why a changed or new, non-stub file is not acceptable; null when it is.
 function contentProblem(name, buf) {
   const body = text(buf);
   const trimmed = body.trim();
-  if (trimmed.startsWith('MOVED TO [[')) return 'malformed retirement line';
+  if (/^moved\s+to\s*\[/i.test(trimmed.normalize('NFKC'))) return 'malformed retirement line';
   if (name !== INDEX && trimmed === '') return 'a note may not be emptied; retire it instead';
   if (buf.length > MAX_NOTE_BYTES) return `note is larger than ${MAX_NOTE_BYTES} bytes`;
   if (scanText(body).length > 0) return 'note contains text that looks like a credential';
@@ -160,9 +192,9 @@ function contentProblem(name, buf) {
 
 // Judges the work folders against the snapshot. "Before" is the live folder, which the snapshot
 // was taken from (`liveChanged` reports when it no longer is); "after" is the live folder with
-// the accepted changes applied. `maxShrink` is the share of a folder's note bytes that must
-// remain (0 turns the check off).
-export function evaluate({ pairs, snap, allowRetire, maxShrink = 0.5 }) {
+// the accepted changes applied. `minRetention` is the share of the distinct terms of all notes
+// that must remain (0 turns the check off).
+export function evaluate({ pairs, snap, allowRetire, minRetention = 0.8 }) {
   const errors = [];
   const changes = [];
   const ignored = [];
@@ -218,9 +250,13 @@ export function evaluate({ pairs, snap, allowRetire, maxShrink = 0.5 }) {
     }
   }
 
+  const beforeMaps = [];
+  const afterMaps = [];
   for (const { label, liveDir } of pairs) {
     const before = scanDir(liveDir).files;
     const after = new Map(before);
+    beforeMaps.push(before);
+    afterMaps.push(after);
     let retiredBytes = 0;
     for (const c of changes) {
       if (c.label !== label) continue;
@@ -231,7 +267,7 @@ export function evaluate({ pairs, snap, allowRetire, maxShrink = 0.5 }) {
         after.set(c.file, work[label].get(c.file));
       }
     }
-    const notesBytesBefore = notesBytes(before);
+    const notesBytesBefore = notesBytes(before, { skipStubs: true });
     const notesBytesAfter = notesBytes(after, { skipStubs: true });
     stats[label] = {
       indexBefore: indexStats(before.has(INDEX) ? text(before.get(INDEX)) : ''),
@@ -250,19 +286,27 @@ export function evaluate({ pairs, snap, allowRetire, maxShrink = 0.5 }) {
     if (indexChanged && text(index).trim() === '' && [...after].some(([n, b]) => n !== INDEX && !isStub(b))) {
       errors.push(`${label}/${INDEX}: the index may not be emptied while notes remain`);
     }
-    if (maxShrink > 0 && notesBytesBefore >= SHRINK_MIN_BYTES && notesBytesAfter < notesBytesBefore * maxShrink) {
-      errors.push(`${label}/${INDEX}: the folder's notes shrank by more than the allowed share`);
-    }
   }
-  const liveChanged = liveDiffers(pairs, snap);
+  const termsBefore = folderTokens(beforeMaps);
+  const afterTerms = folderTokens(afterMaps);
+  let termsKept = 0;
+  for (const t of termsBefore) if (afterTerms.has(t)) termsKept += 1;
+  const share = termsBefore.size === 0 ? 1 : termsKept / termsBefore.size;
+  stats.retention = { termsBefore: termsBefore.size, termsKept, share };
+  if (minRetention > 0 && termsBefore.size >= RETENTION_MIN_TERMS && share < minRetention) {
+    errors.push(`the run would drop too much of the notes' content (kept ${Math.floor(share * 100)}% of distinct terms, at least ${Math.round(minRetention * 100)}% required)`);
+  }
+  const watched = changes.filter((c) => c.kind === 'add').map((c) => `${c.label}/${c.file}`);
+  const liveChanged = liveDiffers(pairs, snap, watched);
   return { ok: errors.length === 0 && liveChanged.length === 0, errors, changes, ignored, stats, liveChanged };
 }
 
-function writeAtomic(dir, name, buf) {
+function writeAtomic(dir, name, buf, mode) {
   const dest = join(dir, name);
   const tmp = join(dir, `${name}.tmp.${process.pid}-${randomBytes(6).toString('hex')}`);
   try {
-    writeFileSync(tmp, buf, { mode: 0o644, flag: 'wx' });
+    writeFileSync(tmp, buf, { mode, flag: 'wx' });
+    chmodSync(tmp, mode);
     renameSync(tmp, dest);
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* temporary file may not exist */ }
@@ -306,6 +350,7 @@ export function apply({ pairs, changes, snap }) {
     }
     if (st && !st.isDirectory()) fail(c.label, c.file, 'the live folder is not a folder');
     const known = snap[c.label]?.[c.file];
+    let mode = 0o600;
     if (c.kind === 'add') {
       if (known !== undefined) fail(c.label, c.file, 'added file is already in the snapshot');
       let exists = true;
@@ -319,6 +364,7 @@ export function apply({ pairs, changes, snap }) {
     } else if (c.kind === 'change' || c.kind === 'retire') {
       if (known === undefined) fail(c.label, c.file, 'file is not in the snapshot');
       if (liveHash(pair, c.file) !== known) fail(c.label, c.file, 'live file changed since the snapshot');
+      mode = lstatSync(join(pair.liveDir, c.file)).mode & 0o777;
     } else {
       fail(c.label, c.file, 'unknown change kind');
     }
@@ -327,10 +373,15 @@ export function apply({ pairs, changes, snap }) {
     if (c.kind === 'retire') {
       if (c.hash !== known) fail(c.label, c.file, 'retirement hash does not match the snapshot');
       if (c.file === INDEX || !isStub(buf)) fail(c.label, c.file, 'work file is not a retirement stub');
+      const stub = stubTarget(text(buf));
+      const named = { label: stub.folder === 'global' ? GLOBAL : c.label, file: `${stub.name}.md` };
+      if (c.target?.label !== named.label || c.target?.file !== named.file) {
+        fail(c.label, c.file, 'retirement target is not the one the stub names');
+      }
       retires.push(c);
     } else {
       if (sha256(buf) !== c.hash) fail(c.label, c.file, 'work file changed since it was validated');
-      writes.push({ pair, file: c.file, buf });
+      writes.push({ pair, file: c.file, buf, mode });
     }
   }
   // A retirement needs its target: written by this change set, or present live, and not retired.
@@ -347,9 +398,9 @@ export function apply({ pairs, changes, snap }) {
   }
   // Indexes last, so that a failure part-way leaves an index that lists only notes that exist.
   writes.sort((a, b) => (a.file === INDEX) - (b.file === INDEX));
-  for (const { pair, file, buf } of writes) {
+  for (const { pair, file, buf, mode } of writes) {
     mkdirSync(pair.liveDir, { recursive: true });
-    writeAtomic(pair.liveDir, file, buf);
+    writeAtomic(pair.liveDir, file, buf, mode);
   }
   for (const c of retires) {
     try {

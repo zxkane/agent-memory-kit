@@ -6,7 +6,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { apply, evaluate, liveDiffers, snapshot } from '../lib/workdir.mjs';
+import { apply, evaluate, liveDiffers, noteTokens, snapshot } from '../lib/workdir.mjs';
 import { tempDir } from './helpers.mjs';
 
 const sha = (text) => createHash('sha256').update(text).digest('hex');
@@ -32,6 +32,7 @@ function setup(t, { notes = {}, global = null } = {}) {
     base, pairs, snap,
     work: (label, file, text) => writeFileSync(join(dirOf(label).workDir, file), text),
     live: (label, file) => join(dirOf(label).liveDir, file),
+    readLive: (label, file) => readFileSync(join(dirOf(label).liveDir, file), 'utf8'),
     workPath: (label, file) => join(dirOf(label).workDir, file),
   };
 }
@@ -594,40 +595,6 @@ test('rule 6: a malformed retirement line in a new note is an error', (t) => {
   assert.deepEqual(r.errors, ['notes/n.md: malformed retirement line']);
 });
 
-function bigFolder(t, size) {
-  return setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': 'x'.repeat(size) } });
-}
-
-test('rule 7: a folder of 30,000 bytes rewritten to 10,000 is an error; to 16,000 is fine', (t) => {
-  const s = bigFolder(t, 30000);
-  s.work('notes', 'a.md', 'x'.repeat(10000));
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.deepEqual(r.errors, ["notes/MEMORY.md: the folder's notes shrank by more than the allowed share"]);
-  assert.equal(r.stats.notes.notesBytesBefore, 30000);
-  assert.equal(r.stats.notes.notesBytesAfter, 10000);
-  s.work('notes', 'a.md', 'x'.repeat(16000));
-  assert.equal(evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true }).ok, true);
-});
-
-test('rule 7: a small folder may shrink, and maxShrink 0 turns the rule off', (t) => {
-  const small = bigFolder(t, 5000);
-  small.work('notes', 'a.md', 'x'.repeat(1000));
-  assert.equal(evaluate({ pairs: small.pairs, snap: small.snap, allowRetire: true }).ok, true);
-  const s = bigFolder(t, 30000);
-  s.work('notes', 'a.md', 'x'.repeat(10000));
-  assert.equal(evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, maxShrink: 0 }).ok, true);
-});
-
-test('rule 7: retiring most of a large folder trips the tripwire', (t) => {
-  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n', 'a.md': 'x'.repeat(5000), 'b.md': 'y'.repeat(25000) } });
-  s.work('notes', 'b.md', 'MOVED TO [[a]]\n');
-  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.deepEqual(r.errors, ["notes/MEMORY.md: the folder's notes shrank by more than the allowed share"]);
-  assert.equal(r.stats.notes.retiredBytes, 25000);
-  assert.equal(r.stats.notes.notesBytesAfter, 5000);
-});
-
 test('M-2: a work file name with a newline cannot forge a second error line', (t) => {
   const s = setup(t, { notes: BASE_NOTES });
   writeFileSync(join(s.pairs[0].workDir, 'x.md\nforged rule: x'), 'x');
@@ -689,4 +656,196 @@ test('snapshot refuses a work folder that already holds files', (t) => {
   const base = tempDir(t);
   write(join(base, 'work'), { 'stale.md': 'stale' });
   assert.throws(() => snapshot([{ label: 'notes', liveDir: join(base, 'live'), workDir: join(base, 'work') }]));
+});
+
+// ---- round 2 ----
+
+const terms = (prefix, from, to) => Array.from({ length: to - from }, (_, i) => `${prefix}${String(from + i).padStart(4, '0')}`).join(' ');
+const RETENTION_ERROR = /^the run would drop too much of the notes' content \(kept \d+% of distinct terms, at least 80% required\)$/;
+
+test('noteTokens: English, identifiers, short words, Han, mixed', () => {
+  assert.deepEqual([...noteTokens('The Quick brown fox, jumps!')].sort(), ['brown', 'jumps', 'quick']);
+  assert.deepEqual([...noteTokens('use MAX_RETRY_COUNT=5 and v2 api_key')].sort(), ['api_key', 'max_retry_count']);
+  assert.deepEqual([...noteTokens('a an of to')], []);
+  assert.deepEqual([...noteTokens('知识库管理')].sort(), ['库管', '知识', '管理', '识库']);
+  assert.deepEqual([...noteTokens('的')], ['的']);
+  assert.deepEqual([...noteTokens('deploy知识库 now')].sort(), ['deploy', '知识', '识库'].sort());
+  assert.deepEqual([...noteTokens('Straße ÅNGSTRÖM')].sort(), ['straße', 'ångström']);
+});
+
+test('rule 7: exact duplicates retired keep every term', (t) => {
+  const body = terms('dupl', 0, 1200).slice(0, 10000);
+  const s = setup(t, {
+    notes: { 'MEMORY.md': '- [A](a1.md) — a\n- [B](a2.md) — b\n- [C](a3.md) — c\n', 'a1.md': body, 'a2.md': body, 'a3.md': body },
+  });
+  s.work('notes', 'a2.md', 'MOVED TO [[a1]]\n');
+  s.work('notes', 'a3.md', 'MOVED TO [[a1]]\n');
+  s.work('notes', 'MEMORY.md', '- [A](a1.md) — a\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.share, 1);
+  assert.ok(r.stats.retention.termsBefore >= 200);
+  assert.equal(r.stats.retention.termsKept, r.stats.retention.termsBefore);
+  assert.equal(r.stats.notes.retiredBytes, 20000);
+});
+
+test('rule 7: moving most of a folder into a new global note passes', (t) => {
+  const notes = { 'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n- [C](c.md) — c\n' };
+  for (const [name, from] of [['a.md', 0], ['b.md', 1200], ['c.md', 2400]]) notes[name] = terms('proj', from, from + 1200).slice(0, 10000);
+  const s = setup(t, { notes, global: { 'MEMORY.md': '- [G](g.md) — g\n', 'g.md': 'global note\n' } });
+  s.work('global', 'moved.md', `${s.readLive('notes', 'b.md')}\n${s.readLive('notes', 'c.md')}`);
+  s.work('global', 'MEMORY.md', '- [G](g.md) — g\n- [M](moved.md) — m\n');
+  s.work('notes', 'b.md', 'MOVED TO [[global:moved]]\n');
+  s.work('notes', 'c.md', 'MOVED TO [[global:moved]]\n');
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.share, 1);
+  assert.equal(r.stats.notes.retiredBytes, 20000);
+});
+
+function tenNotes(t) {
+  const notes = { 'MEMORY.md': Array.from({ length: 10 }, (_, i) => `- [N${i}](n${i}.md) — n${i}\n`).join('') };
+  for (let i = 0; i < 10; i++) notes[`n${i}.md`] = `${terms(`note${i}x`, 0, 30)}\n`;
+  return setup(t, { notes });
+}
+
+function summarise(s) {
+  for (let i = 1; i < 10; i++) s.work('notes', `n${i}.md`, 'MOVED TO [[n0]]\n');
+  s.work('notes', 'n0.md', `${terms('note0x', 0, 10)}\n`);
+  s.work('notes', 'MEMORY.md', '- [N0](n0.md) — n0\n');
+}
+
+test('rule 7: ten distinct notes rewritten into a short summary are rejected', (t) => {
+  const s = tenNotes(t);
+  summarise(s);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], RETENTION_ERROR);
+  assert.deepEqual(r.stats.retention, { termsBefore: 300, termsKept: 10, share: 10 / 300 });
+  assert.match(r.errors[0], /kept 3% /);
+});
+
+test('rule 7: minRetention 0 turns the rule off', (t) => {
+  const s = tenNotes(t);
+  summarise(s);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention: 0 });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.termsKept, 10);
+});
+
+test('rule 7: a small folder (under 200 terms) may be rewritten heavily', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('smal', 0, 150)}\n` } });
+  s.work('notes', 'a.md', 'only this remains\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.termsBefore, 150);
+});
+
+test('rule 7: padding with an unrelated filler note does not hide a gutted note', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('real', 0, 300)}\n` } });
+  s.work('notes', 'a.md', 'short\n');
+  s.work('notes', 'filler.md', `${terms('fill', 0, 500)}\n`);
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n- [F](filler.md) — f\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.match(r.errors[0], RETENTION_ERROR);
+  assert.equal(r.stats.retention.termsKept, 0);
+});
+
+test('rule 7: stubs count on neither side', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': 'alpha beta gamma\n', 'old.md': 'MOVED TO [[a]]\n' } });
+  s.work('notes', 'a.md', 'alpha beta gamma delta\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.stats.notes.notesBytesBefore, Buffer.byteLength('alpha beta gamma\n'));
+  assert.equal(r.stats.notes.notesBytesAfter, Buffer.byteLength('alpha beta gamma delta\n'));
+});
+
+test('rule 6: tolerant forms of a retirement line are errors', (t) => {
+  const forms = ['Moved to [[a]]', 'MOVED  TO [[a]]', 'MOVED TO [[a]]', 'MOVED TO [ [a]]', 'moved to[[a]]'];
+  for (const form of forms) {
+    const s = setup(t, { notes: BASE_NOTES });
+    s.work('notes', 'b.md', `${form}\n`);
+    const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+    assert.deepEqual(r.errors, ['notes/b.md: malformed retirement line'], JSON.stringify(form));
+  }
+});
+
+test('rule 6: an exact stub is still a retirement, and ordinary prose starting with "Moved to" is fine', (t) => {
+  const s = setup(t, { notes: BASE_NOTES });
+  s.work('notes', 'b.md', 'MOVED TO [[a]]\n');
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.ok(r.changes.some((c) => c.kind === 'retire'));
+  const p = setup(t, { notes: BASE_NOTES });
+  p.work('notes', 'a.md', 'Moved to the new cluster in March\n');
+  assert.deepEqual(evaluate({ pairs: p.pairs, snap: p.snap, allowRetire: true }).errors, []);
+});
+
+test('S1: a changed note keeps its mode, a new note is 0600, whatever the umask', (t) => {
+  const s = setup(t, { notes: BASE_NOTES });
+  chmodSync(s.live('notes', 'a.md'), 0o600);
+  chmodSync(s.live('notes', 'b.md'), 0o644);
+  s.work('notes', 'a.md', 'a edited\n');
+  s.work('notes', 'b.md', 'b edited\n');
+  s.work('notes', 'c.md', 'c new\n');
+  s.work('notes', 'MEMORY.md', `${INDEX_AB}- [C](c.md) — c\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  const old = process.umask(0);
+  try {
+    apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  } finally {
+    process.umask(old);
+  }
+  const mode = (f) => statSync(s.live('notes', f)).mode & 0o777;
+  assert.equal(mode('a.md'), 0o600);
+  assert.equal(mode('b.md'), 0o644);
+  assert.equal(mode('c.md'), 0o600);
+});
+
+test('N3: a link or a folder at the name of an added note is a live change', (t) => {
+  for (const kind of ['link', 'folder']) {
+    const s = setup(t, { notes: BASE_NOTES });
+    s.work('notes', 'n.md', 'new\n');
+    s.work('notes', 'MEMORY.md', `${INDEX_AB}- [N](n.md) — n\n`);
+    if (kind === 'link') symlinkSync(join(s.base, 'nowhere'), s.live('notes', 'n.md'));
+    else mkdirSync(s.live('notes', 'n.md'));
+    const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+    assert.equal(r.ok, false, kind);
+    assert.deepEqual(r.errors, []);
+    assert.deepEqual(r.liveChanged, ['notes/n.md']);
+  }
+});
+
+test('N3: liveDiffers lists a snapshot note that became a link or a folder, and watched names', (t) => {
+  const s = setup(t, { notes: BASE_NOTES });
+  rmSyncSync(s.live('notes', 'a.md'));
+  symlinkSync(join(s.base, 'nowhere'), s.live('notes', 'a.md'));
+  rmSyncSync(s.live('notes', 'b.md'));
+  mkdirSync(s.live('notes', 'b.md'));
+  mkdirSync(s.live('notes', 'w.md'));
+  assert.deepEqual(liveDiffers(s.pairs, s.snap).sort(), ['notes/a.md', 'notes/b.md']);
+  assert.deepEqual(liveDiffers(s.pairs, s.snap, ['notes/w.md']).sort(), ['notes/a.md', 'notes/b.md', 'notes/w.md']);
+});
+
+test('N4: a credential-shaped name that is not a note name is withheld from errors', (t) => {
+  const s = setup(t, { notes: BASE_NOTES });
+  writeFileSync(join(s.pairs[0].workDir, `${FAKE_KEY}.txt`), 'x');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, ['notes/"(file name withheld)": not a regular note file']);
+  assert.ok(!JSON.stringify(r).includes(FAKE_KEY));
+});
+
+test('N2: apply refuses a retire change whose target is not the one the stub names', (t) => {
+  const s = setup(t, { notes: { ...BASE_NOTES, 'c.md': 'note c\n' } });
+  s.work('notes', 'b.md', 'MOVED TO [[a]]\n');
+  const forged = [change(s, 'notes', 'b.md', 'retire', { target: { label: 'notes', file: 'c.md' } })];
+  assert.throws(() => apply({ pairs: s.pairs, changes: forged, snap: s.snap }), /notes\/b\.md: retirement target is not the one the stub names/);
+  assert.equal(existsSync(s.live('notes', 'b.md')), true);
+  const honest = [change(s, 'notes', 'b.md', 'retire', { target: { label: 'notes', file: 'a.md' } })];
+  apply({ pairs: s.pairs, changes: honest, snap: s.snap });
+  assert.equal(existsSync(s.live('notes', 'b.md')), false);
 });
