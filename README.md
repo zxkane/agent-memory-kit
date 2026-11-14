@@ -294,7 +294,7 @@ The infrastructure program is not type-checked in CI, so run `npm run typecheck:
 
 The deployment creates:
 
-- a versioned bucket that holds the replica and the agent scopes; superseded versions expire after 90 days (after 1 day for the search snapshots under `index/`, which are rewritten on every write; the 20 most recent earlier versions of each search snapshot are kept regardless of age);
+- a versioned bucket that holds the replica and the agent scopes; superseded versions expire after 90 days (after 1 day for the search snapshots under `index/`, which are rewritten on every write; the 20 most recent earlier versions of each search snapshot are kept for up to 90 days);
 - a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes; read-only on `prod`), and two scopes, `agent-memory/read` and `agent-memory/write`;
 - an HTTP API with one route per operation and a function behind it;
 - SSM parameters under `/agent-memory/<stage>/mcp/`: `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string) and `bucket/name`.
