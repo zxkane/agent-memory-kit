@@ -164,6 +164,22 @@ export function liveDiffers(pairs, snap, watched = []) {
   return diff;
 }
 
+// The folders whose live state decides whether the result may be applied: the scope's own folder
+// (the first pair), where any difference from the snapshot counts, and every other folder that the
+// change set writes to or retires into. A shared folder that the result does not touch (global/ in
+// a project run, written by sessions of every project) cannot be harmed by applying it.
+// `evaluate` and `apply` use the same set.
+export function watchedPairs(pairs, changes) {
+  const touched = new Set();
+  for (const c of changes) {
+    touched.add(c.label);
+    if (c.kind === 'retire' && c.target) touched.add(c.target.label);
+  }
+  return pairs.filter((p, i) => i === 0 || touched.has(p.label));
+}
+
+const addedNames = (changes) => changes.filter((c) => c.kind === 'add').map((c) => `${c.label}/${c.file}`);
+
 // The distinct terms of a note: NFKC-normalised, lower-cased runs of four or more letters, combining
 // marks, digits or underscores,
 // plus, for Han script, every pair of adjacent characters (a lone character stands for itself).
@@ -360,8 +376,7 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
   if (minRetention > 0 && termsBefore >= RUN_MIN_TERMS && share < minRetention) {
     errors.push(`the run would drop too much of the touched notes' content (kept ${Math.floor(share * 100)}% of their distinct terms, at least ${Math.round(minRetention * 100)}% required)`);
   }
-  const watched = changes.filter((c) => c.kind === 'add').map((c) => `${c.label}/${c.file}`);
-  const liveChanged = liveDiffers(pairs, snap, watched);
+  const liveChanged = liveDiffers(watchedPairs(pairs, changes), snap, addedNames(changes));
   return { ok: errors.length === 0 && liveChanged.length === 0, errors, changes, ignored, stats, liveChanged };
 }
 
@@ -461,6 +476,12 @@ export function apply({ pairs, changes, snap }) {
     const present = writes.some((w) => w.pair === targetPair && w.file === t.file) ||
       readRegular(join(targetPair.liveDir, t.file)) !== null;
     if (!present) fail(c.label, c.file, 'retirement target is not present');
+  }
+  // The folders evaluate judged are still as the snapshot copied them (watchedPairs).
+  const moved = liveDiffers(watchedPairs(pairs, changes), snap, addedNames(changes));
+  if (moved.length > 0) {
+    const [label, ...rest] = moved[0].split('/');
+    fail(label, rest.join('/'), 'live folder changed since the snapshot');
   }
   // Indexes last, so that a failure part-way leaves an index that lists only notes that exist.
   writes.sort((a, b) => (a.file === INDEX) - (b.file === INDEX));

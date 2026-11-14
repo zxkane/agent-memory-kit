@@ -1091,3 +1091,65 @@ test('rule 6: a stub plus a few words over a rich note is a rule 7 error, not ru
   assert.equal(r.errors.length, 1);
   assert.match(r.errors[0], PER_NOTE('b.md'));
 });
+
+// F1: a live change counts only in the scope's own folder (the first pair) and in folders that the
+// change set writes to or retires into.
+test('F1: a session write in a folder the result does not touch is not a live change', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' }, global: { 'g.md': 'general' } });
+  s.work('notes', 'a.md', 'alpha, merged with beta');
+  writeFileSync(s.live('global', 'g2.md'), 'written by a session');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.liveChanged, []);
+  assert.equal(r.ok, true);
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(s.readLive('notes', 'a.md'), 'alpha, merged with beta');
+  assert.equal(s.readLive('global', 'g2.md'), 'written by a session');
+});
+
+test('F1: a session write in a folder the result changes, adds to or retires into is a live change', (t) => {
+  const cases = {
+    change: (s) => s.work('global', 'g.md', 'general, edited'),
+    add: (s) => s.work('global', 'new.md', 'a new global note'),
+    retire: (s) => {
+      s.work('global', 'g.md', 'general and alpha');
+      s.work('notes', 'a.md', 'MOVED TO [[global:g]]\n');
+      s.work('notes', 'MEMORY.md', '- [B](b.md) — b\n');
+    },
+    'retire only': (s) => {
+      s.work('notes', 'a.md', 'MOVED TO [[global:g]]\n');
+      s.work('notes', 'MEMORY.md', '- [B](b.md) — b\n');
+    },
+  };
+  for (const [name, edit] of Object.entries(cases)) {
+    const s = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' }, global: { 'g.md': 'general' } });
+    edit(s);
+    writeFileSync(s.live('global', 'g2.md'), 'written by a session');
+    const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+    assert.deepEqual(r.liveChanged, ['global/g2.md'], name);
+    assert.equal(r.ok, false, name);
+  }
+});
+
+test('F1: a session write in the scope\'s own folder is always a live change', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' }, global: { 'g.md': 'general' } });
+  s.work('global', 'g.md', 'general, edited');
+  writeFileSync(s.live('notes', 'x.md'), 'written by a session');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.liveChanged, ['notes/x.md']);
+});
+
+test('F1: apply checks the same folders as evaluate, just before its first write', (t) => {
+  let s = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' }, global: { 'g.md': 'general' } });
+  s.work('notes', 'a.md', 'alpha, edited');
+  let r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  writeFileSync(s.live('notes', 'x.md'), 'written after evaluate');
+  assert.throws(() => apply({ pairs: s.pairs, changes: r.changes, snap: s.snap }), /notes\/x\.md: live folder changed since the snapshot/);
+  assert.equal(s.readLive('notes', 'a.md'), 'alpha');
+
+  s = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' }, global: { 'g.md': 'general' } });
+  s.work('notes', 'a.md', 'alpha, edited');
+  r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  writeFileSync(s.live('global', 'g2.md'), 'written after evaluate');
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(s.readLive('notes', 'a.md'), 'alpha, edited');
+});

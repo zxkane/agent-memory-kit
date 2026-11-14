@@ -390,6 +390,51 @@ test('a rejected extract keeps its previous lastExtract', (t) => {
   assert.notEqual(f.readState().projects.h.lastExtract, before);
 });
 
+// A project `p` with a duplicate pair, and a global/ folder that sessions of every project write to.
+function duplicateProjectWithGlobal(f) {
+  duplicateProject(f);
+  f.seed({ 'global/MEMORY.md': index('g.md'), 'global/g.md': note('g', 'General', 'Something general.') });
+}
+
+test('F1: a session writing global/ during a project run that does not touch global/ is applied', (t) => {
+  const f = fixture(t);
+  duplicateProjectWithGlobal(f);
+  const g2 = join(f.repo, 'global/g2.md');
+  const g2Text = note('g2', 'Written by a session', 'Another project wrote this.');
+  const instruction = mergeInstruction();
+  instruction.p.liveWrites = { [g2]: g2Text };
+  f.instruct(instruction);
+  const r = f.run('organize', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied, 3 change\(s\)/m);
+  assert.equal(existsSync(join(f.repo, 'projects/p/b.md')), false);
+  assert.equal(readFileSync(g2, 'utf8'), g2Text);
+  const files = sh(f.repo, 'git', ['show', '--name-only', '--format=', 'HEAD']).trim().split('\n');
+  assert.ok(!files.includes('global/g2.md'));
+  assert.ok(f.remoteFiles().includes('global/g2.md'));
+});
+
+test('F1: a session writing global/ while the result adds to or retires into global/ is changed meanwhile', (t) => {
+  const edits = {
+    add: { 'global/new.md': note('new', 'New', 'A new global note.'), 'global/MEMORY.md': index('g.md', 'new.md') },
+    retire: {
+      'global/g.md': note('g', 'General', 'Something general. Deploys go through the staging stack first.'),
+      'notes/b.md': 'MOVED TO [[global:g]]\n',
+      'notes/MEMORY.md': index('a.md'),
+    },
+  };
+  for (const [name, writes] of Object.entries(edits)) {
+    const f = fixture(t);
+    duplicateProjectWithGlobal(f);
+    f.instruct({ p: { writes, liveWrites: { [join(f.repo, 'global/g2.md')]: note('g2', 'S', 'A session wrote this.') } } });
+    const r = f.run('organize', '--project', 'p');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^organize p: changed meanwhile, nothing applied/m, name);
+    assert.match(r.stdout, /^ {2}- changed meanwhile: global\/g2\.md$/m, name);
+    assert.ok(existsSync(join(f.repo, 'projects/p/b.md')), name);
+  }
+});
+
 test('a note written to the live folder during the run means nothing is applied', (t) => {
   const f = fixture(t);
   duplicateProject(f);
