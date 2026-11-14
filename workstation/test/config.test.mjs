@@ -33,7 +33,7 @@ test('applies defaults', (t) => {
   assert.deepEqual(loadConfig(env), {
     host: 'alpha', repoDir: '/home/u/agent-memory', repoUrl: null,
     stateDir: join(dir, '.local/state/agent-memory'), claudeDir: join(dir, '.claude'),
-    staleAfterSeconds: 600,
+    staleAfterSeconds: 600, consolidate: null,
   });
 });
 
@@ -46,7 +46,7 @@ test('reads the default path under HOME and honors explicit values', (t) => {
   }));
   assert.deepEqual(loadConfig({ HOME: dir }), {
     host: 'beta', repoDir: '/r', repoUrl: 'git@example.com:u/m.git',
-    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30,
+    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30, consolidate: null,
   });
 });
 
@@ -63,4 +63,66 @@ test('rejects a bad host, a relative repoDir and invalid JSON', (t) => {
   }
   writeRaw('{not json');
   assert.equal(loadConfig(env), null);
+});
+
+const BASE = { enabled: true, host: 'alpha', repoDir: '/home/u/agent-memory' };
+
+test('consolidate is null when the block is absent', (t) => {
+  const { env, write } = setup(t);
+  write(BASE);
+  assert.equal(loadConfig(env).consolidate, null);
+});
+
+test('consolidate block is returned with given values', (t) => {
+  const { env, write } = setup(t);
+  const block = {
+    command: '/usr/local/bin/model', model: 'big-model', env: { FOO_BAR: 'x' },
+    extract: 'Mon *-*-* 03:00:00', organize: 'Sun *-*-* 04:30', maxProjects: 7,
+    maxTranscriptBytes: 50000, maxTurns: 10, maxBudgetUsd: 1.5, timeoutMinutes: 12,
+  };
+  write({ ...BASE, consolidate: block });
+  assert.deepEqual(loadConfig(env).consolidate, block);
+});
+
+test('consolidate defaults are filled', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, consolidate: { command: '/bin/m', model: 'm1' } });
+  assert.deepEqual(loadConfig(env).consolidate, {
+    command: '/bin/m', model: 'm1', env: {}, extract: null, organize: null,
+    maxProjects: 5, maxTranscriptBytes: 200000, maxTurns: 200, maxBudgetUsd: 5, timeoutMinutes: 30,
+  });
+});
+
+test('an invalid consolidate block gives null without disabling the config', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  for (const bad of [
+    { ...ok, command: 'rel/m' },
+    { ...ok, command: undefined },
+    { ...ok, model: '' },
+    { ...ok, model: 'a b' },
+    { ...ok, env: { lower: 'x' } },
+    { ...ok, env: { FOO: 1 } },
+    { ...ok, extract: 'Mon; rm' },
+    { ...ok, extract: 'Mon\n03:00' },
+    { ...ok, organize: '' },
+    { ...ok, organize: 'x'.repeat(81) },
+    { ...ok, maxProjects: 0 },
+    { ...ok, maxProjects: 51 },
+    { ...ok, maxProjects: 1.5 },
+    { ...ok, maxTranscriptBytes: 9999 },
+    { ...ok, maxTurns: 1001 },
+    { ...ok, maxBudgetUsd: 0 },
+    { ...ok, maxBudgetUsd: 101 },
+    { ...ok, timeoutMinutes: 1000 },
+    'text',
+    [],
+  ]) {
+    write({ ...BASE, consolidate: bad });
+    const cfg = loadConfig(env);
+    assert.notEqual(cfg, null);
+    assert.equal(cfg.host, 'alpha');
+    assert.equal(cfg.repoDir, '/home/u/agent-memory');
+    assert.equal(cfg.consolidate, null);
+  }
 });
