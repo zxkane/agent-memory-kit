@@ -93,6 +93,10 @@ describe('infrastructure source', () => {
     assert.equal((src.match(/noncurrentVersionExpiration/g) ?? []).length, 2);
   });
 
+  it('replaces every underscore of the user pool id in the domain prefix', () => {
+    assert.match(read('infra/auth.ts'), /id\.toLowerCase\(\)\.replaceAll\(\s*["']_["']\s*,\s*["']-["']\s*\)/);
+  });
+
   it('logs the source IP', () => {
     assert.match(read('infra/api.ts'), /\$context\.identity\.sourceIp/);
   });

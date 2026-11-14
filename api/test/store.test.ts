@@ -146,6 +146,13 @@ test('s3Store.get: only an access denial or an unnamed 403 is missing; other 403
   await assert.rejects(() => s3Store('b', put500.client).put('k', 'x', null), /InternalError/);
 });
 
+test('a successful get or put without an ETag is an error', async () => {
+  const get = stubClient(() => ({ Body: body('x') }));
+  await assert.rejects(() => s3Store('b', get.client).get('k'), /no ETag/);
+  const put = stubClient(() => ({}));
+  await assert.rejects(() => s3Store('b', put.client).put('k', 'x', null), /no ETag/);
+});
+
 test('s3Store.get rethrows other errors and rejects bodies over 8 MB', async () => {
   const nb = stubClient(() => {
     throw awsError('NoSuchBucket', 404);

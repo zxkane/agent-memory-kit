@@ -17,7 +17,7 @@ export const userPool = new aws.cognito.UserPool(
 // The domain prefix is the pool ID, lower-cased, with the underscore replaced.
 export const userPoolDomain = new aws.cognito.UserPoolDomain("MemoryUserPoolDomain", {
   userPoolId: userPool.id,
-  domain: userPool.id.apply((id) => id.toLowerCase().replace("_", "-")),
+  domain: userPool.id.apply((id) => id.toLowerCase().replaceAll("_", "-")),
 });
 
 const resourceServer = new aws.cognito.ResourceServer("MemoryResourceServer", {

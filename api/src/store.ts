@@ -62,7 +62,9 @@ export function s3Store(bucket: string, client: S3Client = new S3Client({})): St
       if (!out.Body) throw new Error('The stored object has no body.');
       const bytes = await out.Body.transformToByteArray();
       if (bytes.length > MAX_BODY_BYTES) throw new Error('The stored object is larger than the 8 MB limit.');
-      return { status: 'ok', body: new TextDecoder('utf-8').decode(bytes), etag: out.ETag ?? '' };
+      // An empty etag would make the next conditional request never match; fail loudly instead.
+      if (!out.ETag) throw new Error('the store returned no ETag');
+      return { status: 'ok', body: new TextDecoder('utf-8').decode(bytes), etag: out.ETag };
     },
 
     async put(key, body, cond) {
@@ -78,7 +80,8 @@ export function s3Store(bucket: string, client: S3Client = new S3Client({})): St
             ...(cond && 'ifNoneMatch' in cond ? { IfNoneMatch: cond.ifNoneMatch } : {}),
           }),
         );
-        return { status: 'ok', etag: out.ETag ?? '' };
+        if (!out.ETag) throw new Error('the store returned no ETag');
+        return { status: 'ok', etag: out.ETag };
       } catch (err) {
         const status = httpStatus(err);
         if (status === 412 || status === 409) return { status: 'precondition-failed' };
