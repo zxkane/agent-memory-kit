@@ -1416,7 +1416,7 @@ test('I-1: a superseded note retired into the newer note still passes', (t) => {
 
 // I-2: in a project run, an existing global note that is changed is judged on its own new body
 // alone and keeps at least 80% of its former distinct terms (from 5 terms), whatever minRetention.
-const GLOBAL_REDUCED = /^global\/(\w+)\.md: notes in the global folder are organized only by a run on the global scope \(an existing global note may be added to but not reduced in a project run: kept (\d+)% of its distinct terms, at least 80% required\)$/;
+const GLOBAL_REDUCED = /^global\/([\w-]+)\.md: notes in the global folder are organized only by a run on the global scope \(an existing global note may be added to but not reduced in a project run: lost (\d+) of its (\d+) distinct terms, at most (\d+) allowed\)$/;
 const PREFS = 'Writes British spelling in documents, prefers metric units, wants dates as day month year, and keeps answers short.';
 
 test('I-2: a project run may not empty an existing global note into a project note or a new global note', (t) => {
@@ -1470,4 +1470,53 @@ test('M-1: apply refuses a hand-made retirement of an existing global note in a 
   const changes = [{ label: 'global', file: 'tone.md', kind: 'retire', hash, target: { label: 'global', file: 'tools.md' } }];
   assert.throws(() => apply({ pairs: s.pairs, changes, snap: s.snap }), /global\/tone\.md: notes in the global folder are organized only by a run on the global scope/);
   assert.equal(s.readLive('global', 'tone.md'), 'prefers short answers\n');
+});
+
+// Round 2: an existing global note changed in a project run may lose at most min(2, floor(0.2 n))
+// of its n former distinct body terms, judged on its own new body, whatever minRetention.
+function globalNote(t, body) {
+  return setup(t, { notes: BASE_NOTES, global: { 'MEMORY.md': '- [G](tone.md) — g\n', 'tone.md': `${body}\n` } });
+}
+const judge = (s, minRetention = 0.25) => evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention });
+const reduced = (r) => r.errors.filter((e) => GLOBAL_REDUCED.test(e)).map((e) => GLOBAL_REDUCED.exec(e).slice(1).join(' '));
+
+test('global loss: a 3-term global note rewritten to other words is rejected; with a sentence added it passes', (t) => {
+  let s = globalNote(t, 'prefers terse answers');
+  s.work('global', 'tone.md', 'likes brief replies\n');
+  for (const minRetention of [0.25, 0]) assert.deepEqual(reduced(judge(s, minRetention)), ['tone 3 3 0'], String(minRetention));
+  s = globalNote(t, 'prefers terse answers');
+  s.work('global', 'tone.md', 'prefers terse answers. Also likes examples in code blocks.\n');
+  assert.deepEqual(judge(s).errors, []);
+});
+
+test('global loss: a 7-term note may lose one term, not two', (t) => {
+  const body = terms('word', 0, 7);
+  let s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 6)}\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
+  s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 5)}\n`);
+  assert.deepEqual(reduced(judge(s, 0)), ['tone 2 7 1']);
+});
+
+test('global loss: a 40-term note may lose two terms, not three', (t) => {
+  const body = terms('word', 0, 40);
+  let s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 38)}\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
+  s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 37)}\n`);
+  assert.deepEqual(reduced(judge(s, 0)), ['tone 3 40 2']);
+});
+
+test('global loss: a global note with no former body terms is not judged by this rule', (t) => {
+  const s = globalNote(t, 'ok.');
+  s.work('global', 'tone.md', 'Prefers short answers.\n');
+  assert.deepEqual(judge(s, 0).errors, []);
+});
+
+test('global loss: a run on the global scope is judged by the ordinary rule', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [G](tone.md) — g\n', 'tone.md': 'prefers terse answers\n' } });
+  s.work('notes', 'tone.md', 'likes brief replies\n');
+  assert.deepEqual(judge(s).errors, []);
 });

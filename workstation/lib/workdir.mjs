@@ -18,9 +18,10 @@ const NOTE_MIN_TERMS = 15;
 const RUN_MIN_TERMS = 60;
 const GLOBAL = 'global';
 const GLOBAL_ONLY = 'notes in the global folder are organized only by a run on the global scope';
-// An existing global note changed in a project run keeps at least this share of its terms.
-const GLOBAL_KEEP = 0.8;
-const GLOBAL_MIN_TERMS = 5;
+// How many of its n former distinct body terms an existing global note changed in a project run may
+// lose: none below 5 terms, one from 5 to 9, two from 10 on. A fixed small allowance, so that a note
+// cannot be shrunk step by step across runs, nor a short note replaced outright.
+const globalLossAllowed = (n) => Math.min(2, Math.floor(0.2 * n));
 const HASH_RE = /^[0-9a-f]{64}$/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -360,7 +361,7 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
   // share count only in the note's own body or its named target: a run that writes other notes in
   // those words cannot lift a note whose own content was dropped.
   // In a project run, an existing global note that is changed is judged on its own new body alone
-  // and must keep GLOBAL_KEEP of its terms (from GLOBAL_MIN_TERMS), whatever minRetention: global/
+  // and may lose at most globalLossAllowed(n) of its n former terms, whatever minRetention: global/
   // may be added to there, never reduced.
   const termCache = new WeakMap();
   const termsOf = (buf) => {
@@ -406,8 +407,9 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     for (const t of beforeTerms) if (isKept(t)) kept += 1;
     termsBefore += beforeTerms.size;
     termsKept += kept;
-    if (globalNote && beforeTerms.size >= GLOBAL_MIN_TERMS && kept / beforeTerms.size < GLOBAL_KEEP) {
-      errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: kept ${Math.floor((kept / beforeTerms.size) * 100)}% of its distinct terms, at least ${Math.round(GLOBAL_KEEP * 100)}% required)`);
+    const lost = beforeTerms.size - kept;
+    if (globalNote && lost > globalLossAllowed(beforeTerms.size)) {
+      errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: lost ${lost} of its ${beforeTerms.size} distinct terms, at most ${globalLossAllowed(beforeTerms.size)} allowed)`);
       continue;
     }
     if (beforeTerms.size < NOTE_MIN_TERMS) continue;
