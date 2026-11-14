@@ -242,7 +242,7 @@ AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>
 The deployment creates:
 
 - a versioned bucket that holds the replica and the agent scopes; superseded versions expire after 90 days;
-- a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes), and two scopes, `agent-memory/read` and `agent-memory/write`;
+- a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes; read-only on `prod`), and two scopes, `agent-memory/read` and `agent-memory/write`;
 - an HTTP API with one route per operation and a function behind it;
 - SSM parameters under `/agent-memory/<stage>/mcp/`: `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string) and `bucket/name`.
 
@@ -260,12 +260,12 @@ The script reads the `probe` client's parameters, asks the token endpoint for to
 2. Every route refuses a malformed token (401).
 3. Every route refuses a well-formed token signed by another issuer (401). The script makes the key for it.
 4. A token with only `agent-memory/read` gets 403 on `POST /v1/notes`.
-5. A token with both scopes writes a note `deployed-check` in agent `probe`, then reads it, finds it in the index and in the list of scopes, and searches. If the write is refused (for example because the store is full), these steps are skipped and the output says so.
-6. Each response has the fields that `openapi.json` documents.
+5. Two steps. 5a always runs: with a read-only token, `memory_scopes` answers 200 with a `scopes` array and `memory_search` answers 200 with `results` and `total`. 5b runs only when the probe client can get the write scope: a token with both scopes writes a note `deployed-check` in agent `probe`, then reads it, finds it in the index and in the list of scopes. When the token endpoint refuses the write scope, 5b is reported as `SKIP` and does not change the exit code. 5b is also skipped, with the status, when the write itself is refused (for example because the store is full).
+6. Each response the run received has the fields that `openapi.json` documents.
 7. An unknown path (`GET /v1/nope`) answers 404 or 401, never 200.
 8. With `--expired`, the script waits about five minutes until a probe token has expired and expects 401.
 
-The check note stays in the bucket as `agents/probe/deployed-check.md` and is replaced by the next run.
+On the `prod` stage the probe client is read-only, so the write path is exercised by `verify-deployed` only on other stages. When 5b runs, the check note stays in the bucket as `agents/probe/deployed-check.md` and is replaced by the next run.
 
 ### Register the API with an MCP gateway
 

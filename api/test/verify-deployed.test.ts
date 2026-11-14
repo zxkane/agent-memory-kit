@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { runChecks } from '../scripts/verify-deployed.ts';
+import { runChecks, ScopeNotAllowedError } from '../scripts/verify-deployed.ts';
 import type { CheckResult } from '../scripts/verify-deployed.ts';
 
 const BASE = 'https://api.example.com';
@@ -127,7 +127,7 @@ function setup(quirks: Quirks = {}, options: { expired?: boolean } = {}) {
   return { fake, minted, sleeps, run };
 }
 
-const byNumber = (results: CheckResult[], n: number) => results.filter((r) => r.name.startsWith(`${n}.`));
+const byNumber = (results: CheckResult[], n: number) => results.filter((r) => r.name.startsWith(`${n}.`) || r.name.startsWith(`${n}a.`) || r.name.startsWith(`${n}b.`));
 
 test('a correct API passes every check', async () => {
   const { run } = setup();
@@ -160,11 +160,60 @@ test('check 7 fails when an unknown path answers 200', async () => {
   assert.ok((await run()).some((r) => !r.ok && r.name.startsWith('7.')));
 });
 
+test('a probe client without the write scope skips 5b and everything else passes', async () => {
+  const valid = new Set<string>();
+  const fake = fakeApi(valid);
+  const results = await runChecks({
+    fetch: fake.fetch,
+    config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+    mintToken: async (scopes) => {
+      if (scopes.includes('agent-memory/write')) throw new ScopeNotAllowedError('no write scope');
+      const token = makeToken(scopes, 2_000_000_000);
+      valid.add(token);
+      return token;
+    },
+    now: () => fake.clock.value,
+    sleep: async () => {},
+    openapi: OPENAPI,
+  });
+  assert.deepEqual(results.filter((r) => !r.ok), []);
+  const skipped = results.filter((r) => r.skipped);
+  assert.equal(skipped.length, 1);
+  assert.ok(skipped[0]!.name.startsWith('5b.'));
+  assert.ok(skipped[0]!.detail.includes('the probe client has no write scope on this stage'));
+  assert.ok(results.some((r) => r.name.startsWith('4.') && r.ok));
+  assert.ok(results.filter((r) => r.name.startsWith('5a.')).length === 2);
+  assert.deepEqual([...fake.notes.keys()], []);
+});
+
+test('a mint failure other than a refused scope is an error', async () => {
+  await assert.rejects(
+    runChecks({
+      fetch: setup().fake.fetch,
+      config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+      mintToken: async () => {
+        throw new Error('token endpoint down');
+      },
+      now: () => 0,
+      sleep: async () => {},
+      openapi: OPENAPI,
+    }),
+    /token endpoint down/,
+  );
+});
+
+test('a granted write scope runs 5b', async () => {
+  const { run, fake } = setup();
+  const results = await run();
+  assert.ok(results.filter((r) => r.name.startsWith('5b.') && r.ok && !r.skipped).length >= 3);
+  assert.ok(fake.notes.has('agents/probe/deployed-check.md'));
+});
+
 test('a rejected write skips the follow-up reads instead of failing', async () => {
   const { run } = setup({ rejectWrite: true });
   const results = await run();
   assert.deepEqual(results.filter((r) => !r.ok), []);
-  assert.ok(results.some((r) => r.name.startsWith('5.') && r.detail.includes('skipped')));
+  assert.ok(results.some((r) => r.name.startsWith('5b.') && r.skipped === true));
 });
 
 test('the probe asks for exactly the scopes each check needs', async () => {

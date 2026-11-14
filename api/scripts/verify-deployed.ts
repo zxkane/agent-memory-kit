@@ -9,7 +9,11 @@ import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { RESOURCE_SERVER, ROUTES } from '../src/routes.ts';
 
-export type CheckResult = { name: string; ok: boolean; detail: string };
+export type CheckResult = { name: string; ok: boolean; detail: string; skipped?: boolean };
+
+// Thrown by mintToken when the probe client may not have a requested scope (Cognito answers the
+// token request with HTTP 400 and invalid_scope). runChecks treats it as a skip, not an error.
+export class ScopeNotAllowedError extends Error {}
 
 export type Config = { apiUrl: string; tokenEndpoint: string };
 
@@ -83,7 +87,7 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
   const openapi = deps.openapi ?? JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8'));
   const base = config.apiUrl.replace(/\/+$/, '');
   const results: CheckResult[] = [];
-  const add = (name: string, ok: boolean, detail: string) => results.push({ name, ok, detail });
+  const add = (name: string, ok: boolean, detail: string, skipped = false) => results.push(skipped ? { name, ok, detail, skipped } : { name, ok, detail });
 
   async function call(method: string, path: string, options: { token?: string; body?: unknown; query?: Record<string, string> } = {}): Promise<Reply | { error: string }> {
     const url = new URL(base + path);
@@ -149,35 +153,47 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
   const forbidden = await call('POST', '/v1/notes', { token: readToken, body: probeNote });
   add('4. a read-only token cannot write', !('error' in forbidden) && forbidden.status === 403, `POST /v1/notes with only ${READ}: ${describe(forbidden)}, expect 403`);
 
-  // Check 5: write, then read it back four ways.
-  const bothToken = await mintToken([READ, WRITE]);
+  // Check 5a: positive read checks with a read-only token.
   const replies = new Map<string, Reply>();
-  const fetched = async (operation: string, method: string, path: string, options: Parameters<typeof call>[2]) => {
-    const reply = await call(method, path, { token: bothToken, ...options });
+  const fetched = async (token: string, operation: string, method: string, path: string, options: Parameters<typeof call>[2]) => {
+    const reply = await call(method, path, { token, ...options });
     if (!('error' in reply)) replies.set(operation, reply);
     return reply;
   };
+  const scopes0 = await fetched(readToken, 'memory_scopes', 'GET', '/v1/scopes', {});
+  const scopesOk = !('error' in scopes0) && scopes0.status === 200 && Array.isArray((scopes0.body as any)?.scopes);
+  add('5a. memory_scopes answers with a scopes array', scopesOk, `status ${describe(scopes0)}`);
+  const search = await fetched(readToken, 'memory_search', 'GET', '/v1/search', { query: { q: 'deployed check' } });
+  const searchOk = !('error' in search) && search.status === 200 && Array.isArray((search.body as any)?.results) && typeof (search.body as any)?.total === 'number';
+  add('5a. memory_search answers with results and total', searchOk, `status ${describe(search)}`);
 
-  const write = await fetched('memory_write', 'POST', '/v1/notes', { body: probeNote });
-  const written = !('error' in write) && write.status === 200;
-  if (!written) {
-    add('5. write and read back a note', true, `skipped: memory_write answered ${describe(write)}`);
+  // Check 5b: write, then read it back. Needs a token with the write scope, which the probe client
+  // does not have on every stage.
+  let bothToken: string | undefined;
+  try {
+    bothToken = await mintToken([READ, WRITE]);
+  } catch (err) {
+    if (!(err instanceof ScopeNotAllowedError)) throw err;
+  }
+  if (bothToken === undefined) {
+    add('5b. write and read back a note', true, 'SKIP: the probe client has no write scope on this stage', true);
   } else {
-    add('5. memory_write stores the note', true, `status ${describe(write)}`);
-    const read = await fetched('memory_read', 'GET', '/v1/note', { query: { path: PROBE_PATH } });
-    const readContent = !('error' in read) && read.status === 200 && (read.body as any)?.content === probeNote.content;
-    add('5. memory_read returns the note', readContent, `status ${describe(read)}, content ${readContent ? 'matches' : 'differs'}`);
-    const index = await fetched('memory_index', 'GET', '/v1/index', { query: { scope: `agents/${PROBE_AGENT}` } });
-    const indexed = !('error' in index) && index.status === 200 && String((index.body as any)?.index ?? '').includes(PROBE_NAME);
-    add('5. memory_index lists the note', indexed, `status ${describe(index)}, ${indexed ? 'listed' : 'not listed'}`);
+    const write = await fetched(bothToken, 'memory_write', 'POST', '/v1/notes', { body: probeNote });
+    if (!('error' in write) && write.status === 200) {
+      add('5b. memory_write stores the note', true, `status ${describe(write)}`);
+      const read = await fetched(bothToken, 'memory_read', 'GET', '/v1/note', { query: { path: PROBE_PATH } });
+      const readContent = !('error' in read) && read.status === 200 && (read.body as any)?.content === probeNote.content;
+      add('5b. memory_read returns the note', readContent, `status ${describe(read)}, content ${readContent ? 'matches' : 'differs'}`);
+      const index = await fetched(bothToken, 'memory_index', 'GET', '/v1/index', { query: { scope: `agents/${PROBE_AGENT}` } });
+      const indexed = !('error' in index) && index.status === 200 && String((index.body as any)?.index ?? '').includes(PROBE_NAME);
+      add('5b. memory_index lists the note', indexed, `status ${describe(index)}, ${indexed ? 'listed' : 'not listed'}`);
+      const scopes = await fetched(bothToken, 'memory_scopes', 'GET', '/v1/scopes', {});
+      const listed = !('error' in scopes) && scopes.status === 200 && ((scopes.body as any)?.scopes ?? []).some((s: any) => s?.scope === `agents/${PROBE_AGENT}`);
+      add('5b. memory_scopes includes the agent scope', listed, `status ${describe(scopes)}, ${listed ? 'included' : 'missing'}`);
+    } else {
+      add('5b. write and read back a note', true, `SKIP: memory_write answered ${describe(write)}`, true);
+    }
   }
-  const scopes = await fetched('memory_scopes', 'GET', '/v1/scopes', {});
-  if (written) {
-    const listed = !('error' in scopes) && scopes.status === 200 && ((scopes.body as any)?.scopes ?? []).some((s: any) => s?.scope === `agents/${PROBE_AGENT}`);
-    add('5. memory_scopes includes the agent scope', listed, `status ${describe(scopes)}, ${listed ? 'included' : 'missing'}`);
-  }
-  const search = await fetched('memory_search', 'GET', '/v1/search', { query: { q: 'deployed check' } });
-  add('5. memory_search answers', !('error' in search) && search.status === 200, `status ${describe(search)}`);
 
   // Check 6: every response that was received has the documented fields.
   const missing: string[] = [];
@@ -276,6 +292,9 @@ async function main(): Promise<number> {
       body: new URLSearchParams({ grant_type: 'client_credentials', scope: scopes.join(' ') }),
     });
     const body: any = await res.json().catch(() => null);
+    if (res.status === 400 && body?.error === 'invalid_scope') {
+      throw new ScopeNotAllowedError(`scope not allowed for the probe client: ${scopes.join(' ')}`);
+    }
     if (!res.ok || typeof body?.access_token !== 'string') {
       throw new Error(`token request for ${scopes.join(' ')} failed with status ${res.status}`);
     }
@@ -296,7 +315,7 @@ async function main(): Promise<number> {
     console.error(`FAIL  checks stopped: ${err instanceof Error ? err.message : 'error'}`);
     return 1;
   }
-  for (const r of results) console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name} - ${r.detail}`);
+  for (const r of results) console.log(`${r.skipped ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'}  ${r.name} - ${r.detail}`);
   return results.some((r) => !r.ok) ? 1 : 0;
 }
 
