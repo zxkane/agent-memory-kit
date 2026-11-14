@@ -3,7 +3,7 @@
 
 export type PolicyStatement = {
   Effect: 'Allow' | 'Deny';
-  Principal?: '*' | { AWS: string[] };
+  Principal?: '*';
   Action: string[];
   Resource: string[];
   Condition?: Record<string, Record<string, string | string[]>>;
@@ -73,64 +73,91 @@ export function trustPolicy() {
   };
 }
 
-/** TLS-only deny, plus the workstation bridge roles when given. */
-export function bucketPolicy(bucketArn: string, workstationRoleArns: string[]): PolicyDocument {
-  for (const arn of workstationRoleArns) {
-    if (!ROLE_ARN_RE.test(arn)) {
-      throw new Error('Each workstation role ARN must be an IAM role ARN.');
-    }
-  }
-  const statements: PolicyStatement[] = [
-    {
-      Effect: 'Deny',
-      Principal: '*',
-      Action: ['s3:*'],
-      Resource: [bucketArn, `${bucketArn}/*`],
-      Condition: { Bool: { 'aws:SecureTransport': 'false' } },
-    },
-  ];
-  if (workstationRoleArns.length > 0) {
-    const principal = { AWS: workstationRoleArns };
-    // The bridge needs only these objects, and only the actions it uses. It writes notes and their
-    // snapshot but never reads them back from the bucket (it compares the listing's ETags); it reads
-    // its own record index/bridge.json, and the agent notes under agents/. A read of index/bridge.json
-    // before it exists answers 403 (the role has no list permission there), which the bridge treats
-    // as "no record" by design. The list permission names prefixes so that listing cannot reveal
-    // other keys, and index/ has no delete and no wildcard because the API alone writes
-    // index/agents.json.
-    statements.push(
+/** The bucket policy: the TLS-only deny and nothing else. The workstation roles hold their grants in their own policies. */
+export function bucketPolicy(bucketArn: string): PolicyDocument {
+  return {
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Effect: 'Deny',
+        Principal: '*',
+        Action: ['s3:*'],
+        Resource: [bucketArn, `${bucketArn}/*`],
+        Condition: { Bool: { 'aws:SecureTransport': 'false' } },
+      },
+    ],
+  };
+}
+
+/**
+ * The bridge role's whole permission set. It needs only these objects, and only the actions it
+ * uses. It writes notes and their snapshot but never reads them back from the bucket (it compares
+ * the listing's ETags); it reads its own record index/bridge.json, and the agent notes under
+ * agents/. A read of index/bridge.json before it exists answers 403 (the role has no list
+ * permission there), which the bridge treats as "no record" by design. The list permission names
+ * prefixes so that listing cannot reveal other keys, and index/ has no delete and no wildcard
+ * because the API alone writes index/agents.json.
+ */
+export function bridgeRolePolicy(bucketArn: string): PolicyDocument {
+  return {
+    Version: '2012-10-17',
+    Statement: [
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:PutObject', 's3:DeleteObject'],
         Resource: [`${bucketArn}/mem/*`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:PutObject'],
         Resource: [`${bucketArn}/index/mem.json`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:GetObject', 's3:PutObject'],
         Resource: [`${bucketArn}/index/bridge.json`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:GetObject'],
         Resource: [`${bucketArn}/agents/*`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:ListBucket'],
         Resource: [bucketArn],
         Condition: { StringLike: { 's3:prefix': ['mem/*', 'agents/*'] } },
       },
-    );
+    ],
+  };
+}
+
+/** The canary role's whole permission set: read exactly the parameters its checks use. */
+export function canaryRolePolicy(parameterArns: string[]): PolicyDocument {
+  return {
+    Version: '2012-10-17',
+    Statement: [{ Effect: 'Allow', Action: ['ssm:GetParameter'], Resource: parameterArns }],
+  };
+}
+
+/** The trust policy of a workstation role: only the given IAM roles may assume it. */
+export function workstationTrustPolicy(roleArns: string[]) {
+  if (roleArns.length === 0) {
+    throw new Error('Give at least one workstation role ARN.');
   }
-  return { Version: '2012-10-17', Statement: statements };
+  for (const arn of roleArns) {
+    if (!ROLE_ARN_RE.test(arn)) {
+      throw new Error('Each workstation role ARN must be an IAM role ARN.');
+    }
+  }
+  return {
+    Version: '2012-10-17' as const,
+    Statement: [
+      {
+        Effect: 'Allow' as const,
+        Principal: { AWS: roleArns },
+        Action: 'sts:AssumeRole',
+      },
+    ],
+  };
 }

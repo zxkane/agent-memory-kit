@@ -14,7 +14,7 @@ const read = (rel: string): string => readFileSync(new URL(rel, root), 'utf8');
 
 describe('infrastructure source', () => {
   it('has the expected program files', () => {
-    for (const f of ['sst.config.ts', 'infra/policies.ts', 'infra/storage.ts', 'infra/auth.ts', 'infra/api.ts']) {
+    for (const f of ['sst.config.ts', 'infra/policies.ts', 'infra/storage.ts', 'infra/auth.ts', 'infra/api.ts', 'infra/workstation.ts']) {
       assert.ok(files.includes(f), f);
     }
   });
@@ -111,5 +111,32 @@ describe('infrastructure source', () => {
 
   it('logs the source IP', () => {
     assert.match(read('infra/api.ts'), /\$context\.identity\.sourceIp/);
+  });
+
+  it('creates the two workstation roles and their parameters only inside the non-empty-variable branch', () => {
+    const src = squash('infra/workstation.ts');
+    const branch = src.match(/if\(roleArns\.length>0\)\{(.*)\}$/);
+    assert.ok(branch, 'branch on the role ARNs');
+    const body = branch[1];
+    assert.equal((src.match(/newaws\.iam\.Role\(/g) ?? []).length, 2);
+    assert.equal((body.match(/newaws\.iam\.Role\(/g) ?? []).length, 2);
+    assert.equal((src.match(/newaws\.iam\.RolePolicy\(/g) ?? []).length, 2);
+    assert.equal((body.match(/newaws\.iam\.RolePolicy\(/g) ?? []).length, 2);
+    assert.equal((src.match(/newaws\.ssm\.Parameter\(/g) ?? []).length, 2);
+    assert.equal((body.match(/newaws\.ssm\.Parameter\(/g) ?? []).length, 2);
+    assert.match(src, /process\.env\.AGENT_MEMORY_WORKSTATION_ROLE_ARNS/);
+    assert.equal((body.match(/maxSessionDuration:3600/g) ?? []).length, 2);
+    assert.equal((body.match(/assumeRolePolicy:JSON\.stringify\(workstationTrustPolicy\(roleArns\)\)/g) ?? []).length, 2);
+    assert.match(body, /name:`\$\{\$app\.name\}-\$\{\$app\.stage\}-bridge`/);
+    assert.match(body, /name:`\$\{\$app\.name\}-\$\{\$app\.stage\}-canary`/);
+    assert.match(body, /prefix=`\/\$\{\$app\.name\}\/\$\{\$app\.stage\}\/mcp`/);
+    assert.match(body, /name:`\$\{prefix\}\/bridge\/role-arn`/);
+    assert.match(body, /name:`\$\{prefix\}\/canary\/role-arn`/);
+    assert.doesNotMatch(src, /managedPolicyArns|aws\.iam\.RolePolicyAttachment/);
+  });
+
+  it('keeps the workstation role variable out of the storage program and loads workstation.ts', () => {
+    assert.doesNotMatch(read('infra/storage.ts'), /WORKSTATION_ROLE_ARNS/);
+    assert.match(read('sst.config.ts'), /import\("\.\/infra\/workstation\.ts"\)/);
   });
 });

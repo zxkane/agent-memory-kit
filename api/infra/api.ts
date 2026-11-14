@@ -99,8 +99,11 @@ const parameters: { key: string; type: "String" | "SecureString"; value: $util.I
   { key: "bucket/name", type: "String", value: bucket.bucket },
 ];
 
+// The parameter resources by key, so that infra/workstation.ts can name their ARNs.
+export const parameterResources: Record<string, aws.ssm.Parameter> = {};
+
 for (const parameter of parameters) {
-  new aws.ssm.Parameter(`Param${parameter.key.replace(/[^A-Za-z0-9]+/g, "-")}`, {
+  parameterResources[parameter.key] = new aws.ssm.Parameter(`Param${parameter.key.replace(/[^A-Za-z0-9]+/g, "-")}`, {
     name: `${prefix}/${parameter.key}`,
     type: parameter.type,
     value: parameter.value,

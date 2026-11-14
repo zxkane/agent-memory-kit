@@ -2,7 +2,9 @@
 
 // Deploy-time inputs come from the environment, never from this file:
 //   AGENT_MEMORY_REGION                  required, the AWS region to deploy to
-//   AGENT_MEMORY_WORKSTATION_ROLE_ARNS   optional, comma-separated IAM role ARNs for the sync bridge
+//   AGENT_MEMORY_WORKSTATION_ROLE_ARNS   optional, comma-separated ARNs of the workstation's IAM roles.
+//                                        When set, the deployment creates a bridge role and a canary
+//                                        role that only those roles may assume. When unset, it creates neither.
 export default $config({
   app(input) {
     const region = process.env.AGENT_MEMORY_REGION;
@@ -38,6 +40,7 @@ export default $config({
     await import("./infra/storage.ts");
     await import("./infra/auth.ts");
     const { api, bucket, tokenEndpoint } = await import("./infra/api.ts");
+    await import("./infra/workstation.ts");
 
     return {
       apiUrl: api.url,

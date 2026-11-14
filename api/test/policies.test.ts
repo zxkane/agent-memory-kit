@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { bucketPolicy, functionPolicy, logsPolicy, trustPolicy } from '../infra/policies.ts';
+import {
+  bridgeRolePolicy,
+  bucketPolicy,
+  canaryRolePolicy,
+  functionPolicy,
+  logsPolicy,
+  trustPolicy,
+  workstationTrustPolicy,
+} from '../infra/policies.ts';
 
 const BUCKET = 'arn:aws:s3:::example-bucket';
 const ROLE_A = 'arn:aws:iam::123456789012:role/bridge-a';
@@ -54,8 +62,8 @@ describe('functionPolicy', () => {
 });
 
 describe('bucketPolicy', () => {
-  it('without roles holds only the TLS deny', () => {
-    const statements = bucketPolicy(BUCKET, []).Statement as Statement[];
+  it('holds only the TLS deny', () => {
+    const statements = bucketPolicy(BUCKET).Statement as Statement[];
     assert.equal(statements.length, 1);
     const [s] = statements;
     assert.equal(s.Effect, 'Deny');
@@ -64,39 +72,36 @@ describe('bucketPolicy', () => {
     assert.deepEqual(asList(s.Resource).sort(), [BUCKET, `${BUCKET}/*`].sort());
     assert.deepEqual(s.Condition, { Bool: { 'aws:SecureTransport': 'false' } });
   });
+});
 
-  it('with two roles grants the bridge exactly five statements to both principals', () => {
-    const statements = bucketPolicy(BUCKET, [ROLE_A, ROLE_B]).Statement as Statement[];
-    assert.equal(statements.filter((s) => s.Effect === 'Deny').length, 1);
-    const principal = { AWS: [ROLE_A, ROLE_B] };
-    assert.deepEqual(statements.slice(1), [
+describe('bridgeRolePolicy', () => {
+  const policy = bridgeRolePolicy(BUCKET);
+  const statements = policy.Statement as Statement[];
+
+  it('holds exactly five allow statements, without a principal', () => {
+    assert.deepEqual(statements, [
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:PutObject', 's3:DeleteObject'],
         Resource: [`${BUCKET}/mem/*`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:PutObject'],
         Resource: [`${BUCKET}/index/mem.json`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:GetObject', 's3:PutObject'],
         Resource: [`${BUCKET}/index/bridge.json`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:GetObject'],
         Resource: [`${BUCKET}/agents/*`],
       },
       {
         Effect: 'Allow',
-        Principal: principal,
         Action: ['s3:ListBucket'],
         Resource: [BUCKET],
         Condition: { StringLike: { 's3:prefix': ['mem/*', 'agents/*'] } },
@@ -104,15 +109,14 @@ describe('bucketPolicy', () => {
     ]);
   });
 
-  it('gives the roles no write or delete on index/agents.json or agents/, no delete under index/, and no index/* resource', () => {
-    const allows = (bucketPolicy(BUCKET, [ROLE_A]).Statement as Statement[]).filter(
-      (s) => s.Effect === 'Allow',
-    );
-    for (const s of allows) {
+  it('gives no write or delete on index/agents.json or agents/, no delete under index/, and no index/* resource', () => {
+    for (const s of statements) {
+      assert.equal(s.Principal, undefined);
       const actions = asList(s.Action);
       for (const r of asList(s.Resource)) {
         assert.notEqual(r, `${BUCKET}/index/*`);
         assert.notEqual(r, `${BUCKET}/*`);
+        assert.notEqual(r, '*');
         if (r.startsWith(`${BUCKET}/index/`)) {
           assert.ok(!actions.includes('s3:DeleteObject'), r);
         }
@@ -123,27 +127,59 @@ describe('bucketPolicy', () => {
       }
     }
   });
+});
+
+describe('canaryRolePolicy', () => {
+  const PREFIX = 'arn:aws:ssm:region-x:123456789012:parameter/agent-memory/dev/mcp';
+  const ARNS = ['gateway/url', 'cognito/token-endpoint', 'cognito/probe/client-id', 'cognito/probe/client-secret'].map(
+    (k) => `${PREFIX}/${k}`,
+  );
+
+  it('allows ssm:GetParameter on exactly the given parameters', () => {
+    assert.deepEqual(canaryRolePolicy(ARNS).Statement, [
+      { Effect: 'Allow', Action: ['ssm:GetParameter'], Resource: ARNS },
+    ]);
+  });
+
+  it('does not name the hub client secret or a wildcard', () => {
+    const text = JSON.stringify(canaryRolePolicy(ARNS));
+    assert.ok(!text.includes('hub'));
+    assert.ok(!text.includes('*'));
+  });
+});
+
+describe('workstationTrustPolicy', () => {
+  it('lets only the given roles assume the role', () => {
+    assert.deepEqual(workstationTrustPolicy([ROLE_A, ROLE_B]), {
+      Version: '2012-10-17',
+      Statement: [{ Effect: 'Allow', Principal: { AWS: [ROLE_A, ROLE_B] }, Action: 'sts:AssumeRole' }],
+    });
+  });
+
+  it('rejects an empty list', () => {
+    assert.throws(() => workstationTrustPolicy([]), /at least one/i);
+  });
 
   it('throws on a malformed role ARN', () => {
     for (const bad of [
       'arn:aws:iam::123:role/x',
       'arn:aws:iam::123456789012:user/x',
+      'arn:aws:iam::123456789012:root',
       'arn:aws:iam::123456789012:role/',
       '*',
+      'arn:aws:iam::123456789012:role/*',
       'arn:aws:iam::123456789012:role/x y',
       'arn:aws:iam::123456789012:role//name',
       'arn:aws:iam::123456789012:role/a//b',
       'arn:aws:iam::123456789012:role/a/',
     ]) {
-      assert.throws(() => bucketPolicy(BUCKET, [bad]), /role/i, bad);
+      assert.throws(() => workstationTrustPolicy([ROLE_A, bad]), /role/i, bad);
     }
   });
-});
 
-describe('bucketPolicy role ARN paths', () => {
   it('accepts a plain name and a path', () => {
     for (const ok of ['arn:aws:iam::123456789012:role/name', 'arn:aws:iam::123456789012:role/path/name']) {
-      assert.doesNotThrow(() => bucketPolicy(BUCKET, [ok]), ok);
+      assert.doesNotThrow(() => workstationTrustPolicy([ok]), ok);
     }
   });
 });
