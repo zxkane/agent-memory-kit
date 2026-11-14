@@ -38,7 +38,10 @@ export function s3Store(bucket: string, client: S3Client = new S3Client({})): St
         );
       } catch (err) {
         const status = httpStatus(err);
-        if (status === 404 || errorName(err) === 'NoSuchKey') return { status: 'missing' };
+        // Only a missing key reads as missing. NoSuchBucket is also a 404, and AccessDenied (what S3
+        // answers for a missing key without s3:ListBucket) is an error, so the name is checked first.
+        const name = errorName(err);
+        if (name === 'NoSuchKey' || (status === 404 && name !== 'NoSuchBucket')) return { status: 'missing' };
         if (status === 304 || errorName(err) === 'NotModified') return { status: 'not-modified' };
         throw err;
       }

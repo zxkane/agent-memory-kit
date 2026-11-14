@@ -111,6 +111,10 @@ test('s3Store.get rethrows other errors and rejects bodies over 8 MB', async () 
     throw awsError('AccessDenied', 403);
   });
   await assert.rejects(() => s3Store('b', a.client).get('k'), /AccessDenied/);
+  const nb = stubClient(() => {
+    throw awsError('NoSuchBucket', 404);
+  });
+  await assert.rejects(() => s3Store('b', nb.client).get('k'), /NoSuchBucket/);
   const b = stubClient(() => ({ Body: body(new Uint8Array(8 * 1024 * 1024 + 1)), ETag: '"e"' }));
   await assert.rejects(() => s3Store('b', b.client).get('k'));
   const c = stubClient(() => ({ Body: body('x'), ContentLength: 8 * 1024 * 1024 + 1, ETag: '"e"' }));

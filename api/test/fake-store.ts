@@ -9,7 +9,11 @@ export type FakeStore = Store & {
   beforePut?: (key: string) => void;
 };
 
-export function fakeStore(initial: Record<string, string> = {}): FakeStore {
+/**
+ * noList models a role without s3:ListBucket: S3 then answers a get of a missing key with
+ * 403 AccessDenied instead of 404.
+ */
+export function fakeStore(initial: Record<string, string> = {}, opts: { noList?: boolean } = {}): FakeStore {
   let counter = 0;
   const objects = new Map<string, { body: string; etag: string }>();
   const nextEtag = () => `"etag-${++counter}"`;
@@ -21,7 +25,12 @@ export function fakeStore(initial: Record<string, string> = {}): FakeStore {
     async get(key, ifNoneMatch): Promise<Get> {
       store.gets.push({ key, ifNoneMatch });
       const found = objects.get(key);
-      if (!found) return { status: 'missing' };
+      if (!found) {
+        if (opts.noList) {
+          throw Object.assign(new Error('Access Denied'), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } });
+        }
+        return { status: 'missing' };
+      }
       if (ifNoneMatch !== undefined && ifNoneMatch === found.etag) return { status: 'not-modified' };
       return { status: 'ok', body: found.body, etag: found.etag };
     },
