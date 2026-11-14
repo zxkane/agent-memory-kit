@@ -23,8 +23,10 @@ const GLOBAL_ONLY = 'notes in the global folder are organized only by a run on t
 // cannot be shrunk step by step across runs, nor a short note replaced outright.
 const globalLossAllowed = (n) => Math.min(2, Math.floor(0.2 * n));
 // Below this many former terms (short words and names such as "uv" or "SQL" make no terms) an
-// existing global note changed in a project run may only be added to: its former body must still
-// appear word for word in its new body.
+// existing global note changed in a project run may only be appended to: its new body is its former
+// body, or its former body followed by a space and more text (whitespace collapsed). Text put in
+// front, a quotation, a strike-through or a comment around it, or letters joined to its last word
+// all change what the note says.
 const GLOBAL_WORDS_BELOW = 5;
 const collapseSpace = (str) => str.replace(/\s+/g, ' ').trim();
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -367,8 +369,9 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
   // those words cannot lift a note whose own content was dropped.
   // In a project run, an existing global note that is changed is judged on its own new body alone,
   // whatever minRetention: global/ may be added to there, never reduced. A note of fewer than
-  // GLOBAL_WORDS_BELOW former terms must keep its former body word for word (whitespace collapsed,
-  // frontmatter not compared); a longer one may lose at most globalLossAllowed(n) of its n terms.
+  // GLOBAL_WORDS_BELOW former terms may only have text added after its former body (whitespace
+  // collapsed, frontmatter not compared); a longer one may lose at most globalLossAllowed(n) of its
+  // n terms.
   const termCache = new WeakMap();
   const termsOf = (buf) => {
     let set = termCache.get(buf);
@@ -417,8 +420,8 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     if (globalNote && beforeTerms.size < GLOBAL_WORDS_BELOW) {
       const was = collapseSpace(bodyOf(stripInvisible(text(beforeBuf))));
       const now = collapseSpace(bodyOf(stripInvisible(text(work[c.label].get(c.file)))));
-      if (!now.includes(was)) {
-        errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: its former text no longer appears in it word for word)`);
+      if (now !== was && !now.startsWith(`${was} `)) {
+        errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: a short note may only have text added after its existing text)`);
         continue;
       }
     } else if (globalNote && lost > globalLossAllowed(beforeTerms.size)) {

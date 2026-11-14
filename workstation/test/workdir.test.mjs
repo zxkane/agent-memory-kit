@@ -1277,7 +1277,7 @@ const GLOBAL_NOTES = { 'MEMORY.md': '- [Tone](tone.md) — t\n- [Tools](tools.md
 test('C2: a project run may not retire a note that was already in global/', (t) => {
   for (const stub of ['MOVED TO [[tools]]\n', 'MOVED TO [[global:tools]]\n']) {
     const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
-    s.work('global', 'tools.md', 'uses the terminal; prefers short answers\n');
+    s.work('global', 'tools.md', 'uses the terminal and prefers short answers\n');
     s.work('global', 'tone.md', stub);
     s.work('global', 'MEMORY.md', '- [Tools](tools.md) — u\n');
     const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
@@ -1301,7 +1301,7 @@ test('C2: a project run may not drop an existing global note from global/MEMORY.
 test('C2: a project run may still add a global note and add to an existing one', (t) => {
   const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
   s.work('global', 'editor.md', 'edits with a modal editor\n');
-  s.work('global', 'tone.md', 'prefers short answers, without filler\n');
+  s.work('global', 'tone.md', 'prefers short answers without filler\n');
   s.work('global', 'MEMORY.md', '- [Tone](tone.md) — t\n- [Tools](tools.md) — u\n- [Editor](editor.md) — e\n');
   s.work('notes', 'b.md', 'MOVED TO [[global:editor]]\n');
   s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
@@ -1482,7 +1482,7 @@ const reduced = (r) => r.errors.filter((e) => GLOBAL_REDUCED.test(e)).map((e) =>
 
 // A global note of fewer than 5 former terms may only be added to: its former body, with runs of
 // whitespace collapsed, must still appear word for word in its new body.
-const GLOBAL_TEXT = /^global\/([\w-]+)\.md: notes in the global folder are organized only by a run on the global scope \(an existing global note may be added to but not reduced in a project run: its former text no longer appears in it word for word\)$/;
+const GLOBAL_TEXT = /^global\/([\w-]+)\.md: notes in the global folder are organized only by a run on the global scope \(an existing global note may be added to but not reduced in a project run: a short note may only have text added after its existing text\)$/;
 const textChanged = (r) => r.errors.filter((e) => GLOBAL_TEXT.test(e)).map((e) => GLOBAL_TEXT.exec(e)[1]);
 
 test('global loss: a 3-term global note rewritten to other words is rejected; with a sentence added it passes', (t) => {
@@ -1490,7 +1490,7 @@ test('global loss: a 3-term global note rewritten to other words is rejected; wi
   s.work('global', 'tone.md', 'likes brief replies\n');
   for (const minRetention of [0.25, 0]) assert.deepEqual(textChanged(judge(s, minRetention)), ['tone'], String(minRetention));
   s = globalNote(t, 'prefers terse answers');
-  s.work('global', 'tone.md', 'prefers terse answers. Also likes examples in code blocks.\n');
+  s.work('global', 'tone.md', 'prefers terse answers and examples in code blocks.\n');
   assert.deepEqual(judge(s).errors, []);
 });
 
@@ -1534,4 +1534,32 @@ test('global loss: a run on the global scope is judged by the ordinary rule', (t
   const s = setup(t, { notes: { 'MEMORY.md': '- [G](tone.md) — g\n', 'tone.md': 'prefers terse answers\n' } });
   s.work('notes', 'tone.md', 'likes brief replies\n');
   assert.deepEqual(judge(s).errors, []);
+});
+
+// A short existing global note may only be appended to: after collapsing whitespace, its new body is
+// its former body, or its former body followed by a space and more text.
+test('global loss: a short global note may only have text added after its existing text', (t) => {
+  const former = 'Use uv, not pip.';
+  const rejected = {
+    'a prefix': `Do not: ${former}`,
+    'a quotation': `> ${former}`,
+    'a strike-through': `~~${former}~~`,
+    'an HTML comment': `<!-- ${former} -->`,
+  };
+  for (const [what, body] of Object.entries(rejected)) {
+    const s = globalNote(t, former);
+    s.work('global', 'tone.md', `${body}\n`);
+    assert.deepEqual(textChanged(judge(s, 0)), ['tone'], what);
+  }
+  // The former text only as the start of a longer word.
+  let s = globalNote(t, 'prefers terse answers');
+  s.work('global', 'tone.md', 'prefers terse answersheet layouts\n');
+  assert.deepEqual(textChanged(judge(s, 0)), ['tone']);
+  // Appended after a space: passes.
+  s = globalNote(t, former);
+  s.work('global', 'tone.md', `${former} Pin every version in the lock file.\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
+  s = globalNote(t, former);
+  s.work('global', 'tone.md', `${former}\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
 });
