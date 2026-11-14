@@ -440,3 +440,86 @@ test('bridgeAfterSync: exactly 5 s left still starts the bridge', async () => {
   assert.equal(r.up.ok, true);
   assert.equal(calls.up.length, 1);
 });
+
+// ---- roleArn: the dedicated role ----
+
+const ROLE = 'arn:aws:iam::123456789012:role/example-bridge';
+const ROLE_CREDS = { accessKeyId: 'ROLEKEYID', secretAccessKey: 'role-signing-value', sessionToken: 'role-session-value', expiration: '2026-11-14T10:15:00Z' };
+
+function roleFakes(over = {}) {
+  const exchange = [];
+  const { calls, deps } = fakes({
+    assumeRole: async (args) => {
+      exchange.push(args);
+      return ROLE_CREDS;
+    },
+    ...over,
+  });
+  return { calls, deps, exchange };
+}
+
+test('roleArn: S3 gets the exchanged credentials once per run, never the instance credentials', async () => {
+  const { calls, deps, exchange } = roleFakes();
+  const r = await run(cfg(bridgeBlock({ down: true, agentsRepoDir: '/agents', roleArn: ROLE })), deps);
+  assert.equal(r.up.ok && r.down.ok, true);
+  assert.equal(exchange.length, 1);
+  assert.equal(exchange[0].roleArn, ROLE);
+  assert.equal(exchange[0].sessionName, 'agent-memory-bridge');
+  assert.equal(exchange[0].region, 'ap-northeast-1');
+  assert.equal(exchange[0].credentials.accessKeyId, 'EXAMPLEKEYID');
+  assert.ok(exchange[0].signal instanceof AbortSignal);
+  assert.equal(exchange[0].signal, calls.createS3[0].signal);
+  assert.equal(calls.createS3.length, 1);
+  assert.equal(calls.createS3[0].credentials, ROLE_CREDS);
+  assert.ok(!JSON.stringify(calls.createS3).includes('EXAMPLEKEYID'));
+});
+
+test('roleArn: a failed exchange fails every step that needs S3 and no S3 client is built; the pull-only step is not affected', async () => {
+  const { calls, deps } = roleFakes({ assumeRole: async () => { throw new AwsError('sts', 403, 'AccessDenied'); } });
+  const r = await run(cfg(bridgeBlock({ down: true, agentsRepoDir: '/agents', roleArn: ROLE })), deps);
+  assert.deepEqual(r.up, { ok: false, status: null, error: 'sts failed: 403 AccessDenied', at: AT });
+  assert.deepEqual(r.down, { ok: false, status: null, error: 'sts failed: 403 AccessDenied', at: AT });
+  assert.deepEqual([calls.createS3.length, calls.up.length, calls.down.length], [0, 0, 0]);
+  // Pull only: no S3, so no exchange, and the step still runs.
+  const pull = roleFakes({ assumeRole: async () => assert.fail('no exchange') });
+  const p = await run(cfg(bridgeBlock({ up: false, bucket: null, region: null, agentsRepoDir: '/agents', roleArn: ROLE })), pull.deps);
+  assert.equal(p.down.ok, true);
+  assert.equal(pull.calls.credentials, 0);
+});
+
+test('roleArn: an error of the exchange that is not an AwsError never reaches the record', async () => {
+  const { calls, deps } = roleFakes({ assumeRole: async () => { throw new Error('SECRET-IN-ERROR'); } });
+  const r = await run(cfg(bridgeBlock({ down: true, agentsRepoDir: '/agents', roleArn: ROLE })), deps);
+  assert.equal(r.up.ok, false);
+  assert.equal(r.down.ok, false);
+  assert.ok(!JSON.stringify(r).includes('SECRET'));
+  assert.equal(calls.createS3.length, 0);
+});
+
+test('roleArn: an exchange that does not finish in time is a time limit and no S3 client is built', async () => {
+  const { calls, deps } = roleFakes({ assumeRole: () => new Promise(() => {}) });
+  const r = await run(cfg(bridgeBlock({ roleArn: ROLE })), deps, { limitMs: 30 });
+  assert.deepEqual(r.up, { ok: false, status: null, error: 'time limit', at: AT });
+  assert.equal(calls.createS3.length, 0);
+});
+
+test('roleArn: a failed instance-credentials request fails the steps and no exchange is attempted', async () => {
+  const { calls, deps, exchange } = roleFakes({ credentials: async () => { throw new AwsError('credentials', 0, 'Unavailable'); } });
+  const r = await run(cfg(bridgeBlock({ roleArn: ROLE })), deps);
+  assert.equal(r.up.error, 'credentials failed: 0 Unavailable');
+  assert.deepEqual([exchange.length, calls.createS3.length], [0, 0]);
+});
+
+test('no roleArn: the instance credentials are used as before and nothing is exchanged', async () => {
+  const { calls, deps, exchange } = roleFakes();
+  await run(cfg(bridgeBlock()), deps);
+  assert.equal(exchange.length, 0);
+  assert.equal(calls.createS3[0].credentials.accessKeyId, 'EXAMPLEKEYID');
+});
+
+test('roleArn: the exchange sends the run fetch, so a test can keep it off the network', async () => {
+  const fetchImpl = async () => assert.fail('not used here');
+  const { exchange, deps } = roleFakes({ fetchImpl });
+  await run(cfg(bridgeBlock({ roleArn: ROLE })), deps);
+  assert.equal(exchange[0].fetchImpl, fetchImpl);
+});

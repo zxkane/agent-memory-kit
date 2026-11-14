@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
-import { BUCKET_RE, REGION_RE } from './aws-names.mjs';
+import { BUCKET_RE, REGION_RE, ROLE_ARN_RE } from './aws-names.mjs';
 import { scanText } from './secret-scan.mjs';
 
 const HOST_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -77,7 +77,7 @@ function parseConsolidate(block) {
   };
 }
 
-const BRIDGE_KEYS = ['bucket', 'region', 'up', 'down', 'agentsRepoDir', 'agentsRepoUrl'];
+const BRIDGE_KEYS = ['bucket', 'region', 'up', 'down', 'agentsRepoDir', 'agentsRepoUrl', 'roleArn'];
 
 // True when one folder is the other, inside it or around it. Both get a trailing separator, so
 // `/a/notes-agents` is not taken to be inside `/a/notes`.
@@ -111,10 +111,12 @@ function parseBridge(block, repoDir) {
   const url = block.agentsRepoUrl ?? null;
   // Passed to Git as an argument: no leading dash, whitespace or control character.
   if (url !== null && (typeof url !== 'string' || !MODEL_RE.test(url))) return bad('agentsRepoUrl');
-  return { value: { bucket, region, up, down, agentsRepoDir: dir, agentsRepoUrl: url }, problem: null };
+  const roleArn = block.roleArn ?? null;
+  if (roleArn !== null && (typeof roleArn !== 'string' || !ROLE_ARN_RE.test(roleArn))) return bad('roleArn');
+  return { value: { bucket, region, up, down, agentsRepoDir: dir, agentsRepoUrl: url, roleArn }, problem: null };
 }
 
-const CANARY_KEYS = ['stage', 'region', 'schedule'];
+const CANARY_KEYS = ['stage', 'region', 'schedule', 'roleArn'];
 const STAGE_RE = /^[a-z0-9-]{1,32}$/;
 
 // The optional canary block, with the same contract as parseConsolidate: `{ value, problem }`.
@@ -128,7 +130,9 @@ function parseCanary(block) {
   if (typeof block.region !== 'string' || !REGION_RE.test(block.region)) return bad('region');
   const schedule = calendar(block.schedule);
   if (schedule === undefined) return bad('schedule');
-  return { value: { stage: block.stage, region: block.region, schedule }, problem: null };
+  const roleArn = block.roleArn ?? null;
+  if (roleArn !== null && (typeof roleArn !== 'string' || !ROLE_ARN_RE.test(roleArn))) return bad('roleArn');
+  return { value: { stage: block.stage, region: block.region, schedule, roleArn }, problem: null };
 }
 
 // The configuration file: AGENT_MEMORY_CONFIG, or ~/.config/agent-memory/config.json.

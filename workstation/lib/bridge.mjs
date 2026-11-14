@@ -4,7 +4,7 @@
 // the bucket, a remote or a note. A failing step never makes the sync fail; the caller decides the
 // exit code from the sync.
 
-import { AwsError, imdsCredentials } from './aws.mjs';
+import { AwsError, assumeRole, imdsCredentials } from './aws.mjs';
 import { BridgeDownError, runBridgeDown } from './bridge-down.mjs';
 import {
   ALL_STATUS_WORDS, AWS_ERROR_RE, BRIDGE_DOWN_REASONS, DOWN_FAILED_STATUSES, DOWN_OK_STATUSES, OWN_ERROR_TEXTS,
@@ -90,7 +90,7 @@ export function configuredSteps(bridge) {
 // bridge block or the sync failed (nothing is attempted after a failed sync).
 // `processStart`: epoch milliseconds when the run began (the deadline is 110 s after it); `limitMs`:
 // the most the bridge itself may take; `clock`: the time source (tests).
-// deps (tests): credentials, fetchImpl, createS3, runBridgeUp, runBridgeDown.
+// deps (tests): credentials, assumeRole, fetchImpl, createS3, runBridgeUp, runBridgeDown.
 export async function runBridge({
   config, syncResult, deps = {}, now = new Date(), limitMs = BRIDGE_MAX_MS, processStart, clock = Date.now,
 }) {
@@ -130,7 +130,14 @@ export async function runBridge({
     if (want.needsS3 && !late()) {
       try {
         s3 = await within(async () => {
-          const credentials = await (deps.credentials ?? (() => imdsCredentials({ fetchImpl: deps.fetchImpl })))();
+          const instance = await (deps.credentials ?? (() => imdsCredentials({ fetchImpl: deps.fetchImpl })))();
+          // With a dedicated role the instance credentials only sign the exchange; S3 gets the role's.
+          const credentials = bridge.roleArn
+            ? await (deps.assumeRole ?? assumeRole)({
+              roleArn: bridge.roleArn, sessionName: 'agent-memory-bridge', region: bridge.region, credentials: instance,
+              fetchImpl: deps.fetchImpl, signal,
+            })
+            : instance;
           return (deps.createS3 ?? createS3)({
             bucket: bridge.bucket, region: bridge.region, credentials, fetchImpl: deps.fetchImpl, signal,
           });

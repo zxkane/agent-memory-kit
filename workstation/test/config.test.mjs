@@ -205,7 +205,7 @@ test('item 4: a key the consolidate block does not know makes it invalid, naming
 
 const BRIDGE_OK = {
   bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: true,
-  agentsRepoDir: '/home/u/agent-memory-mirror', agentsRepoUrl: 'https://example.com/agents.git',
+  agentsRepoDir: '/home/u/agent-memory-mirror', agentsRepoUrl: 'https://example.com/agents.git', roleArn: null,
 };
 
 test('bridge is null, with no problem, when the block is absent or null', (t) => {
@@ -223,11 +223,11 @@ test('bridge: a valid block with every field, and the defaults', (t) => {
   assert.equal(loadConfig(env).bridgeProblem, null);
   write({ ...BASE, bridge: { up: true, bucket: 'example-bucket', region: 'ap-northeast-1' } });
   assert.deepEqual(loadConfig(env).bridge, {
-    bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: false, agentsRepoDir: null, agentsRepoUrl: null,
+    bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: false, agentsRepoDir: null, agentsRepoUrl: null, roleArn: null,
   });
   write({ ...BASE, bridge: { agentsRepoDir: '/srv/agents' } });
   assert.deepEqual(loadConfig(env).bridge, {
-    bucket: null, region: null, up: false, down: false, agentsRepoDir: '/srv/agents', agentsRepoUrl: null,
+    bucket: null, region: null, up: false, down: false, agentsRepoDir: '/srv/agents', agentsRepoUrl: null, roleArn: null,
   });
   write({ ...BASE, bridge: { up: false } });
   assert.equal(loadConfig(env).bridge.up, false);
@@ -295,7 +295,7 @@ test('bridge: an agentsRepoDir with .. segments that resolves outside repoDir is
 
 // ---- canary block ----
 
-const CANARY_OK = { stage: 'prod', region: 'ap-northeast-1', schedule: '*-*-* *:00:00' };
+const CANARY_OK = { stage: 'prod', region: 'ap-northeast-1', schedule: '*-*-* *:00:00', roleArn: null };
 
 test('canary is null, with no problem, when the block is absent or null', (t) => {
   const { env, write } = setup(t);
@@ -311,7 +311,7 @@ test('canary: a valid block, with and without a schedule', (t) => {
   assert.deepEqual(loadConfig(env).canary, CANARY_OK);
   assert.equal(loadConfig(env).canaryProblem, null);
   write({ ...BASE, canary: { stage: 'dev-2', region: 'us-east-1' } });
-  assert.deepEqual(loadConfig(env).canary, { stage: 'dev-2', region: 'us-east-1', schedule: null });
+  assert.deepEqual(loadConfig(env).canary, { stage: 'dev-2', region: 'us-east-1', schedule: null, roleArn: null });
   write({ ...BASE, canary: { stage: 'a'.repeat(32), region: 'eu-central-1', schedule: null } });
   assert.equal(loadConfig(env).canary.schedule, null);
 });
@@ -413,4 +413,38 @@ test('one echo rule for all three blocks: a word is named, a credential-like or 
     write({ ...BASE, [name]: { ...ok, misspelt: 'x' } });
     assert.equal(loadConfig(env)[`${name}Problem`], 'misspelt', name);
   }
+});
+
+// ---- roleArn ----
+
+const ROLE_OK = 'arn:aws:iam::123456789012:role/example-bridge';
+const ROLE_BAD = [
+  '', 5, ['x'], 'arn:aws:iam::12345:role/x', 'arn:aws:iam::123456789012:user/x', 'arn:aws:iam::123456789012:role/',
+  `${ROLE_OK}\n`, `${ROLE_OK} x`, 'role/example', 'arn:aws:iam::123456789012:role/a b',
+];
+
+test('roleArn: a valid value is kept on the bridge block and on the canary block, null when absent or null', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, bridge: { ...BRIDGE_OK, roleArn: ROLE_OK }, canary: { stage: 'prod', region: 'ap-northeast-1', roleArn: ROLE_OK } });
+  const cfg = loadConfig(env);
+  assert.deepEqual([cfg.bridge.roleArn, cfg.bridgeProblem, cfg.canary.roleArn, cfg.canaryProblem], [ROLE_OK, null, ROLE_OK, null]);
+  write({ ...BASE, bridge: { ...BRIDGE_OK, roleArn: null }, canary: { stage: 'prod', region: 'ap-northeast-1', roleArn: null } });
+  const empty = loadConfig(env);
+  assert.deepEqual([empty.bridge.roleArn, empty.canary.roleArn], [null, null]);
+});
+
+test('roleArn: a bad value makes the block invalid with the problem roleArn', (t) => {
+  const { env, write } = setup(t);
+  for (const roleArn of ROLE_BAD) {
+    write({ ...BASE, bridge: { ...BRIDGE_OK, roleArn } });
+    assert.deepEqual([loadConfig(env).bridge, loadConfig(env).bridgeProblem], [null, 'roleArn'], JSON.stringify(roleArn));
+    write({ ...BASE, canary: { stage: 'prod', region: 'ap-northeast-1', roleArn } });
+    assert.deepEqual([loadConfig(env).canary, loadConfig(env).canaryProblem], [null, 'roleArn'], JSON.stringify(roleArn));
+  }
+});
+
+test('roleArn: a pull-only bridge block may carry one', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, bridge: { agentsRepoDir: '/srv/agents', roleArn: ROLE_OK } });
+  assert.equal(loadConfig(env).bridge.roleArn, ROLE_OK);
 });

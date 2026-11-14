@@ -5,7 +5,7 @@
 export const CANARY_ERROR_TEXTS = ['time limit', 'checks stopped', 'canary failed'];
 
 // The AwsError operations the canary can produce, and the message shape it accepts.
-export const CANARY_OPERATIONS = ['credentials', 'ssm', 'sign'];
+export const CANARY_OPERATIONS = ['credentials', 'ssm', 'sts', 'sign'];
 export const CANARY_AWS_ERROR_RE = new RegExp(`^(${CANARY_OPERATIONS.join('|')}) failed: \\d{1,3} [A-Za-z0-9]{1,40}$`);
 
 const MAX_FAILED = 30;
