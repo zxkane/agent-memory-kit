@@ -4,7 +4,10 @@ import { spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadConfig } from '../lib/config.mjs';
+import { TOOL_BUDGET, buildToolContext, textCost } from '../lib/context.mjs';
 import { memoryLinkPath } from '../lib/project.mjs';
+import { readStatus } from '../lib/sync-engine.mjs';
 import { isolatedEnv, isolateGit, makeRemoteAndClones, sh, tempDir } from './helpers.mjs';
 
 isolateGit();
@@ -330,6 +333,188 @@ test('session-start in a repository whose directory name is not a usable project
   assert.match(out, /\nThis repository's directory name cannot be used as a project name, so its memory stays on this machine\.\n/);
   assert.doesNotMatch(out, /not inside a Git repository/);
   assert.equal(existsSync(join(f.repo, 'projects')), false);
+});
+
+function assertToolText(r, f) {
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /^Shared memory is on\./);
+  assert.match(r.stdout, /Project index \(/);
+  assert.match(r.stdout, /Global index \(/);
+  assert.throws(() => JSON.parse(r.stdout));
+  assert.equal(readFileSync(join(f.repo, 'projects', 'example-repo', '.project'), 'utf8'), 'example.com/a/example-repo\n');
+  assert.equal(existsSync(f.claudeDir), false);
+}
+
+test('session-start codex prints plain text with both indexes', (t) => {
+  const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+  mkdirSync(join(f.repo, 'projects', 'example-repo'), { recursive: true });
+  writeFileSync(join(f.repo, 'projects', 'example-repo', 'MEMORY.md'), '- [Note](note.md) - a fact\n');
+  const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['codex']);
+  assertToolText(r, f);
+  assert.match(r.stdout, /- \[Note\]\(note\.md\) - a fact/);
+});
+
+test('session-start kiro without stdin JSON uses the process directory', (t) => {
+  const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+  const r = spawnSync(process.execPath, [join(PKG, 'session-start.mjs'), 'kiro'], { input: '', env: f.env, cwd: f.worktree, encoding: 'utf8' });
+  assertToolText(r, f);
+});
+
+test('session-start codex outside a repository', (t) => {
+  const f = fixture(t);
+  const r = run('session-start.mjs', { cwd: f.tmp }, f.env, ['codex']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /This directory is not inside a Git repository, so it has no project notes\./);
+  assert.doesNotMatch(r.stdout, /Project index \(/);
+  assert.equal(existsSync(join(f.repo, 'projects')), false);
+});
+
+test('session-start codex in a repository without origin', (t) => {
+  const f = fixture(t, { origin: null });
+  const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['codex']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /has no shareable "origin" remote/);
+  assert.doesNotMatch(r.stdout, /Project index \(/);
+  assert.equal(existsSync(join(f.repo, 'projects')), false);
+});
+
+test('session-start codex with a name claimed by another repository', (t) => {
+  const f = fixture(t, { origin: 'https://example.com/b/example-repo' });
+  const marker = join(f.repo, 'projects', 'example-repo', '.project');
+  mkdirSync(join(f.repo, 'projects', 'example-repo'), { recursive: true });
+  writeFileSync(marker, 'example.com/a/example-repo\n');
+  const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['codex']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /^Shared memory is on\./);
+  assert.match(r.stdout, /shares its name with another project in shared memory \(example\.com\/a\/example-repo\)/);
+  assert.doesNotMatch(r.stdout, /Project index \(/);
+  assert.equal(readFileSync(marker, 'utf8'), 'example.com/a/example-repo\n');
+});
+
+test('session-start codex on a machine that is not enabled', (t) => {
+  const f = fixture(t, { enabled: false });
+  const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['codex']);
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, '');
+  assert.equal(existsSync(f.state), false);
+  assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+});
+
+test('session-start codex in a repository whose directory name is not a usable project name', (t) => {
+  const f = fixture(t);
+  const odd = join(f.tmp, 'odd name');
+  mkdirSync(odd);
+  sh(odd, 'git', ['init', '-q']);
+  sh(odd, 'git', ['remote', 'add', 'origin', 'https://example.com/owner/odd-name']);
+  const r = run('session-start.mjs', { cwd: odd }, f.env, ['codex']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /\nThis repository's directory name cannot be used as a project name, so it has no project notes\.\n/);
+  assert.doesNotMatch(r.stdout, /Project index \(/);
+  assert.equal(existsSync(join(f.repo, 'projects')), false);
+  assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+});
+
+for (const [label, input] of [['stdin that is not JSON', 'not json'], ['JSON without cwd', '{"session_id": "x"}']]) {
+  test(`session-start codex with ${label} uses the process directory and logs nothing`, (t) => {
+    const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+    const r = spawnSync(process.execPath, [join(PKG, 'session-start.mjs'), 'codex'], { input, env: f.env, cwd: f.worktree, encoding: 'utf8' });
+    assertToolText(r, f);
+    assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+  });
+}
+
+test('session-start codex writes exactly the text buildToolContext returns, within the budget', (t) => {
+  const f = fixture(t);
+  const r = run('session-start.mjs', { cwd: f.tmp }, f.env, ['codex']);
+  const config = loadConfig(f.env);
+  const expected = buildToolContext({ config, status: readStatus(config), project: null, repoOk: true, reason: 'not-a-repository' });
+  assert.equal(r.stdout, expected);
+  assert.ok(expected.endsWith('\n') && !expected.endsWith('\n\n'));
+  assert.ok(textCost(r.stdout) <= TOOL_BUDGET);
+});
+
+// stdin is a terminal: the driver must not wait for input. `script` gives the child a pseudo-terminal.
+const hasScript = spawnSync('script', ['--version'], { encoding: 'utf8' }).status === 0;
+// Its stdin stays open and silent, so a driver that read the terminal would wait until killed.
+function runOnTerminal(f, tool) {
+  const cmd = `"${process.execPath}" "${join(PKG, 'session-start.mjs')}" ${tool}`;
+  return new Promise((resolve) => {
+    const child = spawn('script', ['-qec', cmd, '/dev/null'], { env: f.env, cwd: f.worktree, stdio: ['pipe', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    child.on('close', (status, signal) => {
+      clearTimeout(timer);
+      resolve({ status, signal, stdout });
+    });
+  });
+}
+
+test('session-start codex does not read a terminal', { skip: !hasScript && 'script is not available' }, async (t) => {
+  const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+  const r = await runOnTerminal(f, 'codex');
+  assert.equal(r.signal, null);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /Shared memory is on\./);
+  assert.match(r.stdout, /Project index \(/);
+  assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+});
+
+test('session-start claude on a terminal logs the input error and prints nothing', { skip: !hasScript && 'script is not available' }, async (t) => {
+  const f = fixture(t);
+  const r = await runOnTerminal(f, 'claude');
+  assert.equal(r.signal, null);
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout.trim(), '');
+  const lines = errorLines(f.state);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /hook input is not valid JSON/);
+});
+
+// The host may write or close stdin after the driver has started.
+function runWithLateInput(f, args, input, { writeAt = 400, endAt = 400 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [join(PKG, 'session-start.mjs'), ...args], { env: f.env, cwd: f.tmp, stdio: ['pipe', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.on('close', (status) => resolve({ status, stdout }));
+    setTimeout(() => child.stdin.write(input), writeAt);
+    setTimeout(() => child.stdin.end(), Math.max(endAt, writeAt));
+  });
+}
+
+for (const [label, timing] of [['written late', { writeAt: 400, endAt: 400 }], ['written at once and closed late', { writeAt: 0, endAt: 400 }]]) {
+  test(`session-start claude reads input ${label}`, async (t) => {
+    const f = fixture(t);
+    const r = await runWithLateInput(f, [], JSON.stringify({ cwd: f.worktree }), timing);
+    assert.equal(r.status, 0);
+    assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /^Shared memory is on\./);
+    assert.equal(realpathSync(f.link), realpathSync(join(f.repo, 'projects', 'example-repo')));
+    assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+  });
+
+  test(`session-start codex uses the cwd of input ${label}`, async (t) => {
+    const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+    const r = await runWithLateInput(f, ['codex'], JSON.stringify({ cwd: f.worktree }), timing);
+    assertToolText(r, f);
+    assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+  });
+}
+
+test('session-start with an unknown tool', (t) => {
+  const f = fixture(t);
+  const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['vim']);
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, '');
+  const lines = errorLines(f.state);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /unknown tool/);
+});
+
+test('run.sh session-start passes the tool name to the driver', (t) => {
+  const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+  const r = run('run.sh', { cwd: f.worktree }, f.env, ['session-start', 'codex']);
+  assertToolText(r, f);
 });
 
 test('session-start reports a memory folder that could not be linked', (t) => {

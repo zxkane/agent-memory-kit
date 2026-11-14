@@ -93,6 +93,26 @@ for bad_settings in '{ not json' '[1, 2]' 'null'; do
     check "bad settings ($bad_settings) writes nothing" nothing_written
     check "bad settings ($bad_settings) left as it was" test "$(cat "$home/.claude/settings.json")" = "$bad_settings"
 done
+# The same for a Codex hooks.json that cannot be used, in a real run and in a dry run.
+for bad_codex in '{ nope' '[1]' '{"hooks": null}' '{"hooks": {"SessionStart": "x"}}'; do
+    for mode in real dry; do
+        fresh_home
+        mkdir "$home/.codex"
+        printf '%s\n' "$bad_codex" > "$home/.codex/hooks.json"
+        if [[ $mode == dry ]]; then run_setup --dry-run --init alpha --repo-url "$remote"; else run_setup --init alpha --repo-url "$remote"; fi
+        check "bad codex hooks ($mode, $bad_codex) exits 1" test "$status" -eq 1
+        check "bad codex hooks ($mode, $bad_codex) names the file" has_text "$out" "$home/.codex/hooks.json"
+        check "bad codex hooks ($mode, $bad_codex) writes nothing" nothing_written
+        check "bad codex hooks ($mode, $bad_codex) writes no node path" test ! -e "$kit/workstation/node.local.path"
+        check "bad codex hooks ($mode, $bad_codex) left as it was" test "$(cat "$home/.codex/hooks.json")" = "$bad_codex"
+    done
+done
+# A shape the hooks would not be added to does not matter when no hooks are registered.
+fresh_home
+mkdir "$home/.codex"
+printf '%s\n' '{"hooks": {"SessionStart": "x"}}' > "$home/.codex/hooks.json"
+run_setup --dry-run --no-hooks --init alpha --repo-url "$remote"
+check 'odd codex shape with --no-hooks passes the checks' test "$status" -eq 0
 git init -q --bare -b main "$tmp/no-main.git"
 for bad_url in "$tmp/missing.git" "$tmp/no-main.git"; do
     fresh_home
@@ -205,6 +225,63 @@ check 'no-hooks again exits 0' test "$status" -eq 0
 check 'no-hooks again removes the kit hooks' bash -c '! grep -q "# agent-memory-kit" "$1"' _ "$settings"
 check 'no-hooks again keeps other settings' grep -q '"model": *"kept"' "$settings"
 check 'no-hooks again keeps other hooks' grep -q '/srv/other.sh' "$settings"
+
+# Codex and Kiro: with ~/.codex and ~/.kiro present, a dry run says what it would register and
+# changes nothing; a real run writes the launcher and the Kiro hook file and prints the trust notice.
+fresh_home
+mkdir "$home/.codex" "$home/.kiro"
+run_setup --dry-run --init alpha --repo-url "$remote"
+check 'agents dry run exits 0' test "$status" -eq 0
+check 'agents dry run names the Codex hook' has_text "$out" "would register the Codex session-start hook ($home/.codex/hooks.json)"
+check 'agents dry run names the Kiro file' has_text "$out" "would write $home/.kiro/hooks/agent-memory-kit.json"
+check 'agents dry run changes nothing' test -z "$(ls -A "$home/.codex")$(ls -A "$home/.kiro")"
+check 'agents dry run writes no launcher' test ! -e "$home/.config"
+run_setup --init alpha --repo-url "$remote" --no-enable
+check 'agents run exits 0' test "$status" -eq 0
+check 'launcher is executable' test -x "$home/.config/agent-memory/run.sh"
+check 'launcher runs the kit' grep -qF "exec \"$kit/workstation/run.sh\" \"\$@\"" "$home/.config/agent-memory/run.sh"
+check 'kiro hook file exists' test -f "$home/.kiro/hooks/agent-memory-kit.json"
+check 'codex hooks file exists' test -f "$home/.codex/hooks.json"
+check 'codex trust notice is printed' has_text "$out" 'Codex: start a session and run /hooks to trust the new hook; Codex skips it until then.'
+run_setup --no-enable
+check 'agents rerun exits 0' test "$status" -eq 0
+check 'agents rerun prints no trust notice' bash -c '! grep -qF "run /hooks" <<< "$1"' _ "$out"
+codex_stamp="$(stat -c %Y.%y "$home/.codex/hooks.json")$(stat -c %y "$home/.kiro/hooks/agent-memory-kit.json")"
+run_setup --dry-run
+check 'agents rerun dry run exits 0' test "$status" -eq 0
+check 'agents rerun dry run does not say it would register Codex' bash -c '! grep -q "would register the Codex" <<< "$1"' _ "$out"
+check 'agents rerun dry run does not say it would write Kiro' bash -c '! grep -q "would write .*agent-memory-kit.json" <<< "$1"' _ "$out"
+check 'agents rerun leaves both hook files alone' test "$codex_stamp" = "$(stat -c %Y.%y "$home/.codex/hooks.json")$(stat -c %y "$home/.kiro/hooks/agent-memory-kit.json")"
+run_setup --dry-run --no-hooks
+check 'agents no-hooks dry run exits 0' test "$status" -eq 0
+check 'agents no-hooks dry run names the Codex removal' has_text "$out" "would remove the Codex session-start hook from $home/.codex/hooks.json"
+check 'agents no-hooks dry run names the Kiro removal' has_text "$out" "would remove $home/.kiro/hooks/agent-memory-kit.json"
+check 'agents no-hooks dry run changes nothing' test -e "$home/.kiro/hooks/agent-memory-kit.json"
+run_setup --no-hooks --no-enable
+check 'agents no-hooks exits 0' test "$status" -eq 0
+check 'agents no-hooks removes the kiro file' test ! -e "$home/.kiro/hooks/agent-memory-kit.json"
+check 'agents no-hooks keeps the launcher' test -x "$home/.config/agent-memory/run.sh"
+check 'agents no-hooks removes the codex entry' bash -c '! grep -q "# agent-memory-kit" "$1"' _ "$home/.codex/hooks.json"
+run_setup --dry-run --no-hooks
+check 'agents no-hooks dry run says nothing once the entries are gone' bash -c '! grep -q "would remove\|would leave" <<< "$1"' _ "$out"
+
+# Linked folders: a dry run says they would be left unchanged, a real run writes nothing in them
+# and prints what to add by hand.
+fresh_home
+mkdir -p "$tmp/dotfiles/codex" "$tmp/dotfiles/kiro-hooks" "$home/.kiro"
+ln -s "$tmp/dotfiles/codex" "$home/.codex"
+ln -s "$tmp/dotfiles/kiro-hooks" "$home/.kiro/hooks"
+run_setup --dry-run --init alpha --repo-url "$remote"
+check 'linked dry run exits 0' test "$status" -eq 0
+check 'linked dry run leaves the Codex file' has_text "$out" "would leave $home/.codex/hooks.json unchanged"
+check 'linked dry run does not register Codex' bash -c '! grep -q "would register the Codex" <<< "$1"' _ "$out"
+check 'linked dry run leaves the Kiro folder' has_text "$out" "would leave $home/.kiro/hooks unchanged"
+check 'linked dry run does not write the Kiro file' bash -c '! grep -q "would write .*agent-memory-kit.json" <<< "$1"' _ "$out"
+run_setup --init alpha --repo-url "$remote" --no-enable
+check 'linked run exits 0' test "$status" -eq 0
+check 'linked run writes nothing into the linked folders' test -z "$(ls -A "$tmp/dotfiles/codex")$(ls -A "$tmp/dotfiles/kiro-hooks")"
+check 'linked run prints the Codex entry to add' has_text "$out" 'Add this hook to it:'
+check 'linked run prints the Kiro document to save' has_text "$out" 'regular file named agent-memory-kit.json'
 
 # Node.js 24 or later is accepted, an older one is not.
 real_node="$(command -v node)"
