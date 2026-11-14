@@ -30,6 +30,8 @@ const EXTRACT_LOOKBACK_MS = 7 * DAY_MS;
 const REPORT_KEEP_DAYS = 90;
 const REVISIT_MS = 28 * DAY_MS;
 const KEEP_MARKER = '.keep';
+// Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
+const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
 const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]';
 const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
@@ -476,6 +478,15 @@ function stepApply(config, rest) {
 
 function stepMain(args) {
   const [name, ...rest] = args;
+  // Once Node runs the apply step, it finishes and reports, even after Ctrl-C (which reaches the
+  // whole process group), SIGTERM or SIGHUP: killed part-way, it could have written or committed
+  // changes that the driver would then not know of. The handlers come first, before anything
+  // else runs (the imported modules only define functions and constants, and nothing before this
+  // line reads or writes the clone), so an apply step that dies from one of these signals has
+  // done nothing. It is bounded by the Git network time limits; the lock wait in run.sh comes
+  // before Node starts. A Git command killed by the same signal is a failed sync, reported as
+  // such. scan and snapshot change nothing and may die.
+  if (name === 'apply') for (const signal of INTERRUPT_SIGNALS) process.on(signal, () => {});
   const config = loadConfig();
   if (!config || !config.consolidate) {
     out({ outcome: 'error', error: 'consolidation is not configured' });
@@ -484,15 +495,8 @@ function stepMain(args) {
   try {
     if (name === 'scan' && rest.length === 0) stepScan(config);
     else if (name === 'snapshot') stepSnapshot(config, rest);
-    else if (name === 'apply') {
-      // Once started, the apply step finishes and reports, even after Ctrl-C (which reaches the
-      // whole process group), SIGTERM or SIGHUP: killed part-way, it could have written or
-      // committed changes that the driver would then not know of. It is bounded by the lock wait
-      // and the Git network time limits. A Git command killed by the same signal is a failed sync,
-      // reported as such. scan and snapshot change nothing and may die.
-      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => {});
-      stepApply(config, rest);
-    } else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ...');
+    else if (name === 'apply') stepApply(config, rest);
+    else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ...');
     return 0;
   } catch (err) {
     process.stderr.write(`agent-memory consolidate-step ${String(name).slice(0, 20)}: ${firstLine(err)}\n`);
@@ -533,20 +537,25 @@ function parseDriverArgs(argv) {
   return opts;
 }
 
-// Runs a locked step and returns its JSON line (which may be `{ outcome: 'error', error }`), or
-// null when the step could not run at all (no lock, no Node, a crash before its line).
+// Runs a locked step. `result` is its JSON line (which may be `{ outcome: 'error', error }`), or
+// null when it printed none; `status` and `signal` say how the step ended, so that a lock-wait
+// timeout (LOCK_TIMEOUT_CODE from run.sh) and a death by signal can be told from a crash.
 function runStep(args) {
   const r = spawnSync(RUN_SH, ['consolidate-step', ...args], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], maxBuffer: 64 * 1024 * 1024,
   });
-  if (r.error || typeof r.stdout !== 'string') return null;
+  const ended = { status: r.status, signal: r.signal };
+  if (r.error || typeof r.stdout !== 'string') return { result: null, ...ended };
   try {
     const value = JSON.parse(r.stdout.trim().split('\n').at(-1));
-    return value && typeof value === 'object' && !Array.isArray(value) && typeof value.outcome === 'string' ? value : null;
+    const ok = value && typeof value === 'object' && !Array.isArray(value) && typeof value.outcome === 'string';
+    return { result: ok ? value : null, ...ended };
   } catch {
-    return null;
+    return { result: null, ...ended };
   }
 }
+
+const lockTimedOut = (step) => step.result === null && step.status === LOCK_TIMEOUT_CODE;
 
 const stateFile = (config) => join(config.stateDir, 'consolidate.json');
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -715,6 +724,7 @@ function modelTimeoutMs(c) {
 
 // SIGINT, SIGTERM or SIGHUP: stop the model, apply nothing more, clean up, exit 128 + n.
 const SIGNAL_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+const INTERRUPT_SIGNALS = Object.keys(SIGNAL_CODES);
 const abort = new AbortController();
 let interrupted = null;
 
@@ -739,9 +749,10 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
   mkdirSync(work, { mode: 0o700 });
   chmodSync(work, 0o700);
   try {
-    const snap = runStep(['snapshot', '--work', work, '--kind', opts.kind, '--scope', scope]);
+    const snapStep = runStep(['snapshot', '--work', work, '--kind', opts.kind, '--scope', scope]);
+    const snap = snapStep.result;
     if (await signalsHandled()) return { outcome: 'aborted', work };
-    if (!snap) return { outcome: 'step-failed', step: 'snapshot', work };
+    if (!snap) return { outcome: 'step-failed', step: 'snapshot', lockTimeout: lockTimedOut(snapStep), work };
     if (snap.outcome !== 'snapshot') return { ...snap, step: 'snapshot', work };
     const planBuf = readFileSync(join(work, 'plan.json'));
     const hasGlobal = JSON.parse(planBuf.toString('utf8')).pairs.some((p) => p.label === GLOBAL);
@@ -776,12 +787,25 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
       '--model', model, '--min-retention', opts.minRetention === undefined ? 'default' : String(opts.minRetention),
     ];
     if (opts.dryRun) args.push('--dry-run');
-    const res = runStep(args);
+    const applyStep = runStep(args);
+    const res = applyStep.result;
     // An apply step that finished stands, signal or not: its line says what happened to the notes
-    // and the run stops afterwards. One that ended without its line (killed outright, or crashed)
-    // may have applied and committed changes: never reported as "nothing applied".
+    // and the run stops afterwards. One that ended without its line ended in one of three ways:
+    // - the wait for the sync lock timed out (run.sh exit LOCK_TIMEOUT_CODE): nothing was done;
+    // - SIGINT, SIGTERM or SIGHUP killed it: that is only possible before its handlers existed,
+    //   so before it did anything. The run stops as interrupted by that signal, even when only
+    //   the step received it;
+    // - anything else (SIGKILL, a crash): it may have applied and committed changes, so it is
+    //   never reported as "nothing applied".
     await signalsHandled();
-    if (!res) return { outcome: 'apply-interrupted', step: 'apply', model: modelInfo, work };
+    if (!res) {
+      if (lockTimedOut(applyStep)) return { outcome: 'step-failed', step: 'apply', lockTimeout: true, model: modelInfo, work };
+      if (INTERRUPT_SIGNALS.includes(applyStep.signal)) {
+        onSignal(applyStep.signal);
+        return { outcome: 'aborted', model: modelInfo, work };
+      }
+      return { outcome: 'apply-interrupted', step: 'apply', model: modelInfo, work };
+    }
     // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
     // `no-change` always means the model completed and found nothing.
     if (res.outcome === 'no-change' && stopReason !== 'completed') {
@@ -870,7 +894,9 @@ function printScope(kind, scope, res, opts, repoDir) {
     lines.push(`  - the sync ${when} failed: ${res.sync?.error ?? 'unknown error'}`);
   }
   if (res.outcome === 'error') lines.push(`  - the ${res.step} step failed: ${res.error ?? 'unknown error'}`);
-  if (res.outcome === 'step-failed') lines.push(`  - the ${res.step} step could not run`);
+  if (res.outcome === 'step-failed') {
+    lines.push(`  - the ${res.step} step could not run${res.lockTimeout ? ': the wait for the sync lock timed out' : ''}`);
+  }
   if (res.reason) lines.push(`  - ${res.reason}`);
   if (res.outcome === 'changed-meanwhile') {
     for (const name of res.liveChanged ?? []) lines.push(`  - changed meanwhile: ${name}`);
@@ -904,13 +930,15 @@ async function driverMain(argv) {
   const started = new Date();
   const now = started.getTime();
   removeStaleRuns(config, now);
-  const scan = runStep(['scan']);
+  const scanStep = runStep(['scan']);
+  const scan = scanStep.result;
   if (await signalsHandled()) {
     process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
   if (!scan || scan.outcome !== 'scan') {
-    const why = scan?.outcome === 'error' ? scan.error : 'the scan of the notes could not run';
+    let why = scan?.outcome === 'error' ? scan.error : 'the scan of the notes could not run';
+    if (lockTimedOut(scanStep)) why += ': the wait for the sync lock timed out';
     process.stderr.write(`agent-memory consolidate: ${why}\n`);
     return 1;
   }

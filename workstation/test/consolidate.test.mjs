@@ -23,8 +23,8 @@ const DAY_MS = 24 * 3600 * 1000;
 // A stand-in for the model client. It logs how it was called (and the digest it was given), then
 // edits files in its working directory as the test's instruction file says for its scope.
 const FAKE = `#!${process.execPath}
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { basename, dirname, join } from 'node:path';
 const cwd = process.cwd();
 const scope = basename(cwd) === 'notes' ? basename(dirname(cwd)) : basename(cwd);
@@ -46,6 +46,15 @@ for (const [rel, target] of Object.entries(ins.links ?? {})) {
   symlinkSync(target, join(cwd, rel));
 }
 for (const [path, mode] of Object.entries(ins.chmod ?? {})) chmodSync(path.startsWith('/') ? path : join(cwd, path), mode);
+if (ins.holdLock) {
+  // Takes the lock in a process of its own (it outlives this one), so that the apply step waits.
+  const { lock, marker, seconds } = ins.holdLock;
+  const holder = spawn('flock', [lock, 'sh', '-c', 'touch "$0"; sleep "$1"', marker, String(seconds)], { detached: true, stdio: 'ignore' });
+  writeFileSync(marker + '.pid', String(holder.pid));
+  holder.unref();
+  for (let i = 0; i < 250 && !existsSync(marker); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+  if (!existsSync(marker)) process.exit(3);
+}
 if (ins.sleepMs) await new Promise((resolve) => setTimeout(resolve, ins.sleepMs));
 if (ins.silent) process.exit(1);
 const result = { type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.25, num_turns: 4, result: process.env.FAKE_SUMMARY, ...ins.result };
@@ -1194,6 +1203,89 @@ test('a terminal signal during the sync after applying: the apply stands and its
     const p = f.readState().projects.p;
     assert.equal(p.lastOutcome.outcome, 'applied', signal);
     assert.equal(p.organizedDigest, folderDigest(join(f.repo, 'projects/p')), signal);
+  }
+});
+
+// Makes the fake model take the sync lock for `seconds` just before it ends, so that the apply
+// step has to wait for it. Returns `release()`, which ends the holder; call it once the run is
+// over. It also runs after the test, but by then the temporary folder (and the pid file in it)
+// may be gone, so the pid is read as soon as it can be.
+function holdLockAfterModel(t, f, instruction, seconds) {
+  const marker = join(f.tmp, 'lock-held');
+  instruction.holdLock = { lock: join(f.home, '.local/state/agent-memory/sync.lock'), marker, seconds };
+  let pid = null;
+  const release = () => {
+    try { pid ??= Number(readFileSync(`${marker}.pid`, 'utf8')); } catch { /* not started */ }
+    if (pid) {
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+    }
+  };
+  t.after(release);
+  return release;
+}
+
+test('an apply step that times out waiting for the lock is step-failed and applies nothing', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  const instruction = mergeInstruction();
+  const release = holdLockAfterModel(t, f, instruction.p, 30);
+  f.instruct(instruction);
+  f.env.AGENT_MEMORY_LOCK_WAIT_SECONDS = '1';
+  const head = f.head();
+  const r = f.run('organize');
+  release();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: step-failed, 0 change\(s\), USD 0\.25, stopped: completed$/m);
+  assert.match(r.stdout, /^ {2}- the apply step could not run: the wait for the sync lock timed out$/m);
+  assert.doesNotMatch(r.stdout, /may have been applied|applied/);
+  assert.equal(f.head(), head);
+  assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
+  const p = f.readState().projects.p;
+  assert.equal(p.lastOutcome.outcome, 'step-failed');
+  assert.equal(p.organizedDigest, undefined);
+  assert.equal(p.lastOrganize, undefined);
+});
+
+test('a scan that times out waiting for the lock says so', async (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  const lock = join(f.home, '.local/state/agent-memory/sync.lock');
+  mkdirSync(dirname(lock), { recursive: true });
+  const holder = spawn('flock', [lock, '-c', 'echo held; sleep 30'], { stdio: ['ignore', 'pipe', 'ignore'], detached: true });
+  t.after(() => { try { process.kill(-holder.pid, 'SIGKILL'); } catch { /* gone */ } });
+  await new Promise((resolve) => holder.stdout.once('data', resolve));
+  f.env.AGENT_MEMORY_LOCK_WAIT_SECONDS = '1';
+  const r = f.run('organize');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /the scan of the notes could not run: the wait for the sync lock timed out/);
+  assert.deepEqual(f.calls(), []);
+});
+
+test('a signal while the apply step waits for the lock: aborted, nothing applied', async (t) => {
+  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+    const f = fixture(t);
+    duplicateProject(f);
+    const instruction = mergeInstruction();
+    const release = holdLockAfterModel(t, f, instruction.p, 30);
+    f.instruct(instruction);
+    const head = f.head();
+    const child = spawn(RUN_SH, ['consolidate', 'organize'], { env: f.env, stdio: ['ignore', 'pipe', 'ignore'], detached: true });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    const exited = new Promise((resolve) => child.once('close', (code2, sig) => resolve({ code: code2, signal: sig })));
+    t.after(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } });
+    // The apply step is waiting once its run.sh is running with the work folder of this run.
+    const waiting = () => spawnSync('pgrep', ['-f', `consolidate-step apply --work ${f.state}`]).status === 0;
+    assert.ok(await waitFor(waiting), 'the apply step is waiting for the lock');
+    process.kill(-child.pid, signal);
+    const status = await exited;
+    release();
+    assert.deepEqual(status, { code, signal: null }, signal);
+    assert.match(stdout, /^organize p: aborted, nothing applied, USD 0\.25, stopped: completed$/m, signal);
+    assert.doesNotMatch(stdout, /may have been applied/, signal);
+    assert.equal(f.head(), head, signal);
+    assert.ok(existsSync(join(f.repo, 'projects/p/b.md')), signal);
+    assert.equal(f.readState().projects.p.lastOutcome.outcome, 'aborted', signal);
   }
 });
 

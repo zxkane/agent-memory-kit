@@ -74,11 +74,12 @@ case "$mode" in
         ;;
     consolidate-step)
         # A step of a consolidation that reads or writes the clone; a running sync is waited for.
+        # Exit 75 (EX_TEMPFAIL) tells the driver that the wait timed out and the step did nothing.
         require_node
         take_sync_lock
         if ! flock -w "${AGENT_MEMORY_LOCK_WAIT_SECONDS:-300}" 9; then
             printf '%s\n' 'agent-memory: a sync is running; try again.' >&2
-            exit 1
+            exit 75
         fi
         exec "$node_path" "$root/consolidate.mjs" --step "${@:2}"
         ;;
