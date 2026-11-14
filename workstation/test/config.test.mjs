@@ -205,7 +205,7 @@ test('item 4: a key the consolidate block does not know makes it invalid, naming
 
 const BRIDGE_OK = {
   bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: true,
-  agentsRepoDir: '/home/u/agent-memory-mirror', agentsRepoUrl: 'https://example.com/agents.git', roleArn: null,
+  agentsRepoDir: '/home/u/agent-memory-mirror', agentsRepoUrl: 'https://example.com/agents.git', roleArn: null, credentials: 'instance',
 };
 
 test('bridge is null, with no problem, when the block is absent or null', (t) => {
@@ -223,11 +223,11 @@ test('bridge: a valid block with every field, and the defaults', (t) => {
   assert.equal(loadConfig(env).bridgeProblem, null);
   write({ ...BASE, bridge: { up: true, bucket: 'example-bucket', region: 'ap-northeast-1' } });
   assert.deepEqual(loadConfig(env).bridge, {
-    bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: false, agentsRepoDir: null, agentsRepoUrl: null, roleArn: null,
+    bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: false, agentsRepoDir: null, agentsRepoUrl: null, roleArn: null, credentials: 'instance',
   });
   write({ ...BASE, bridge: { agentsRepoDir: '/srv/agents' } });
   assert.deepEqual(loadConfig(env).bridge, {
-    bucket: null, region: null, up: false, down: false, agentsRepoDir: '/srv/agents', agentsRepoUrl: null, roleArn: null,
+    bucket: null, region: null, up: false, down: false, agentsRepoDir: '/srv/agents', agentsRepoUrl: null, roleArn: null, credentials: 'instance',
   });
   write({ ...BASE, bridge: { up: false } });
   assert.equal(loadConfig(env).bridge.up, false);
@@ -295,7 +295,7 @@ test('bridge: an agentsRepoDir with .. segments that resolves outside repoDir is
 
 // ---- canary block ----
 
-const CANARY_OK = { stage: 'prod', region: 'ap-northeast-1', schedule: '*-*-* *:00:00', roleArn: null };
+const CANARY_OK = { stage: 'prod', region: 'ap-northeast-1', schedule: '*-*-* *:00:00', roleArn: null, credentials: 'instance' };
 
 test('canary is null, with no problem, when the block is absent or null', (t) => {
   const { env, write } = setup(t);
@@ -311,7 +311,7 @@ test('canary: a valid block, with and without a schedule', (t) => {
   assert.deepEqual(loadConfig(env).canary, CANARY_OK);
   assert.equal(loadConfig(env).canaryProblem, null);
   write({ ...BASE, canary: { stage: 'dev-2', region: 'us-east-1' } });
-  assert.deepEqual(loadConfig(env).canary, { stage: 'dev-2', region: 'us-east-1', schedule: null, roleArn: null });
+  assert.deepEqual(loadConfig(env).canary, { stage: 'dev-2', region: 'us-east-1', schedule: null, roleArn: null, credentials: 'instance' });
   write({ ...BASE, canary: { stage: 'a'.repeat(32), region: 'eu-central-1', schedule: null } });
   assert.equal(loadConfig(env).canary.schedule, null);
 });
@@ -447,4 +447,40 @@ test('roleArn: a pull-only bridge block may carry one', (t) => {
   const { env, write } = setup(t);
   write({ ...BASE, bridge: { agentsRepoDir: '/srv/agents', roleArn: ROLE_OK } });
   assert.equal(loadConfig(env).bridge.roleArn, ROLE_OK);
+});
+
+// ---- credentials source ----
+
+test('bridge and canary: credentials is "instance" or "environment", "instance" by default', (t) => {
+  const { env, write } = setup(t);
+  const bridge = { up: true, bucket: 'example-bucket', region: 'ap-northeast-1' };
+  const canary = { stage: 'prod', region: 'ap-northeast-1' };
+  write({ ...BASE, bridge, canary });
+  assert.deepEqual([loadConfig(env).bridge.credentials, loadConfig(env).canary.credentials], ['instance', 'instance']);
+  write({ ...BASE, bridge: { ...bridge, credentials: 'environment' }, canary: { ...canary, credentials: 'environment' } });
+  let cfg = loadConfig(env);
+  assert.deepEqual([cfg.bridge.credentials, cfg.canary.credentials, cfg.bridgeProblem, cfg.canaryProblem], ['environment', 'environment', null, null]);
+  write({ ...BASE, bridge: { ...bridge, credentials: 'instance' }, canary: { ...canary, credentials: 'instance' } });
+  cfg = loadConfig(env);
+  assert.deepEqual([cfg.bridge.credentials, cfg.canary.credentials], ['instance', 'instance']);
+  // A pull-only block takes the field too.
+  write({ ...BASE, bridge: { agentsRepoDir: '/srv/agents', credentials: 'environment' } });
+  assert.equal(loadConfig(env).bridge.credentials, 'environment');
+});
+
+test('bridge and canary: any other credentials value makes the block invalid and names the field', (t) => {
+  const { env, write } = setup(t);
+  const bridge = { up: true, bucket: 'example-bucket', region: 'ap-northeast-1' };
+  const canary = { stage: 'prod', region: 'ap-northeast-1' };
+  for (const value of ['Environment', 'env', 'imds', '', null, true, 5, ['environment'], {}]) {
+    write({ ...BASE, bridge: { ...bridge, credentials: value } });
+    assert.deepEqual([loadConfig(env).bridge, loadConfig(env).bridgeProblem], [null, 'credentials'], JSON.stringify(value));
+    write({ ...BASE, canary: { ...canary, credentials: value } });
+    assert.deepEqual([loadConfig(env).canary, loadConfig(env).canaryProblem], [null, 'credentials'], JSON.stringify(value));
+  }
+  // An unknown key is still invalid next to a valid credentials field.
+  write({ ...BASE, bridge: { ...bridge, credentials: 'environment', upp: true } });
+  assert.equal(loadConfig(env).bridgeProblem, 'upp');
+  write({ ...BASE, canary: { ...canary, credentials: 'environment', scheduel: 'hourly' } });
+  assert.equal(loadConfig(env).canaryProblem, 'scheduel');
 });

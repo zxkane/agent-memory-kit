@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launcher: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate | consolidate-step | canary
+# Launcher: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate | consolidate-step | canary | bridge
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mode="${1:-}"
@@ -93,8 +93,20 @@ case "$mode" in
         require_node
         exec "$node_path" "$root/canary.mjs"
         ;;
+    bridge)
+        # One bridge run without a sync (GitHub Actions). It reads the notes clone and never writes
+        # it, but a sync must not run at the same moment. Exit 75 (EX_TEMPFAIL): the lock is held and
+        # nothing was done.
+        require_node
+        take_sync_lock
+        if ! flock -n 9; then
+            printf '%s\n' 'agent-memory: a sync is running; try again.' >&2
+            exit 75
+        fi
+        exec "$node_path" "$root/bridge-run.mjs" "${@:2}"
+        ;;
     *)
-        printf '%s\n' 'usage: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate extract|organize [options] | canary' >&2
+        printf '%s\n' 'usage: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate extract|organize [options] | canary | bridge [--time-limit <seconds>]' >&2
         exit 2
         ;;
 esac

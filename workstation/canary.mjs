@@ -9,7 +9,7 @@ import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSyn
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ChecksStoppedError, formatResult, makeMintToken, runChecks } from '../api/scripts/verify-deployed.ts';
-import { AwsError, assumeRole, imdsCredentials, ssmGetParameter } from './lib/aws.mjs';
+import { AwsError, assumeRole, environmentCredentials, imdsCredentials, ssmGetParameter } from './lib/aws.mjs';
 import { FIELD_RE, realIsoTime } from './lib/bridge-text.mjs';
 import { CANARY_AWS_ERROR_RE, canaryReason } from './lib/canary-text.mjs';
 import { loadConfig } from './lib/config.mjs';
@@ -58,10 +58,10 @@ function writeRecord(stateDir, record) {
 }
 
 // One run. `config` is a loaded config with a valid `canary` block. deps (tests): credentials (a
-// function or the credentials), assumeRole, fetchImpl, runChecks, makeMintToken, stdout (a function taking text).
+// function or the credentials), environmentCredentials, assumeRole, fetchImpl, runChecks, makeMintToken, stdout (a function taking text).
 // One deadline of `limitMs` covers everything, parameter requests included.
 export async function runCanary({ config, deps = {}, now = new Date(), limitMs = DEFAULT_LIMIT_MS }) {
-  const { stage, region, roleArn } = config.canary;
+  const { stage, region, roleArn, credentials: source } = config.canary;
   const stateFile = join(config.stateDir, 'canary.json');
   const out = deps.stdout ?? ((text) => process.stdout.write(text));
 
@@ -92,10 +92,14 @@ export async function runCanary({ config, deps = {}, now = new Date(), limitMs =
   let error = null;
   try {
     const work = (async () => {
-      const instance = typeof deps.credentials === 'function'
-        ? await deps.credentials()
-        : (deps.credentials ?? await imdsCredentials({ fetchImpl }));
-      // With a dedicated role the instance credentials only sign the exchange; Parameter Store gets the role's.
+      // One source, chosen by the block: the environment of a GitHub Actions job or the metadata
+      // service. Neither is a fallback for the other.
+      const instance = source === 'environment'
+        ? (deps.environmentCredentials ?? environmentCredentials)()
+        : typeof deps.credentials === 'function'
+          ? await deps.credentials()
+          : (deps.credentials ?? await imdsCredentials({ fetchImpl }));
+      // With a dedicated role these credentials only sign the exchange; Parameter Store gets the role's.
       const credentials = roleArn
         ? await (deps.assumeRole ?? assumeRole)({
           roleArn, sessionName: 'agent-memory-canary', region, credentials: instance, fetchImpl,

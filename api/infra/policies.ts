@@ -17,6 +17,11 @@ export type PolicyDocument = {
 // Every path segment and the role name must be non-empty.
 const ROLE_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:role\/([\w+=,.@-]+\/)*[\w+=,.@-]+$/;
 
+/** Whether the value is the ARN of one IAM role (no wildcard, no account root, no other kind of principal). */
+export function isRoleArn(value: string): boolean {
+  return ROLE_ARN_RE.test(value);
+}
+
 /**
  * The function's whole permission set. No delete and no list: without s3:ListBucket S3 answers a
  * get of a missing key with 403, which s3Store.get reads as missing (see store.ts).
@@ -140,24 +145,60 @@ export function canaryRolePolicy(parameterArns: string[]): PolicyDocument {
   };
 }
 
-/** The trust policy of a workstation role: only the given IAM roles may assume it. */
-export function workstationTrustPolicy(roleArns: string[]) {
-  if (roleArns.length === 0) {
-    throw new Error('Give at least one workstation role ARN.');
+const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:ref:refs\/heads\/[A-Za-z0-9._\/-]+$/;
+/** True for a GitHub Actions subject of exactly one branch of one repository. */
+export function isGithubSubject(value: string): boolean {
+  return SUBJECT_RE.test(value);
+}
+
+const GITHUB_PROVIDER_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/;
+const GITHUB_OIDC = 'token.actions.githubusercontent.com';
+
+/**
+ * The trust policy of a workstation role: the given IAM roles, and the GitHub Actions jobs whose
+ * subject is named exactly (one branch of one repository; an environment subject would not be
+ * bound to a branch), through the account's existing GitHub OIDC provider. Each kind that is
+ * non-empty gets one statement.
+ */
+export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: string[]; githubProviderArn?: string }) {
+  const { roleArns, githubSubjects, githubProviderArn } = input;
+  if (roleArns.length === 0 && githubSubjects.length === 0) {
+    throw new Error('Give at least one workstation role ARN or GitHub subject.');
   }
   for (const arn of roleArns) {
-    if (!ROLE_ARN_RE.test(arn)) {
+    if (!isRoleArn(arn)) {
       throw new Error('Each workstation role ARN must be an IAM role ARN.');
     }
   }
-  return {
-    Version: '2012-10-17' as const,
-    Statement: [
-      {
-        Effect: 'Allow' as const,
-        Principal: { AWS: roleArns },
-        Action: 'sts:AssumeRole',
+  for (const subject of githubSubjects) {
+    if (!isGithubSubject(subject)) {
+      throw new Error('Each GitHub subject must be repo:<owner>/<repository>:ref:refs/heads/<branch>.');
+    }
+  }
+  if (githubSubjects.length > 0 && (githubProviderArn === undefined || !GITHUB_PROVIDER_ARN_RE.test(githubProviderArn))) {
+    throw new Error('GitHub subjects need the ARN of the account\'s GitHub OIDC provider.');
+  }
+  const statements: Array<Record<string, unknown>> = [];
+  if (roleArns.length > 0) {
+    statements.push({ Effect: 'Allow', Principal: { AWS: roleArns }, Action: 'sts:AssumeRole' });
+  }
+  if (githubSubjects.length > 0) {
+    statements.push({
+      Effect: 'Allow',
+      Principal: { Federated: githubProviderArn },
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringEquals: {
+          [`${GITHUB_OIDC}:aud`]: 'sts.amazonaws.com',
+          [`${GITHUB_OIDC}:sub`]: githubSubjects,
+        },
       },
-    ],
-  };
+    });
+  }
+  return { Version: '2012-10-17' as const, Statement: statements };
+}
+
+/** The trust policy of a workstation role for IAM roles only. */
+export function workstationTrustPolicy(roleArns: string[]) {
+  return jobsTrustPolicy({ roleArns, githubSubjects: [] });
 }

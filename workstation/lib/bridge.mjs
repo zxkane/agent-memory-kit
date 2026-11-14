@@ -4,7 +4,7 @@
 // the bucket, a remote or a note. A failing step never makes the sync fail; the caller decides the
 // exit code from the sync.
 
-import { AwsError, assumeRole, imdsCredentials } from './aws.mjs';
+import { AwsError, assumeRole, environmentCredentials, imdsCredentials } from './aws.mjs';
 import { BridgeDownError, runBridgeDown } from './bridge-down.mjs';
 import {
   ALL_STATUS_WORDS, AWS_ERROR_RE, BRIDGE_DOWN_REASONS, DOWN_FAILED_STATUSES, DOWN_OK_STATUSES, OWN_ERROR_TEXTS,
@@ -17,7 +17,8 @@ const MAX_ERROR_CHARS = 200;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 
 // The unit gives a run 120 s (TimeoutStartSec). One deadline covers the bridge (the sync has its own limits): 110 s
-// after the process started, and at most 75 s after the bridge began. Everything that can block for
+// after the process started, and at most 75 s after the bridge began when it runs after a sync
+// (`run.sh bridge` passes its own, longer limit and has no process deadline). Everything that can block for
 // long is cut at it: S3 requests (the client's signal is aborted then) and the Git network commands
 // of both steps (each gets min(its own limit, time left) and is not started with less than 2 s left).
 // What can still run after the deadline is local work (Git on a local clone, writing status.json),
@@ -89,8 +90,8 @@ export function configuredSteps(bridge) {
 // `{ up, down }`: a step record, or null when the step is not configured. Null when there is no
 // bridge block or the sync failed (nothing is attempted after a failed sync).
 // `processStart`: epoch milliseconds when the run began (the deadline is 110 s after it); `limitMs`:
-// the most the bridge itself may take; `clock`: the time source (tests).
-// deps (tests): credentials, assumeRole, fetchImpl, createS3, runBridgeUp, runBridgeDown.
+// the most the bridge itself may take (the default is 75 s; a caller may give more, as `run.sh bridge` does); `clock`: the time source (tests).
+// deps (tests): credentials (the metadata source), environmentCredentials, assumeRole, fetchImpl, createS3, runBridgeUp, runBridgeDown.
 export async function runBridge({
   config, syncResult, deps = {}, now = new Date(), limitMs = BRIDGE_MAX_MS, processStart, clock = Date.now,
 }) {
@@ -130,8 +131,12 @@ export async function runBridge({
     if (want.needsS3 && !late()) {
       try {
         s3 = await within(async () => {
-          const instance = await (deps.credentials ?? (() => imdsCredentials({ fetchImpl: deps.fetchImpl })))();
-          // With a dedicated role the instance credentials only sign the exchange; S3 gets the role's.
+          // One source, chosen by the block: the environment of a GitHub Actions job or the metadata
+          // service. Neither is a fallback for the other.
+          const instance = bridge.credentials === 'environment'
+            ? (deps.environmentCredentials ?? environmentCredentials)()
+            : await (deps.credentials ?? (() => imdsCredentials({ fetchImpl: deps.fetchImpl })))();
+          // With a dedicated role these credentials only sign the exchange; S3 gets the role's.
           const credentials = bridge.roleArn
             ? await (deps.assumeRole ?? assumeRole)({
               roleArn: bridge.roleArn, sessionName: 'agent-memory-bridge', region: bridge.region, credentials: instance,

@@ -19,37 +19,24 @@ new aws.s3.BucketServerSideEncryptionConfiguration("MemoryBucketEncryption", {
   rules: [{ applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" } }],
 });
 
-const versioning = new aws.s3.BucketVersioning("MemoryBucketVersioning", {
+// Not versioned. The notes under mem/ are a copy of the notes repository and can be uploaded again.
+// The agents' notes are copied into a second repository only when the bridge's down step runs, and
+// only what a run has copied, so a replaced agent note may have no other copy. A bucket that an
+// earlier release versioned keeps its versioning in the suspended state (S3 cannot turn it off
+// again); this rule then removes the old versions after one day, and the delete markers they left.
+new aws.s3.BucketLifecycleConfiguration("MemoryBucketLifecycle", {
   bucket: bucket.bucket,
-  versioningConfiguration: { status: "Enabled" },
+  rules: [
+    {
+      id: "expire-abandoned-uploads-and-old-versions",
+      status: "Enabled",
+      filter: {},
+      abortIncompleteMultipartUpload: { daysAfterInitiation: 7 },
+      noncurrentVersionExpiration: { noncurrentDays: 1 },
+      expiration: { expiredObjectDeleteMarker: true },
+    },
+  ],
 });
-
-new aws.s3.BucketLifecycleConfiguration(
-  "MemoryBucketLifecycle",
-  {
-    bucket: bucket.bucket,
-    rules: [
-      {
-        id: "expire-old-versions-and-abandoned-uploads",
-        status: "Enabled",
-        filter: {},
-        noncurrentVersionExpiration: { noncurrentDays: 90 },
-        abortIncompleteMultipartUpload: { daysAfterInitiation: 7 },
-      },
-      // The two snapshots are rewritten on every write and can be megabytes each, so their old
-      // versions go after one day. A noncurrent version expires as soon as any rule that matches
-      // it is due, so this shorter rule wins for index/ and the 90-day rule covers the rest. The 20 most recent
-      // noncurrent versions are kept whatever their age, so a corrupted snapshot can be repaired by hand.
-      {
-        id: "expire-index-snapshot-versions",
-        status: "Enabled",
-        filter: { prefix: "index/" },
-        noncurrentVersionExpiration: { noncurrentDays: 1, newerNoncurrentVersions: 20 },
-      },
-    ],
-  },
-  { dependsOn: [versioning] },
-);
 
 new aws.s3.BucketPolicy(
   "MemoryBucketPolicy",

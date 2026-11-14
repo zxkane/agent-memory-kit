@@ -77,7 +77,12 @@ function parseConsolidate(block) {
   };
 }
 
-const BRIDGE_KEYS = ['bucket', 'region', 'up', 'down', 'agentsRepoDir', 'agentsRepoUrl', 'roleArn'];
+// Where a job takes its AWS credentials from: the instance's metadata service (default) or, inside a
+// GitHub Actions job, the environment. Never both, never a fallback from one to the other.
+const CREDENTIAL_SOURCES = ['instance', 'environment'];
+const credentialSource = (value) => (value === undefined ? 'instance' : CREDENTIAL_SOURCES.includes(value) ? value : undefined);
+
+const BRIDGE_KEYS = ['bucket', 'region', 'up', 'down', 'agentsRepoDir', 'agentsRepoUrl', 'roleArn', 'credentials'];
 
 // True when one folder is the other, inside it or around it. Both get a trailing separator, so
 // `/a/notes-agents` is not taken to be inside `/a/notes`.
@@ -113,10 +118,12 @@ function parseBridge(block, repoDir) {
   if (url !== null && (typeof url !== 'string' || !MODEL_RE.test(url))) return bad('agentsRepoUrl');
   const roleArn = block.roleArn ?? null;
   if (roleArn !== null && (typeof roleArn !== 'string' || !ROLE_ARN_RE.test(roleArn))) return bad('roleArn');
-  return { value: { bucket, region, up, down, agentsRepoDir: dir, agentsRepoUrl: url, roleArn }, problem: null };
+  const credentials = credentialSource(block.credentials);
+  if (credentials === undefined) return bad('credentials');
+  return { value: { bucket, region, up, down, agentsRepoDir: dir, agentsRepoUrl: url, roleArn, credentials }, problem: null };
 }
 
-const CANARY_KEYS = ['stage', 'region', 'schedule', 'roleArn'];
+const CANARY_KEYS = ['stage', 'region', 'schedule', 'roleArn', 'credentials'];
 const STAGE_RE = /^[a-z0-9-]{1,32}$/;
 
 // The optional canary block, with the same contract as parseConsolidate: `{ value, problem }`.
@@ -132,7 +139,9 @@ function parseCanary(block) {
   if (schedule === undefined) return bad('schedule');
   const roleArn = block.roleArn ?? null;
   if (roleArn !== null && (typeof roleArn !== 'string' || !ROLE_ARN_RE.test(roleArn))) return bad('roleArn');
-  return { value: { stage: block.stage, region: block.region, schedule, roleArn }, problem: null };
+  const credentials = credentialSource(block.credentials);
+  if (credentials === undefined) return bad('credentials');
+  return { value: { stage: block.stage, region: block.region, schedule, roleArn, credentials }, problem: null };
 }
 
 // The configuration file: AGENT_MEMORY_CONFIG, or ~/.config/agent-memory/config.json.

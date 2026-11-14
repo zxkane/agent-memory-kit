@@ -489,3 +489,79 @@ test('no roleArn: the instance credentials are used and nothing is exchanged', a
   assert.equal(exchanges.length, 0);
   assert.deepEqual(keyIds, ['AKIAEXAMPLE', 'AKIAEXAMPLE', 'AKIAEXAMPLE', 'AKIAEXAMPLE']);
 });
+
+// ---- credentials: "environment" ----
+
+const ENV_CREDS = { accessKeyId: 'ASIAENVKEYID', secretAccessKey: 'env-signing-value', sessionToken: 'env-session-value' };
+
+function withEnvironment(t, over = {}) {
+  const s = setup(t);
+  s.config.canary.credentials = 'environment';
+  const keyIds = [];
+  const reads = { environment: 0, instance: 0 };
+  const inner = s.deps.fetchImpl;
+  s.deps.fetchImpl = async (input, init) => {
+    if (String(input).startsWith('https://ssm.')) keyIds.push(/Credential=([^/]+)\//.exec(new Headers(init.headers).get('authorization'))?.[1]);
+    return inner(input, init);
+  };
+  s.deps.credentials = async () => { reads.instance += 1; return CREDS; };
+  s.deps.environmentCredentials = () => { reads.environment += 1; return ENV_CREDS; };
+  Object.assign(s.deps, over);
+  return { s, keyIds, reads };
+}
+
+test('environment: the parameters are read with the environment credentials, the metadata service is never asked', async (t) => {
+  const { s, keyIds, reads } = withEnvironment(t);
+  const result = await runCanary({ config: s.config, deps: { ...s.deps, runChecks: fixedChecks(PASSING) }, now: NOW });
+  assert.equal(result.ok, true);
+  assert.deepEqual(reads, { environment: 1, instance: 0 });
+  assert.deepEqual(keyIds, ['ASIAENVKEYID', 'ASIAENVKEYID', 'ASIAENVKEYID', 'ASIAENVKEYID']);
+});
+
+test('environment: a missing variable is the run error and nothing else is attempted, also not the metadata service', async (t) => {
+  const { s, keyIds, reads } = withEnvironment(t, { environmentCredentials: () => { throw new AwsError('credentials', 0, 'NoEnvironment'); } });
+  let ran = false;
+  const result = await runCanary({ config: s.config, deps: { ...s.deps, runChecks: async () => { ran = true; return PASSING; } }, now: NOW });
+  assert.deepEqual(result, { ok: false, failed: [], error: 'credentials failed: 0 NoEnvironment' });
+  assert.equal(s.file().error, 'credentials failed: 0 NoEnvironment');
+  assert.match(s.printed.join(''), /^canary failed: credentials failed: 0 NoEnvironment\n$/);
+  assert.deepEqual([ran, keyIds.length, reads.instance], [false, 0, 0]);
+});
+
+test('environment: the real reader with a malformed value is BadEnvironment', async (t) => {
+  const { s } = withEnvironment(t, { environmentCredentials: undefined });
+  const names = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'];
+  const saved = Object.fromEntries(names.map((k) => [k, process.env[k]]));
+  try {
+    Object.assign(process.env, { AWS_ACCESS_KEY_ID: 'ASIAENVKEYID', AWS_SECRET_ACCESS_KEY: 'SECRET IN VALUE', AWS_SESSION_TOKEN: 'token-value' });
+    const result = await runCanary({ config: s.config, deps: s.deps, now: NOW });
+    assert.equal(result.error, 'credentials failed: 0 BadEnvironment');
+    assert.ok(!s.everything().includes('SECRET IN VALUE'));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('instance: an environment that holds credentials is ignored', async (t) => {
+  for (const credentials of [undefined, 'instance']) {
+    const s = setup(t);
+    if (credentials) s.config.canary.credentials = credentials;
+    s.deps.environmentCredentials = () => assert.fail('the environment is not read');
+    assert.equal((await runCanary({ config: s.config, deps: { ...s.deps, runChecks: fixedChecks(PASSING) }, now: NOW })).ok, true);
+  }
+});
+
+test('environment plus roleArn: the exchange starts from the environment credentials', async (t) => {
+  const { s, keyIds, reads } = withEnvironment(t);
+  s.config.canary.roleArn = ROLE;
+  const exchanges = [];
+  s.deps.assumeRole = async (args) => { exchanges.push(args); return ROLE_CREDS; };
+  const result = await runCanary({ config: s.config, deps: { ...s.deps, runChecks: fixedChecks(PASSING) }, now: NOW });
+  assert.equal(result.ok, true);
+  assert.deepEqual(exchanges[0].credentials, ENV_CREDS);
+  assert.deepEqual(reads, { environment: 1, instance: 0 });
+  assert.deepEqual(keyIds, ['ROLEKEYID', 'ROLEKEYID', 'ROLEKEYID', 'ROLEKEYID']);
+});

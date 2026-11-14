@@ -6,6 +6,9 @@ import {
   canaryRolePolicy,
   functionPolicy,
   logsPolicy,
+  isGithubSubject,
+  isRoleArn,
+  jobsTrustPolicy,
   trustPolicy,
   workstationTrustPolicy,
 } from '../infra/policies.ts';
@@ -184,6 +187,116 @@ describe('workstationTrustPolicy', () => {
   });
 });
 
+describe('jobsTrustPolicy', () => {
+  const PROVIDER = 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com';
+  const SUBJECT = 'repo:o/r:ref:refs/heads/main';
+  const roleStatement = { Effect: 'Allow', Principal: { AWS: [ROLE_A, ROLE_B] }, Action: 'sts:AssumeRole' };
+  const githubStatement = (subjects: string[]) => ({
+    Effect: 'Allow',
+    Principal: { Federated: PROVIDER },
+    Action: 'sts:AssumeRoleWithWebIdentity',
+    Condition: {
+      StringEquals: {
+        'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+        'token.actions.githubusercontent.com:sub': subjects,
+      },
+    },
+  });
+
+  it('for roles only returns exactly the workstation document', () => {
+    const doc = jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [] });
+    assert.deepEqual(doc, workstationTrustPolicy([ROLE_A, ROLE_B]));
+    assert.equal(JSON.stringify(doc), JSON.stringify(workstationTrustPolicy([ROLE_A, ROLE_B])));
+    assert.deepEqual(doc, { Version: '2012-10-17', Statement: [roleStatement] });
+  });
+
+  it('for subjects only returns one GitHub statement with the audience condition', () => {
+    assert.deepEqual(
+      jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER }),
+      { Version: '2012-10-17', Statement: [githubStatement([SUBJECT])] },
+    );
+  });
+
+  it('for both returns the role statement then the GitHub statement', () => {
+    const second = 'repo:o/r:ref:refs/heads/release/1';
+    assert.deepEqual(
+      jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [SUBJECT, second], githubProviderArn: PROVIDER }),
+      { Version: '2012-10-17', Statement: [roleStatement, githubStatement([SUBJECT, second])] },
+    );
+  });
+
+  it('refuses two empty lists', () => {
+    assert.throws(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [] }), /at least one/i);
+  });
+
+  it('refuses subjects that are not an exact branch', () => {
+    for (const bad of [
+      'repo:o/*:ref:refs/heads/main',
+      'repo:o/r:*',
+      'repo:o/r:ref:refs/heads/*',
+      'repo:o/r:ref:refs/heads/ma?n',
+      'repo:o/?:ref:refs/heads/main',
+      'repo:o/r:pull_request',
+      'repo:o/r:ref:refs/tags/v1',
+      'repo:o/r:environment:',
+      'repo:o/r:environment:production',
+      'repo:o:ref:refs/heads/main',
+      'repo:o/r:ref:refs/heads/',
+      'o/r:ref:refs/heads/main',
+      '',
+    ]) {
+      assert.throws(
+        () => jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT, bad], githubProviderArn: PROVIDER }),
+        /subject/i,
+        bad,
+      );
+    }
+  });
+
+  it('accepts branch names with slashes, dots and dashes', () => {
+    for (const ok of ['repo:o/r:ref:refs/heads/feature/x', 'repo:o-1/r_2.x:ref:refs/heads/rel-1.0']) {
+      assert.doesNotThrow(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [ok], githubProviderArn: PROVIDER }), ok);
+    }
+  });
+
+  it('refuses subjects without a provider ARN, and a provider ARN of another issuer', () => {
+    assert.throws(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT] }), /provider/i);
+    for (const bad of [
+      'arn:aws:iam::123456789012:oidc-provider/example.com',
+      'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com.evil.example',
+      'arn:aws:iam::123456789012:role/token.actions.githubusercontent.com',
+      'arn:aws:iam::123:oidc-provider/token.actions.githubusercontent.com',
+      '*',
+    ]) {
+      assert.throws(
+        () => jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT], githubProviderArn: bad }),
+        /provider/i,
+        bad,
+      );
+    }
+  });
+
+  it('still validates the role ARNs', () => {
+    assert.throws(() => jobsTrustPolicy({ roleArns: ['*'], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER }), /role/i);
+  });
+});
+
+describe('isGithubSubject', () => {
+  it('accepts exactly one branch of one repository and nothing broader', () => {
+    assert.equal(isGithubSubject('repo:example-owner/example-repo:ref:refs/heads/main'), true);
+    assert.equal(isGithubSubject('repo:example-owner/example-repo:ref:refs/heads/release/1.0'), true);
+    for (const bad of [
+      '',
+      'repo:example-owner/example-repo:environment:production',
+      'repo:example-owner/*:ref:refs/heads/main',
+      'repo:example-owner/example-repo:ref:refs/heads/*',
+      'repo:example-owner/example-repo:pull_request',
+    ]) {
+      assert.equal(isGithubSubject(bad), false, bad);
+    }
+  });
+});
+
 describe('logsPolicy', () => {
   const LOG_GROUP = 'arn:aws:logs:region-x:123456789012:log-group:/aws/lambda/example';
   const policy = logsPolicy(LOG_GROUP);
@@ -227,5 +340,18 @@ describe('trustPolicy', () => {
 
   it('allows only sts:AssumeRole', () => {
     assert.deepEqual(asList(statements[0].Action), ['sts:AssumeRole']);
+  });
+});
+
+describe('isRoleArn', () => {
+  it('accepts role ARNs with and without a path', () => {
+    assert.equal(isRoleArn(ROLE_A), true);
+    assert.equal(isRoleArn(ROLE_B), true);
+  });
+
+  it('refuses everything else', () => {
+    for (const bad of ['', '*', 'arn:aws:iam::123456789012:root', 'arn:aws:iam::123456789012:role/', 'arn:aws:iam::123456789012:role/a/', 'arn:aws:iam::*:role/a']) {
+      assert.equal(isRoleArn(bad), false, bad);
+    }
   });
 });
