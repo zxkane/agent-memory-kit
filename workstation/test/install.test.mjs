@@ -624,3 +624,45 @@ test('planInstall says what install would do for Codex and Kiro', (t) => {
   assert.ok(off[1].startsWith(`would leave ${kiroFile} unchanged`) && off[1].includes('remove'));
   assert.deepEqual(files(managed), ['codex', 'codex/hooks.json', 'kiro-hooks', 'kiro-hooks/agent-memory-kit.json']);
 });
+
+test('planInstall is silent for files that an installed home already has, and install leaves them alone', async (t) => {
+  const { kitDir, home, codexFile, kiroFile } = agentFixture(t, { codex: true, kiro: true });
+  await install({ home, kitDir });
+  const old = new Date(2020, 0, 1);
+  for (const f of [codexFile, kiroFile]) utimesSync(f, old, old);
+  assert.deepEqual(planInstall({ home }), []);
+  assert.deepEqual((await install({ home, kitDir })).notices, []);
+  for (const f of [codexFile, kiroFile]) assert.equal(statSync(f).mtimeMs, old.getTime());
+  // A changed file is planned again, and a link at the Kiro file counts as a change.
+  writeFileSync(kiroFile, '{}');
+  assert.deepEqual(planInstall({ home }), [`would write ${kiroFile}`]);
+  rmSync(kiroFile);
+  symlinkSync(codexFile, kiroFile);
+  assert.deepEqual(planInstall({ home }), [`would write ${kiroFile}`]);
+});
+
+test('dangling links under the home directory count as linked and nothing is written', async (t) => {
+  const cases = [
+    ['.codex', { codex: false, kiro: false }],
+    ['.kiro', { codex: false, kiro: false }],
+    ['.kiro/hooks', { codex: false, kiro: true }],
+  ];
+  for (const [rel, opts] of cases) {
+    for (const hooks of [true, false]) {
+      const { base, kitDir, home } = agentFixture(t, opts);
+      symlinkSync(join(base, 'nowhere'), join(home, rel));
+      const label = `${rel} hooks=${hooks}`;
+      assert.doesNotThrow(() => checkInstall({ home, hooks }), label);
+      const { notices } = await install({ home, kitDir, hooks });
+      assert.equal(existsSync(join(base, 'nowhere')), false, label);
+      assert.equal(lstatSync(join(home, rel)).isSymbolicLink(), true, label);
+      if (rel === '.kiro/hooks' && hooks) {
+        assert.equal(notices.length, 1, label);
+        assert.deepEqual(documentOf(notices[0]), kiroHookDocument(), label);
+      } else {
+        assert.deepEqual(notices, [], label);
+      }
+      assert.doesNotThrow(() => planInstall({ home, hooks }), label);
+    }
+  }
+});

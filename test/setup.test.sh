@@ -246,6 +246,12 @@ check 'codex trust notice is printed' has_text "$out" 'Codex: start a session an
 run_setup --no-enable
 check 'agents rerun exits 0' test "$status" -eq 0
 check 'agents rerun prints no trust notice' bash -c '! grep -qF "run /hooks" <<< "$1"' _ "$out"
+codex_stamp="$(stat -c %Y.%y "$home/.codex/hooks.json")$(stat -c %y "$home/.kiro/hooks/agent-memory-kit.json")"
+run_setup --dry-run
+check 'agents rerun dry run exits 0' test "$status" -eq 0
+check 'agents rerun dry run does not say it would register Codex' bash -c '! grep -q "would register the Codex" <<< "$1"' _ "$out"
+check 'agents rerun dry run does not say it would write Kiro' bash -c '! grep -q "would write .*agent-memory-kit.json" <<< "$1"' _ "$out"
+check 'agents rerun leaves both hook files alone' test "$codex_stamp" = "$(stat -c %Y.%y "$home/.codex/hooks.json")$(stat -c %y "$home/.kiro/hooks/agent-memory-kit.json")"
 run_setup --dry-run --no-hooks
 check 'agents no-hooks dry run exits 0' test "$status" -eq 0
 check 'agents no-hooks dry run names the Codex removal' has_text "$out" "would remove the Codex session-start hook from $home/.codex/hooks.json"

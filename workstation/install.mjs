@@ -141,11 +141,19 @@ function realPathWithTail(path) {
   }
 }
 
-// True when `folder` does not resolve to <real home>/<rel>: a symbolic link sits on the way, and
-// what is written there lands in whatever the link points at, often a repository the user manages.
-function folderIsLinked(home, folder, rel) {
+// True when a symbolic link sits on the way from `home` to <home>/<rel> (also one that points
+// nowhere), or when the folder does not resolve to <real home>/<rel>. What is written there lands
+// in whatever the link points at, often a repository the user manages.
+function folderIsLinked(home, rel) {
+  let path = home;
+  for (const part of rel.split('/')) {
+    path = join(path, part);
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    if (!stat) break;
+    if (stat.isSymbolicLink()) return true;
+  }
   try {
-    return realPathWithTail(folder) !== join(realpathSync(home), rel);
+    return realPathWithTail(join(home, rel)) !== join(realpathSync(home), rel);
   } catch {
     return true;
   }
@@ -156,7 +164,7 @@ const LINKED = 'is a symbolic link or lies in a linked folder, so it was left un
 function codexTarget(home) {
   const file = join(home, '.codex/hooks.json');
   const stat = lstatSync(file, { throwIfNoEntry: false });
-  return { file, stat, linked: stat?.isSymbolicLink() === true || folderIsLinked(home, dirname(file), '.codex') };
+  return { file, stat, linked: stat?.isSymbolicLink() === true || folderIsLinked(home, '.codex') };
 }
 
 function kiroTarget(home) {
@@ -171,7 +179,7 @@ function kiroTarget(home) {
   return {
     dir,
     file,
-    linked: folderIsLinked(home, dir, '.kiro/hooks'),
+    linked: folderIsLinked(home, '.kiro/hooks'),
     current: text !== null && sameJson(text, kiroHookDocument()),
     marked: text !== null && text.includes(HOOK_MARKER),
   };
@@ -237,34 +245,57 @@ export function checkInstall({ home, hooks = true }) {
   }
 }
 
-// What a dry run reports for Codex and Kiro, by the rules `install` follows.
+// What to do about the Codex hooks file: { action, file, text?, mode?, removes? }.
+// Actions: 'write' (create or rewrite), 'unchanged', 'notice-add' and 'notice-remove' (a linked
+// file, left alone), 'none'. Throws when a regular file cannot be used.
+function decideCodex(home, hooks) {
+  const { file, stat, linked } = codexTarget(home);
+  if (linked) {
+    const config = readLinkedConfig(file);
+    if (hooks) return { action: hasCommand(config, 'SessionStart', toolCommand('codex')) ? 'none' : 'notice-add', file };
+    return { action: config && hasOwnHook(config) ? 'notice-remove' : 'none', file };
+  }
+  if (!stat) {
+    if (!hooks) return { action: 'none', file };
+    return { action: 'write', file, text: `${JSON.stringify(mergeCodexHooks({}), null, 2)}\n`, mode: 0o600 };
+  }
+  const config = readCodexConfig(file, hooks);
+  const next = hooks ? mergeCodexHooks(config) : removeHooks(config);
+  if (JSON.stringify(next) === JSON.stringify(config)) return { action: 'unchanged', file };
+  return { action: 'write', file, text: `${JSON.stringify(next, null, 2)}\n`, mode: stat.mode & 0o777, removes: !hooks };
+}
+
+// The same for the Kiro hook file: { action, file, dir }; actions as above plus 'remove'.
+function decideKiro(home, hooks) {
+  const kiro = kiroTarget(home);
+  const { file, dir } = kiro;
+  if (kiro.linked) {
+    if (hooks) return { action: kiro.current ? 'none' : 'notice-add', file, dir };
+    return { action: kiro.marked ? 'notice-remove' : 'none', file, dir };
+  }
+  if (hooks) {
+    // A symbolic link at the file itself is replaced by a regular file.
+    const isLink = lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink() === true;
+    return { action: kiro.current && !isLink ? 'unchanged' : 'write', file, dir };
+  }
+  return { action: kiro.marked ? 'remove' : 'none', file, dir };
+}
+
+// What a dry run reports for Codex and Kiro: nothing for a file that stays as it is.
 export function planInstall({ home, hooks = true }) {
   const lines = [];
   if (isDirectory(join(home, '.codex'))) {
-    const { file, stat, linked } = codexTarget(home);
-    const config = stat ? readLinkedConfig(file) : null;
-    if (linked) {
-      if (hooks && !hasCommand(config, 'SessionStart', toolCommand('codex'))) {
-        lines.push(`would leave ${file} unchanged (it or its folder is a symbolic link) and print the hook entry to add`);
-      } else if (!hooks && config && hasOwnHook(config)) {
-        lines.push(`would leave ${file} unchanged (it or its folder is a symbolic link) and ask for the kit's hook to be removed by hand`);
-      }
-    } else if (hooks) {
-      lines.push(`would register the Codex session-start hook (${file})`);
-    } else if (config && hasOwnHook(config)) {
-      lines.push(`would remove the Codex session-start hook from ${file}`);
-    }
+    const d = decideCodex(home, hooks);
+    if (d.action === 'write') lines.push(d.removes ? `would remove the Codex session-start hook from ${d.file}` : `would register the Codex session-start hook (${d.file})`);
+    else if (d.action === 'notice-add') lines.push(`would leave ${d.file} unchanged (it or its folder is a symbolic link) and print the hook entry to add`);
+    else if (d.action === 'notice-remove') lines.push(`would leave ${d.file} unchanged (it or its folder is a symbolic link) and ask for the kit's hook to be removed by hand`);
   }
   if (isDirectory(join(home, '.kiro'))) {
-    const kiro = kiroTarget(home);
-    if (kiro.linked) {
-      if (hooks && !kiro.current) lines.push(`would leave ${kiro.dir} unchanged (it or its folder is a symbolic link) and print the hook document to save there`);
-      else if (!hooks && kiro.marked) lines.push(`would leave ${kiro.file} unchanged (its folder is a symbolic link) and ask for it to be removed by hand`);
-    } else if (hooks) {
-      lines.push(`would write ${kiro.file}`);
-    } else if (kiro.marked) {
-      lines.push(`would remove ${kiro.file}`);
-    }
+    const d = decideKiro(home, hooks);
+    if (d.action === 'write') lines.push(`would write ${d.file}`);
+    else if (d.action === 'remove') lines.push(`would remove ${d.file}`);
+    else if (d.action === 'notice-add') lines.push(`would leave ${d.dir} unchanged (it or its folder is a symbolic link) and print the hook document to save there`);
+    else if (d.action === 'notice-remove') lines.push(`would leave ${d.file} unchanged (its folder is a symbolic link) and ask for it to be removed by hand`);
   }
   return lines;
 }
@@ -282,51 +313,44 @@ function writeLauncher(home, kitDir) {
 
 const TRUST_NOTICE = 'Codex: start a session and run /hooks to trust the new hook; Codex skips it until then.';
 
-// Returns notices for the user. A file that is a symbolic link, or lies in a linked folder, is
-// never written, created or removed.
+// Carries out what decideCodex says and returns notices for the user. A file that is a symbolic
+// link, or lies in a linked folder, is never written, created or removed.
 function installCodex(home, hooks) {
-  const { file, stat, linked } = codexTarget(home);
-  if (linked) {
-    const config = readLinkedConfig(file);
-    const head = `Codex: ${file} ${LINKED}`;
-    if (hooks) {
-      if (hasCommand(config, 'SessionStart', toolCommand('codex'))) return [];
+  const d = decideCodex(home, hooks);
+  switch (d.action) {
+    case 'notice-add': {
       const entry = JSON.stringify({ hooks: { SessionStart: [codexEntry()] } }, null, 2);
-      return [`${head} Add this hook to it:\n${entry}`, TRUST_NOTICE];
+      return [`Codex: ${d.file} ${LINKED} Add this hook to it:\n${entry}`, TRUST_NOTICE];
     }
-    return config && hasOwnHook(config) ? [`${head} Remove the agent-memory-kit hook from it.`] : [];
+    case 'notice-remove':
+      return [`Codex: ${d.file} ${LINKED} Remove the agent-memory-kit hook from it.`];
+    case 'write':
+      writeAtomic(d.file, d.text, d.mode);
+      return d.removes ? [] : [TRUST_NOTICE];
+    default:
+      return [];
   }
-  if (!stat) {
-    if (!hooks) return [];
-    writeAtomic(file, `${JSON.stringify(mergeCodexHooks({}), null, 2)}\n`, 0o600);
-    return [TRUST_NOTICE];
-  }
-  const config = readCodexConfig(file, hooks);
-  const next = hooks ? mergeCodexHooks(config) : removeHooks(config);
-  if (JSON.stringify(next) === JSON.stringify(config)) return [];
-  writeAtomic(file, `${JSON.stringify(next, null, 2)}\n`, stat.mode & 0o777);
-  return hooks ? [TRUST_NOTICE] : [];
 }
 
 function installKiro(home, hooks) {
-  const kiro = kiroTarget(home);
-  if (kiro.linked) {
-    if (hooks && !kiro.current) {
+  const d = decideKiro(home, hooks);
+  switch (d.action) {
+    case 'notice-add': {
       const document = JSON.stringify(kiroHookDocument(), null, 2);
-      return [`Kiro: ${kiro.dir} ${LINKED} Save this document there as a regular file named agent-memory-kit.json:\n${document}`];
+      return [`Kiro: ${d.dir} ${LINKED} Save this document there as a regular file named agent-memory-kit.json:\n${document}`];
     }
-    return !hooks && kiro.marked ? [`Kiro: ${kiro.file} lies in a linked folder and was left unchanged. Remove it by hand.`] : [];
+    case 'notice-remove':
+      return [`Kiro: ${d.file} lies in a linked folder and was left unchanged. Remove it by hand.`];
+    case 'write':
+      mkdirSync(d.dir, { recursive: true });
+      writeAtomic(d.file, `${JSON.stringify(kiroHookDocument(), null, 2)}\n`, 0o644);
+      return [];
+    case 'remove':
+      rmSync(d.file);
+      return [];
+    default:
+      return [];
   }
-  if (hooks) {
-    // A symbolic link at the file itself is replaced by a regular file.
-    if (!kiro.current || lstatSync(kiro.file).isSymbolicLink()) {
-      mkdirSync(kiro.dir, { recursive: true });
-      writeAtomic(kiro.file, `${JSON.stringify(kiroHookDocument(), null, 2)}\n`, 0o644);
-    }
-  } else if (kiro.marked) {
-    rmSync(kiro.file);
-  }
-  return [];
 }
 
 // With `hooks: false` the hooks are not registered, and entries added earlier are removed.
