@@ -215,7 +215,7 @@ describe('jobsTrustPolicy', () => {
   });
 
   it('for both returns the role statement then the GitHub statement', () => {
-    const env = 'repo:o/r:environment:prod';
+    const env = 'repo:o/r:ref:refs/heads/release/1';
     assert.deepEqual(
       jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [SUBJECT, env], githubProviderArn: PROVIDER }),
       { Version: '2012-10-17', Statement: [roleStatement, githubStatement([SUBJECT, env])] },
@@ -226,7 +226,7 @@ describe('jobsTrustPolicy', () => {
     assert.throws(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [] }), /at least one/i);
   });
 
-  it('refuses subjects that are not an exact branch or environment', () => {
+  it('refuses subjects that are not an exact branch', () => {
     for (const bad of [
       'repo:o/*:ref:refs/heads/main',
       'repo:o/r:*',
@@ -234,6 +234,7 @@ describe('jobsTrustPolicy', () => {
       'repo:o/r:pull_request',
       'repo:o/r:ref:refs/tags/v1',
       'repo:o/r:environment:',
+      'repo:o/r:environment:production',
       'repo:o:ref:refs/heads/main',
       'repo:o/r:ref:refs/heads/',
       'o/r:ref:refs/heads/main',
@@ -247,8 +248,8 @@ describe('jobsTrustPolicy', () => {
     }
   });
 
-  it('accepts branch names with slashes and environments', () => {
-    for (const ok of ['repo:o/r:ref:refs/heads/feature/x', 'repo:o-1/r_2.x:environment:prod-1']) {
+  it('accepts branch names with slashes, dots and dashes', () => {
+    for (const ok of ['repo:o/r:ref:refs/heads/feature/x', 'repo:o-1/r_2.x:ref:refs/heads/rel-1.0']) {
       assert.doesNotThrow(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [ok], githubProviderArn: PROVIDER }), ok);
     }
   });

@@ -140,13 +140,13 @@ export function canaryRolePolicy(parameterArns: string[]): PolicyDocument {
   };
 }
 
-const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:(ref:refs\/heads\/[A-Za-z0-9._\/-]+|environment:[A-Za-z0-9._-]+)$/;
+const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:ref:refs\/heads\/[A-Za-z0-9._\/-]+$/;
 const GITHUB_PROVIDER_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/;
 const GITHUB_OIDC = 'token.actions.githubusercontent.com';
 
 /**
  * The trust policy of a workstation role: the given IAM roles, and the GitHub Actions jobs whose
- * subject is named exactly (a branch or an environment of one repository), through the account's
+ * subject is named exactly (one branch of one repository; an environment subject would not be bound to a branch), through the account's
  * existing GitHub OIDC provider. Each kind that is non-empty gets one statement.
  */
 export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: string[]; githubProviderArn?: string }) {
@@ -161,7 +161,7 @@ export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: str
   }
   for (const subject of githubSubjects) {
     if (!SUBJECT_RE.test(subject)) {
-      throw new Error('Each GitHub subject must be repo:<owner>/<repository>:ref:refs/heads/<branch> or repo:<owner>/<repository>:environment:<name>.');
+      throw new Error('Each GitHub subject must be repo:<owner>/<repository>:ref:refs/heads/<branch>.');
     }
   }
   if (githubSubjects.length > 0 && (githubProviderArn === undefined || !GITHUB_PROVIDER_ARN_RE.test(githubProviderArn))) {
