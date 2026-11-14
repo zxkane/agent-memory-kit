@@ -158,6 +158,15 @@ function installCodex(home, hooks) {
   } catch {
     throw new Error(`${file} is not valid JSON holding an object; fix it and run the installer again.`);
   }
+  if (hooks) {
+    const value = config.hooks;
+    if (value !== undefined && (value === null || typeof value !== 'object' || Array.isArray(value))) {
+      throw new Error(`${file} has an unexpected shape: "hooks" must be an object; fix it and run the installer again.`);
+    }
+    if (value?.SessionStart !== undefined && !Array.isArray(value.SessionStart)) {
+      throw new Error(`${file} has an unexpected shape: "hooks.SessionStart" must be an array; fix it and run the installer again.`);
+    }
+  }
   const next = hooks ? mergeCodexHooks(config) : removeHooks(config);
   if (JSON.stringify(next) === JSON.stringify(config)) return [];
   writeAtomic(file, `${JSON.stringify(next, null, 2)}\n`, link.mode & 0o777);

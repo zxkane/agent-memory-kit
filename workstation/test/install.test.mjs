@@ -350,3 +350,26 @@ test('kiro: --no-hooks removes the kit file and leaves another file alone', asyn
   await install({ home, kitDir, hooks: false });
   assert.equal(readFileSync(kiroFile, 'utf8'), '{"version":"v1","hooks":[]}');
 });
+
+test('codex: an unexpected shape in a regular hooks.json is an error and the file is untouched', async (t) => {
+  const { kitDir, home, codexFile } = agentFixture(t, { codex: true });
+  for (const text of ['{"hooks": {"SessionStart": "x"}}', '{"hooks": []}', '{"hooks": "x"}']) {
+    writeFileSync(codexFile, text);
+    await assert.rejects(install({ home, kitDir }), (err) => err.message.includes(codexFile), text);
+    assert.equal(readFileSync(codexFile, 'utf8'), text);
+  }
+  // With hooks off nothing changes and nothing throws.
+  writeFileSync(codexFile, '{"hooks": {"SessionStart": "x"}}');
+  assert.deepEqual((await install({ home, kitDir, hooks: false })).notices, []);
+  assert.equal(readFileSync(codexFile, 'utf8'), '{"hooks": {"SessionStart": "x"}}');
+});
+
+test('codex: a symbolic link to an unexpected shape gets the add-by-hand notice', async (t) => {
+  const { base, kitDir, home, codexFile } = agentFixture(t, { codex: true });
+  const target = join(base, 'shape.json');
+  writeFileSync(target, '{"hooks": {"SessionStart": "x"}}');
+  symlinkSync(target, codexFile);
+  const { notices } = await install({ home, kitDir });
+  assert.ok(notices[0].includes('is a symbolic link and was left unchanged. Add this hook'));
+  assert.equal(readFileSync(target, 'utf8'), '{"hooks": {"SessionStart": "x"}}');
+});
