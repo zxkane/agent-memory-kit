@@ -146,8 +146,9 @@ const GITHUB_OIDC = 'token.actions.githubusercontent.com';
 
 /**
  * The trust policy of a workstation role: the given IAM roles, and the GitHub Actions jobs whose
- * subject is named exactly (one branch of one repository; an environment subject would not be bound to a branch), through the account's
- * existing GitHub OIDC provider. Each kind that is non-empty gets one statement.
+ * subject is named exactly (one branch of one repository; an environment subject would not be
+ * bound to a branch), through the account's existing GitHub OIDC provider. Each kind that is
+ * non-empty gets one statement.
  */
 export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: string[]; githubProviderArn?: string }) {
   const { roleArns, githubSubjects, githubProviderArn } = input;

@@ -204,6 +204,7 @@ describe('jobsTrustPolicy', () => {
   it('for roles only returns exactly the workstation document', () => {
     const doc = jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [] });
     assert.deepEqual(doc, workstationTrustPolicy([ROLE_A, ROLE_B]));
+    assert.equal(JSON.stringify(doc), JSON.stringify(workstationTrustPolicy([ROLE_A, ROLE_B])));
     assert.deepEqual(doc, { Version: '2012-10-17', Statement: [roleStatement] });
   });
 
@@ -215,10 +216,10 @@ describe('jobsTrustPolicy', () => {
   });
 
   it('for both returns the role statement then the GitHub statement', () => {
-    const env = 'repo:o/r:ref:refs/heads/release/1';
+    const second = 'repo:o/r:ref:refs/heads/release/1';
     assert.deepEqual(
-      jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [SUBJECT, env], githubProviderArn: PROVIDER }),
-      { Version: '2012-10-17', Statement: [roleStatement, githubStatement([SUBJECT, env])] },
+      jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [SUBJECT, second], githubProviderArn: PROVIDER }),
+      { Version: '2012-10-17', Statement: [roleStatement, githubStatement([SUBJECT, second])] },
     );
   });
 
@@ -231,6 +232,8 @@ describe('jobsTrustPolicy', () => {
       'repo:o/*:ref:refs/heads/main',
       'repo:o/r:*',
       'repo:o/r:ref:refs/heads/*',
+      'repo:o/r:ref:refs/heads/ma?n',
+      'repo:o/?:ref:refs/heads/main',
       'repo:o/r:pull_request',
       'repo:o/r:ref:refs/tags/v1',
       'repo:o/r:environment:',

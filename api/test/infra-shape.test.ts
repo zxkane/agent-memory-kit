@@ -116,7 +116,7 @@ describe('infrastructure source', () => {
   it('creates the two workstation roles and their parameters only inside the branch that requires one of the two variables', () => {
     const src = squash('infra/workstation.ts');
     const branch = src.match(/if\(roleArns\.length>0\|\|githubSubjects\.length>0\)\{(.*)\}$/);
-    assert.ok(branch, 'branch on the role ARNs');
+    assert.ok(branch, 'branch on the role ARNs or the GitHub subjects');
     const body = branch[1];
     assert.equal((src.match(/newaws\.iam\.Role\(/g) ?? []).length, 2);
     assert.equal((body.match(/newaws\.iam\.Role\(/g) ?? []).length, 2);
@@ -136,8 +136,12 @@ describe('infrastructure source', () => {
     assert.match(src, /jobsTrustPolicy\(/);
     assert.doesNotMatch(src, /workstationTrustPolicy/);
     assert.doesNotMatch(src, /OpenIdConnectProvider/);
-    assert.match(src, /getCallerIdentityOutput\(\)/);
-    assert.match(src, /getPartitionOutput\(\)/);
+    // The two data sources are read only in the arm taken when subjects are given.
+    const split = src.match(/^(.*?)githubSubjects\.length===0\?(.*?):(\$interpolate.*)$/);
+    assert.ok(split, 'the choice on the subjects');
+    assert.doesNotMatch(`${split[1]}${split[2]}`, /getCallerIdentityOutput|getPartitionOutput/);
+    assert.match(split[3] as string, /getCallerIdentityOutput\(\)/);
+    assert.match(split[3] as string, /getPartitionOutput\(\)/);
     assert.doesNotMatch(src, /managedPolicyArns|aws\.iam\.RolePolicyAttachment/);
   });
 
