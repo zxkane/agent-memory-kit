@@ -54,13 +54,22 @@ function writeInPlace(to, write) {
   }
 }
 
+// Returns false when `from` was deleted meanwhile (a session removing a note while we copy).
 function copyKeepingTime(from, to) {
-  writeInPlace(to, (tmp) => {
-    copyFileSync(from, tmp);
-    const st = statSync(from);
-    utimesSync(tmp, st.atime, st.mtime);
-  });
+  try {
+    writeInPlace(to, (tmp) => {
+      copyFileSync(from, tmp);
+      const st = statSync(from);
+      utimesSync(tmp, st.atime, st.mtime);
+    });
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT' && lstatOrNull(from) === null) return false;
+    throw err;
+  }
 }
+
+const GONE = new Set(['ENOENT', 'ENOTDIR']);
 
 // True when dir holds anything other than regular files (a subfolder, a symlink).
 export function hasNestedEntries(dir) {
@@ -81,11 +90,11 @@ export function adoptDir(srcDir, targetDir, host, opts = {}) {
 
   for (const name of names.filter((n) => n !== INDEX)) {
     const from = join(srcDir, name);
-    const bytes = readFileSync(from);
+    const bytes = readIfFile(from);
+    if (bytes === null) continue; // deleted since the listing
     const existing = readIfFile(join(targetDir, name));
     if (existing === null) {
-      copyKeepingTime(from, join(targetDir, name));
-      copied += 1;
+      if (copyKeepingTime(from, join(targetDir, name))) copied += 1;
       continue;
     }
     if (existing.equals(bytes)) continue;
@@ -97,7 +106,7 @@ export function adoptDir(srcDir, targetDir, host, opts = {}) {
       if (names.includes(candidate)) continue; // a source file still to be processed owns this name
       const other = readIfFile(join(targetDir, candidate));
       if (other === null) {
-        copyKeepingTime(from, join(targetDir, candidate));
+        if (!copyKeepingTime(from, join(targetDir, candidate))) break;
         copied += 1;
         renamed.push(`${name} -> ${candidate}`);
         used = candidate;
@@ -105,15 +114,17 @@ export function adoptDir(srcDir, targetDir, host, opts = {}) {
         used = candidate;
       }
     }
-    renames.set(name, used);
+    if (used !== null) renames.set(name, used);
   }
 
   if (names.includes(INDEX)) {
-    const incoming = readFileSync(join(srcDir, INDEX), 'utf8');
-    const current = readIfFile(join(targetDir, INDEX));
-    const merged = mergeIndex(current === null ? '' : current.toString('utf8'), incoming, renames);
-    if (current === null || merged !== current.toString('utf8')) {
-      writeInPlace(join(targetDir, INDEX), (tmp) => writeFileSync(tmp, merged));
+    const incomingBytes = readIfFile(join(srcDir, INDEX));
+    if (incomingBytes !== null) {
+      const current = readIfFile(join(targetDir, INDEX));
+      const merged = mergeIndex(current === null ? '' : current.toString('utf8'), incomingBytes.toString('utf8'), renames);
+      if (current === null || merged !== current.toString('utf8')) {
+        writeInPlace(join(targetDir, INDEX), (tmp) => writeFileSync(tmp, merged));
+      }
     }
   }
   return { copied, renamed };
@@ -186,10 +197,18 @@ function freeBackupName(linkPath, now) {
 
 // Adopts the real directory at linkPath under the lock. Returns null when the
 // state changed under us and the caller should look again.
-function adoptUnderLock({ linkPath, targetDir, host, now, skip }) {
+function adoptUnderLock({ linkPath, targetDir, host, now, skip }, steps) {
+  steps.afterLock?.();
   if (!lstatOrNull(linkPath)?.isDirectory()) return null;
-  if (hasNestedEntries(linkPath)) return result('skipped', { reason: 'nested-entries' });
-  const first = adoptDir(linkPath, targetDir, host, { skip });
+  // The folder can still vanish or change type here (a session removing it); then look again.
+  let first;
+  try {
+    if (hasNestedEntries(linkPath)) return result('skipped', { reason: 'nested-entries' });
+    first = adoptDir(linkPath, targetDir, host, { skip });
+  } catch (err) {
+    if (GONE.has(err.code) && !lstatOrNull(linkPath)?.isDirectory()) return null;
+    throw err;
+  }
   const backupDir = freeBackupName(linkPath, now);
   if (!lstatOrNull(linkPath)?.isDirectory()) return null;
   try {
@@ -199,7 +218,14 @@ function adoptUnderLock({ linkPath, targetDir, host, now, skip }) {
     throw err;
   }
   // A note written between the first pass and the rename is in the backup now.
-  const second = adoptDir(backupDir, targetDir, host, { skip });
+  let second;
+  try {
+    second = adoptDir(backupDir, targetDir, host, { skip });
+  } catch (err) {
+    // A non-directory took the path just before our rename and was moved aside with it.
+    if (!GONE.has(err.code) || lstatOrNull(backupDir)?.isDirectory()) throw err;
+    return null; // look again: the path is free now
+  }
   const copied = first.copied + second.copied;
   const renamed = [...first.renamed, ...second.renamed];
   try {
@@ -211,7 +237,7 @@ function adoptUnderLock({ linkPath, targetDir, host, now, skip }) {
   return result('adopted', { copied, renamed, backupDir });
 }
 
-export function ensureLink({ linkPath, targetDir, host, now = new Date(), lockWaitMs = DEFAULT_LOCK_WAIT_MS, skip }) {
+export function ensureLink({ linkPath, targetDir, host, now = new Date(), lockWaitMs = DEFAULT_LOCK_WAIT_MS, skip }, steps = {}) {
   mkdirSync(targetDir, { recursive: true });
   mkdirSync(dirname(linkPath), { recursive: true });
   const lockPath = `${linkPath}.adopt-lock`;
@@ -240,14 +266,20 @@ export function ensureLink({ linkPath, targetDir, host, now = new Date(), lockWa
         : result('skipped', { reason: 'foreign-symlink' });
     }
     if (!st.isDirectory()) return result('skipped', { reason: 'not-a-directory' });
-    if (hasNestedEntries(linkPath)) return result('skipped', { reason: 'nested-entries' });
+    steps.beforeNestedCheck?.();
+    try {
+      if (hasNestedEntries(linkPath)) return result('skipped', { reason: 'nested-entries' });
+    } catch (err) {
+      if (GONE.has(err.code)) continue; // another process changed the path; look at it again
+      throw err;
+    }
 
     if (!takeLock(lockPath)) {
       sleep(LOCK_POLL_MS);
       continue;
     }
     try {
-      const adopted = adoptUnderLock({ linkPath, targetDir, host, now, skip });
+      const adopted = adoptUnderLock({ linkPath, targetDir, host, now, skip }, steps);
       if (adopted) return adopted;
     } finally {
       rmSync(lockPath, { recursive: true, force: true });

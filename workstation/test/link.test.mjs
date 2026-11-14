@@ -178,6 +178,90 @@ test('two concurrent adoptions lose nothing and leave one link', async (t) => {
   assert.ok(results.every((r) => ['adopted', 'linked', 'ok'].includes(r.action)));
 });
 
+// Runs `act` once, at the point of the race inside ensureLink.
+const once = (act) => {
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    act();
+  };
+};
+
+test('a directory renamed away and linked by another adoption before the nested check gives ok', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const beforeNestedCheck = once(() => {
+    fs.renameSync(linkPath, `${linkPath}.local-backup-other`);
+    symlinkSync(targetDir, linkPath);
+  });
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha' }, { beforeNestedCheck });
+  assert.equal(r.action, 'ok');
+  assert.ok(lstatSync(linkPath).isSymbolicLink());
+});
+
+test('a directory renamed away before the nested check is linked by the caller', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const beforeNestedCheck = once(() => fs.renameSync(linkPath, `${linkPath}.local-backup-other`));
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha' }, { beforeNestedCheck });
+  assert.ok(['linked', 'ok'].includes(r.action));
+  assert.equal(realpathSync(linkPath), realpathSync(targetDir));
+});
+
+test('a directory replaced by a file before the nested check is reported as not a directory', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const beforeNestedCheck = once(() => {
+    fs.rmSync(linkPath, { recursive: true });
+    writeFileSync(linkPath, 'now a file');
+  });
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha' }, { beforeNestedCheck });
+  assert.deepEqual([r.action, r.reason], ['skipped', 'not-a-directory']);
+  assert.equal(readFileSync(linkPath, 'utf8'), 'now a file');
+});
+
+test('a folder removed after the lock is taken is looked at again', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'note.md', 'hello');
+  const afterLock = once(() => fs.rmSync(linkPath, { recursive: true }));
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha' }, { afterLock });
+  assert.equal(r.action, 'linked');
+  assert.ok(lstatSync(linkPath).isSymbolicLink());
+});
+
+test('a note deleted while the first pass runs does not make ensureLink throw', (t) => {
+  const base = tempDir(t);
+  const linkPath = join(base, 'projects', 'p', 'memory');
+  const targetDir = join(base, 'clone', 'notes');
+  put(linkPath, 'gone.md', 'bye');
+  put(linkPath, 'kept.md', 'stay');
+  put(linkPath, 'MEMORY.md', '- [K](kept.md)\n');
+  const original = fs.readFileSync;
+  let deleted = false;
+  patchFs(t, 'readFileSync', (orig) => (path, ...rest) => {
+    if (!deleted && String(path) === join(linkPath, 'gone.md')) {
+      deleted = true;
+      fs.rmSync(path);
+    }
+    return orig(path, ...rest);
+  });
+  const r = ensureLink({ linkPath, targetDir, host: 'alpha' });
+  fs.readFileSync = original;
+  syncBuiltinESMExports();
+  assert.equal(r.action, 'adopted');
+  assert.equal(read(targetDir, 'kept.md'), 'stay');
+  assert.ok(lstatSync(linkPath).isSymbolicLink());
+});
+
 test('a stale adoption lock is removed', (t) => {
   const base = tempDir(t);
   const linkPath = join(base, 'projects', 'p', 'memory');
