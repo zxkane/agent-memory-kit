@@ -283,6 +283,86 @@ check 'linked run writes nothing into the linked folders' test -z "$(ls -A "$tmp
 check 'linked run prints the Codex entry to add' has_text "$out" 'Add this hook to it:'
 check 'linked run prints the Kiro document to save' has_text "$out" 'regular file named agent-memory-kit.json'
 
+# Consolidation timers: written from the config's consolidate.extract / consolidate.organize.
+udir="$home/.config/systemd/user"
+set_consolidate() { # set_consolidate <json of the consolidate block, or "none">
+    node -e '
+        const fs = require("node:fs");
+        const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        if (process.argv[2] === "none") delete c.consolidate;
+        else c.consolidate = JSON.parse(process.argv[2]);
+        fs.writeFileSync(process.argv[1], JSON.stringify(c, null, 2) + "\n");
+    ' "$cfg" "$1"
+}
+both='{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00","organize":"Sun *-*-* 04:30"}'
+fresh_home
+run_setup --init alpha --repo-url "$remote" --no-enable
+check 'no consolidate block exits 0' test "$status" -eq 0
+check 'no consolidate block writes no extract unit' test ! -e "$udir/agent-memory-extract.service" -a ! -e "$udir/agent-memory-extract.timer"
+check 'no consolidate block writes no organize unit' test ! -e "$udir/agent-memory-organize.service" -a ! -e "$udir/agent-memory-organize.timer"
+check 'no consolidate block prints nothing about them' bash -c '! grep -qiE "extract|organize" <<< "$1"' _ "$out"
+run_setup --dry-run
+check 'no consolidate block dry run prints nothing about them' bash -c '! grep -qiE "extract|organize" <<< "$1"' _ "$out"
+set_consolidate "$both"
+rm -rf "$udir" "$calls"
+run_setup --dry-run
+check 'consolidate dry run exits 0' test "$status" -eq 0
+check 'consolidate dry run names the extract units' has_text "$out" "would write $udir/agent-memory-extract.service and agent-memory-extract.timer"
+check 'consolidate dry run names the organize units' has_text "$out" "would write $udir/agent-memory-organize.service and agent-memory-organize.timer"
+check 'consolidate dry run says it would enable them' has_text "$out" 'agent-memory-extract.timer agent-memory-organize.timer'
+check 'consolidate dry run writes nothing' test ! -e "$udir"
+check 'consolidate dry run does not call systemctl' no_calls
+run_setup --no-enable
+check 'consolidate run exits 0' test "$status" -eq 0
+check 'consolidate no-enable does not call systemctl' no_calls
+for name in extract organize; do
+    check "$name service exists" test -f "$udir/agent-memory-$name.service"
+    check "$name timer exists" test -f "$udir/agent-memory-$name.timer"
+    check "$name service ExecStart" has_line "$udir/agent-memory-$name.service" "ExecStart=\"$kit/workstation/run.sh\" consolidate $name"
+    check "$name service PATH" has_line "$udir/agent-memory-$name.service" "Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin"
+    check "$name service is oneshot" has_line "$udir/agent-memory-$name.service" 'Type=oneshot'
+    check "$name service timeout" has_line "$udir/agent-memory-$name.service" 'TimeoutStartSec=4h'
+    check "$name service umask" has_line "$udir/agent-memory-$name.service" 'UMask=0077'
+    check "$name service is nice" has_line "$udir/agent-memory-$name.service" 'Nice=10'
+    check "$name service leaves KillMode alone" bash -c '! grep -q KillMode "$1"' _ "$udir/agent-memory-$name.service"
+    check "$name timer persistent" has_line "$udir/agent-memory-$name.timer" 'Persistent=true'
+    check "$name timer jitter" has_line "$udir/agent-memory-$name.timer" 'RandomizedDelaySec=10min'
+    check "$name timer wanted by timers.target" has_line "$udir/agent-memory-$name.timer" 'WantedBy=timers.target'
+done
+check 'extract OnCalendar' has_line "$udir/agent-memory-extract.timer" 'OnCalendar=Sat *-*-* 03:00'
+check 'organize OnCalendar' has_line "$udir/agent-memory-organize.timer" 'OnCalendar=Sun *-*-* 04:30'
+run_setup
+check 'consolidate enabling run exits 0' test "$status" -eq 0
+check 'consolidate run enables the extract timer' has_line "$calls" '--user enable --now agent-memory-extract.timer'
+check 'consolidate run enables the organize timer' has_line "$calls" '--user enable --now agent-memory-organize.timer'
+check 'consolidate run still enables the sync timer' has_line "$calls" '--user enable --now agent-memory-sync.timer'
+check 'consolidate run reloads once' test "$(grep -cxF -- '--user daemon-reload' "$calls")" -eq 1
+# Removing a schedule disables its timer and removes both of its unit files.
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00"}'
+run_setup --dry-run
+check 'removal dry run names the organize files' has_text "$out" "would remove $udir/agent-memory-organize.service"
+check 'removal dry run names the organize timer' has_text "$out" "would remove $udir/agent-memory-organize.timer"
+check 'removal dry run removes nothing' test -f "$udir/agent-memory-organize.timer"
+rm -f "$calls"
+run_setup
+check 'removal exits 0' test "$status" -eq 0
+check 'removal disables the organize timer' has_line "$calls" '--user disable --now agent-memory-organize.timer'
+check 'removal removes the organize service' test ! -e "$udir/agent-memory-organize.service"
+check 'removal removes the organize timer' test ! -e "$udir/agent-memory-organize.timer"
+check 'removal keeps the extract units' test -f "$udir/agent-memory-extract.service" -a -f "$udir/agent-memory-extract.timer"
+run_setup --dry-run
+check 'a second dry run has nothing left to remove' bash -c '! grep -q "would remove" <<< "$1"' _ "$out"
+# Removing the whole block removes the rest.
+set_consolidate none
+run_setup
+check 'removing the block exits 0' test "$status" -eq 0
+check 'removing the block removes the extract units' test ! -e "$udir/agent-memory-extract.service" -a ! -e "$udir/agent-memory-extract.timer"
+check 'removing the block keeps the sync units' test -f "$svc" -a -f "$tim"
+# An invalid block counts as absent.
+set_consolidate '{"command":"relative/claude","model":"model-id","extract":"Sat *-*-* 03:00"}'
+run_setup --no-enable
+check 'an invalid block writes no unit' test ! -e "$udir/agent-memory-extract.timer"
+
 # Node.js 24 or later is accepted, an older one is not.
 real_node="$(command -v node)"
 for version in 25 23; do
