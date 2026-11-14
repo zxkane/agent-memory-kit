@@ -946,18 +946,37 @@ test('state without lastExtractTried loads as never tried; unknown keys survive'
   assert.equal(state.projects.p.note, 'kept');
 });
 
-test('the run stops starting scopes once its summed cost reaches maxProjects × maxBudgetUsd', (t) => {
+test('with named projects the run stops starting scopes once its cost reaches their number × maxBudgetUsd', (t) => {
   const f = fixture(t, { consolidate: { maxProjects: 1, maxBudgetUsd: 1 } });
   f.seed({
     'projects/p1/a.md': note('a', 'A', 'One.'),
     'projects/p2/a.md': note('a', 'A', 'Two.'),
     'projects/p3/a.md': note('a', 'A', 'Three.'),
   });
-  f.instruct({ '*': { result: { total_cost_usd: 0.6 } } });
+  // Each scope overshoots its own limit: the ceiling of 3 is reached after two.
+  f.instruct({ '*': { result: { total_cost_usd: 1.5 } } });
   const r = f.run('organize', '--project', 'p1', '--project', 'p2', '--project', 'p3');
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(f.calls().map((c) => c.scope), ['p1', 'p2']);
-  assert.match(r.stdout, /ceiling/);
+  assert.match(r.stdout, /ceiling of USD 3\.00/);
+});
+
+test('item 3: named projects each get their budget; without --project the ceiling is maxProjects × maxBudgetUsd', (t) => {
+  let f = fixture(t, { consolidate: { maxProjects: 1, maxBudgetUsd: 1 } });
+  f.seed({ 'projects/p1/a.md': note('a', 'A', 'One.'), 'projects/p2/a.md': note('a', 'A', 'Two.') });
+  f.instruct({ '*': { result: { total_cost_usd: 1 } } });
+  let r = f.run('organize', '--project', 'p1', '--project', 'p2');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p1', 'p2']);
+  assert.doesNotMatch(r.stdout, /ceiling/);
+
+  f = fixture(t, { consolidate: { maxProjects: 2, maxBudgetUsd: 1 } });
+  f.seed({ 'projects/p1/a.md': note('a', 'A', 'One.'), 'projects/p2/a.md': note('a', 'A', 'Two.') });
+  f.instruct({ '*': { result: { total_cost_usd: 2 } } });
+  r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(f.calls().length, 1);
+  assert.match(r.stdout, /ceiling of USD 2\.00/);
 });
 
 test('a second consolidation while one holds the lock exits 0 and calls no model', async (t) => {
@@ -1588,7 +1607,7 @@ test('m10: the client\'s standard error of a failed model run is kept in the wor
   let r = f.run('organize', '--keep');
   assert.equal(r.status, 1);
   const [call] = f.calls();
-  const log = join(call.cwd, 'model-stderr.log');
+  const log = join(dirname(call.cwd), 'model-stderr-p.log');
   assert.equal(readFileSync(log, 'utf8'), marker);
   assert.equal(statSync(log).mode & 0o777, 0o600);
   const pattern = /STDERR-MARKER-2718/;
@@ -1600,4 +1619,40 @@ test('m10: the client\'s standard error of a failed model run is kept in the wor
   assert.equal(r.status, 1);
   assert.deepEqual(readdirSync(f.workRoot()), []);
   assert.doesNotMatch(r.stdout + r.stderr, pattern);
+});
+
+test('item 1: a scope whose last run failed more than 28 days ago goes first again', (t) => {
+  for (const [age, expected] of [[29, 'p'], [2, 'q']]) {
+    const f = fixture(t, { consolidate: { maxProjects: 1 } });
+    f.seed({ 'projects/p/a.md': note('a', 'A', 'Failed once.'), 'projects/q/a.md': note('a', 'A', 'Changes every week.') });
+    const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+    mkdirSync(f.state, { recursive: true });
+    writeFileSync(f.stateFile(), JSON.stringify({
+      projects: {
+        p: { lastOrganizeTried: days(age) },
+        q: { lastOrganize: days(1), lastOrganizeTried: days(1), organizedDigest: 'f'.repeat(64) },
+      },
+    }));
+    f.run('organize');
+    assert.deepEqual(f.calls().map((c) => c.scope), [expected], `${age} days`);
+  }
+});
+
+test('item 2: a model that writes model-stderr.log itself and fails is model-failed; the driver\'s log is apart', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
+  f.instruct({
+    p: { writes: { 'model-stderr.log': 'WRITTEN BY THE MODEL' }, silent: true, stderr: 'CLIENT-STDERR-MARKER' },
+  });
+  const r = f.run('organize', '--keep');
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: model-failed, nothing applied/m);
+  assert.match(r.stdout, /^organize q: no-change/m);
+  const call = f.calls().find((c) => c.scope === 'p');
+  const log = join(dirname(call.cwd), 'model-stderr-p.log');
+  assert.equal(readFileSync(log, 'utf8'), 'CLIENT-STDERR-MARKER');
+  assert.equal(statSync(log).mode & 0o777, 0o600);
+  assert.equal(readFileSync(join(call.cwd, 'model-stderr.log'), 'utf8'), 'WRITTEN BY THE MODEL');
+  assert.equal(existsSync(join(dirname(call.cwd), 'model-stderr-q.log')), false);
 });

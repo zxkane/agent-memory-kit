@@ -382,6 +382,10 @@ check 'invalid block keeps the extract units' test -f "$udir/agent-memory-extrac
 check 'invalid block does not disable a consolidation timer' bash -c '! grep -qE "disable.*agent-memory-(extract|organize)" "$1"' _ "$calls"
 check 'invalid block does not enable a consolidation timer' bash -c '! grep -qE "enable --now agent-memory-(extract|organize)" "$1"' _ "$calls"
 check 'invalid block still enables the sync timer' has_line "$calls" '--user enable --now agent-memory-sync.timer'
+# Item 4: an unknown key makes the block invalid, named like any other field.
+set_consolidate '{"command":"/path/to/claude","model":"model-id","organise":"Sun *-*-* 04:30"}'
+run_setup --dry-run
+check 'an unknown key is named' has_text "$out" "the consolidate block in $cfg is invalid (organise); the consolidation units were left as they are."
 set_consolidate none
 run_setup --no-enable
 

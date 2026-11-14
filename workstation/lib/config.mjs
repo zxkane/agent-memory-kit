@@ -20,6 +20,11 @@ function calendar(value) {
   return typeof value === 'string' && CALENDAR_RE.test(value) && value.trim() !== '' ? value : undefined;
 }
 
+const CONSOLIDATE_KEYS = [
+  'command', 'model', 'env', 'extract', 'organize', 'maxProjects', 'maxTranscriptBytes', 'maxTurns', 'maxBudgetUsd',
+  'timeoutMinutes',
+];
+
 // The optional consolidation block: `{ value, problem }`. An absent block gives no value and no
 // problem. A present block that is not valid gives no value (consolidation stays off; it never
 // disables the rest of the config) and, as `problem`, the name of the first field that failed
@@ -28,6 +33,10 @@ function parseConsolidate(block) {
   if (block === undefined || block === null) return { value: null, problem: null };
   const bad = (problem) => ({ value: null, problem });
   if (typeof block !== 'object' || Array.isArray(block)) return bad('consolidate');
+  // A key the block does not know (a misspelt one such as `organise`) makes it invalid: ignoring
+  // it would silently drop the setting it was meant to be.
+  const unknown = Object.keys(block).find((key) => !CONSOLIDATE_KEYS.includes(key));
+  if (unknown !== undefined) return bad(/^[A-Za-z0-9_.-]{1,64}$/.test(unknown) ? unknown : '(an unknown key)');
   const { command, model } = block;
   if (typeof command !== 'string' || !isAbsolute(command) || CONTROL_RE.test(command)) return bad('command');
   if (typeof model !== 'string' || !MODEL_RE.test(model)) return bad('model');

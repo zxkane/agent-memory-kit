@@ -637,8 +637,10 @@ function extractScopes(scan, state, opts, now) {
 //   then the others), then by lastOrganizeTried (falling back to lastOrganize), oldest first,
 //   never tried first;
 // - B, scopes whose last model run left them unorganized (lastOrganizeTried is set and lastOrganize
-//   is absent or older): after all of A, by lastOrganizeTried only, whatever their class, so that
-//   scopes failing every run rotate among themselves and cannot keep the others waiting.
+//   is absent or older) within the last REVISIT_MS: after all of A, by lastOrganizeTried only,
+//   whatever their class, so that scopes failing every run rotate among themselves and cannot keep
+//   the others waiting. A failed try older than REVISIT_MS puts the scope back into group A, at the
+//   front of its class, so that it waits behind the others for at most REVISIT_MS.
 function organizeScopes(scan, state, opts, now) {
   const infos = [...(scan.global.usable ? [{ name: GLOBAL, ...scan.global }] : []), ...scan.projects];
   if (opts.projects.length > 0) return opts.projects.map((name) => ({ scope: name }));
@@ -650,11 +652,20 @@ function organizeScopes(scan, state, opts, now) {
     return (i.overLimit || i.conflict) && now - last(i) > REVISIT_MS;
   };
   const rank = (i) => (i.overLimit ? 0 : i.conflict ? 1 : 2);
-  const tried = (i) => timeOf(entry(i)?.lastOrganizeTried) ?? last(i);
-  const leftUnorganized = (i) => {
+  const failedTry = (i) => {
     const t = timeOf(entry(i)?.lastOrganizeTried);
     const l = timeOf(entry(i)?.lastOrganize);
-    return t !== null && (l === null || t > l);
+    return t !== null && (l === null || t > l) ? t : null;
+  };
+  const leftUnorganized = (i) => {
+    const t = failedTry(i);
+    return t !== null && now - t <= REVISIT_MS;
+  };
+  // A scope whose failed try is older than REVISIT_MS counts as the oldest of its class.
+  const tried = (i) => {
+    const t = failedTry(i);
+    if (t !== null && now - t > REVISIT_MS) return -Infinity;
+    return timeOf(entry(i)?.lastOrganizeTried) ?? last(i);
   };
   const older = (a, b) => (a === b ? 0 : a - b);
   const due = infos.filter(isDue);
@@ -821,7 +832,10 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
     // `no-change` always means the model completed and found nothing.
     if (res.outcome === 'no-change' && stopReason !== 'completed') {
-      writeFileSync(join(work, 'model-stderr.log'), m.stderrTail ?? '', { mode: 0o600, flag: 'wx' });
+      // Beside the scope's work folder, in the run folder: no folder the model can write to.
+      const stderrLog = join(runDir, `model-stderr-${scope}.log`);
+      writeFileSync(stderrLog, m.stderrTail ?? '', { mode: 0o600 });
+      chmodSync(stderrLog, 0o600);
       return { ...res, outcome: 'model-failed', step: 'apply', model: modelInfo, work };
     }
     return { ...res, step: 'apply', model: modelInfo, work };
@@ -982,7 +996,9 @@ async function driverMain(argv) {
   const state = readState(config, started);
   const list = opts.kind === 'extract' ? extractScopes(scan, state, opts, now) : organizeScopes(scan, state, opts, now);
   const limit = opts.projects.length > 0 ? Infinity : c.maxProjects;
-  const ceiling = c.maxProjects * c.maxBudgetUsd;
+  // The run's cost ceiling: maxBudgetUsd for each scope the run may take, which is maxProjects,
+  // or the number of projects named with --project.
+  const ceiling = (opts.projects.length > 0 ? opts.projects.length : c.maxProjects) * c.maxBudgetUsd;
   let calls = 0;
   let spent = 0;
   let runDir = null;

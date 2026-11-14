@@ -184,3 +184,21 @@ test('m13: the model is checked with MODEL_RE, the rule of the --model option', 
     assert.equal(loadConfig(env).consolidate.model, model);
   }
 });
+
+test('item 4: a key the consolidate block does not know makes it invalid, naming that key', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  for (const key of ['organise', 'maxBudget', 'Command']) {
+    write({ ...BASE, consolidate: { ...ok, [key]: 'x' } });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.consolidate, null, key);
+    assert.equal(cfg.consolidateProblem, key);
+  }
+  const every = {
+    command: '/bin/m', model: 'm1', env: { A_B: 'x' }, extract: 'Sat *-*-* 03:00', organize: 'Sun *-*-* 04:30',
+    maxProjects: 2, maxTranscriptBytes: 20000, maxTurns: 20, maxBudgetUsd: 2, timeoutMinutes: 20,
+  };
+  write({ ...BASE, consolidate: every });
+  assert.deepEqual(loadConfig(env).consolidate, every);
+  assert.equal(loadConfig(env).consolidateProblem, null);
+});

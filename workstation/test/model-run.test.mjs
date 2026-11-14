@@ -464,3 +464,17 @@ test('m10: runModel keeps the last 64 KB of the client\'s standard error, and pr
   const missing = await runModel({ command: join(dir, 'nope'), args: [], cwd: dir, env: {}, timeoutMs: 10000 });
   assert.equal(missing.stderrTail, '');
 });
+
+test('runModel with a command that cannot start, a tiny time limit or an abort signal, never throws', async (t) => {
+  const dir = tmp(t);
+  const command = join(dir, 'does-not-exist');
+  const quick = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 1 });
+  assert.ok(['spawn-failed', 'timeout'].includes(quick.stopReason), quick.stopReason);
+  assert.equal(quick.ran, false);
+  const controller = new AbortController();
+  const pending = runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 10000, signal: controller.signal });
+  controller.abort();
+  const aborted = await pending;
+  assert.ok(['spawn-failed', 'aborted'].includes(aborted.stopReason), aborted.stopReason);
+  assert.equal(aborted.ran, false);
+});
