@@ -249,6 +249,66 @@ test('runModel escalates to SIGKILL when SIGTERM is ignored', async (t) => {
   assert.equal(await gone(Number(readFileSync(join(dir, 'sh.pid'), 'utf8'))), true);
 });
 
+test('runModel stops the process group when its signal is aborted', async (t) => {
+  const dir = tmp(t);
+  const command = fakeCommand(
+    dir,
+    `echo $$ > "${join(dir, 'sh.pid')}"\nsleep 60 &\necho $! > "${join(dir, 'sleep.pid')}"\nwait`,
+  );
+  t.after(() => {
+    for (const f of ['sh.pid', 'sleep.pid']) {
+      const p = join(dir, f);
+      if (existsSync(p)) {
+        try {
+          process.kill(Number(readFileSync(p, 'utf8')), 'SIGKILL');
+        } catch {}
+      }
+    }
+  });
+  const controller = new AbortController();
+  const started = Date.now();
+  const pending = runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 60000, signal: controller.signal });
+  while (!existsSync(join(dir, 'sleep.pid')) && Date.now() - started < 5000) await new Promise((r) => setTimeout(r, 20));
+  controller.abort();
+  const r = await pending;
+  assert.deepEqual(r, { ran: false, stopReason: 'aborted', costUsd: null, turns: null, denials: 0, summary: '' });
+  assert.ok(Date.now() - started < 10000);
+  for (const f of ['sh.pid', 'sleep.pid']) {
+    assert.equal(await gone(Number(readFileSync(join(dir, f), 'utf8'))), true, `${f} process is gone`);
+  }
+});
+
+test('runModel reports aborted even when the stopped process printed a result', async (t) => {
+  const dir = tmp(t);
+  const command = fakeCommand(
+    dir,
+    `trap 'echo "{\\"subtype\\":\\"success\\",\\"is_error\\":false}"; exit 0' TERM\necho $$ > "${join(dir, 'sh.pid')}"\nwhile true; do sleep 0.1; done`,
+  );
+  t.after(() => {
+    try {
+      process.kill(Number(readFileSync(join(dir, 'sh.pid'), 'utf8')), 'SIGKILL');
+    } catch {}
+  });
+  const controller = new AbortController();
+  const pending = runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 60000, signal: controller.signal });
+  const started = Date.now();
+  while (!existsSync(join(dir, 'sh.pid')) && Date.now() - started < 5000) await new Promise((r) => setTimeout(r, 20));
+  controller.abort();
+  assert.equal((await pending).stopReason, 'aborted');
+});
+
+test('runModel with an already aborted signal starts nothing', async (t) => {
+  const dir = tmp(t);
+  const command = fakeCommand(dir, `touch "${join(dir, 'started')}"`);
+  const controller = new AbortController();
+  controller.abort();
+  const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 10000, signal: controller.signal });
+  assert.equal(r.ran, false);
+  assert.equal(r.stopReason, 'aborted');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(existsSync(join(dir, 'started')), false);
+});
+
 test('runModel passes only the allowed environment', async (t) => {
   const dir = tmp(t);
   const command = fakeCommand(

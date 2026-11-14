@@ -117,10 +117,16 @@ function killGroup(pid, signal) {
   }
 }
 
-export function runModel({ command, args = [], cwd, env, timeoutMs }) {
+// `signal` (optional, an AbortSignal) stops the run: the process group is ended as on a timeout
+// and the result is `aborted`, given only once the child has exited.
+export function runModel({ command, args = [], cwd, env, timeoutMs, signal }) {
   return new Promise((resolve) => {
     if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       resolve(failure('invalid-timeout'));
+      return;
+    }
+    if (signal?.aborted) {
+      resolve(failure('aborted'));
       return;
     }
     let child;
@@ -140,6 +146,7 @@ export function runModel({ command, args = [], cwd, env, timeoutMs }) {
     let size = 0;
     let overflow = false;
     let timedOut = false;
+    let aborted = false;
     let settled = false;
     let termTimer = null;
     let killTimer = null;
@@ -151,6 +158,7 @@ export function runModel({ command, args = [], cwd, env, timeoutMs }) {
       clearTimeout(termTimer);
       clearTimeout(killTimer);
       clearTimeout(drainTimer);
+      signal?.removeEventListener('abort', onAbort);
       resolve(result);
     };
 
@@ -159,7 +167,11 @@ export function runModel({ command, args = [], cwd, env, timeoutMs }) {
     const conclude = () => {
       if (settled) return;
       child.stdout.destroy();
-      if (timedOut && child.pid !== undefined) killGroup(child.pid, 'SIGKILL');
+      if ((timedOut || aborted) && child.pid !== undefined) killGroup(child.pid, 'SIGKILL');
+      if (aborted) {
+        finish(failure('aborted'));
+        return;
+      }
       const data = overflow ? null : parseOutput(Buffer.concat(chunks).toString('utf8'));
       if (data) finish(summarize(data, timedOut));
       else finish(failure(timedOut ? 'timeout' : 'no-result'));
@@ -190,13 +202,27 @@ export function runModel({ command, args = [], cwd, env, timeoutMs }) {
     });
     child.on('close', conclude);
 
-    termTimer = setTimeout(() => {
-      timedOut = true;
+    // Ends the process group: SIGTERM, then SIGKILL after the grace period.
+    let stopping = false;
+    const stop = () => {
+      if (stopping || settled) return;
+      stopping = true;
+      clearTimeout(termTimer);
       killGroup(child.pid, 'SIGTERM');
       killTimer = setTimeout(() => {
         killGroup(child.pid, 'SIGKILL');
         drainTimer = setTimeout(conclude, DRAIN_MS);
       }, KILL_GRACE_MS);
+    };
+    function onAbort() {
+      aborted = true;
+      stop();
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    termTimer = setTimeout(() => {
+      timedOut = true;
+      stop();
     }, timeoutMs);
   });
 }
