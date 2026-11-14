@@ -1,4 +1,5 @@
 import type { Note } from '../snapshot.ts';
+import { foldCase } from '../text.ts';
 import { onlyParams, parseLimit, parseQuery, parseScope, scopeName } from '../validate.ts';
 
 export type SearchResult = {
@@ -24,9 +25,9 @@ function lowered(note: Note): Lowered {
   let found = loweredCache.get(note);
   if (!found) {
     found = {
-      name: note.name.toLowerCase(),
-      description: note.description.toLowerCase(),
-      body: note.body.toLowerCase(),
+      name: foldCase(note.name),
+      description: foldCase(note.description),
+      body: foldCase(note.body),
     };
     loweredCache.set(note, found);
   }

@@ -5,7 +5,7 @@ import { memoryIndex } from '../src/ops/index.ts';
 import { memoryRead } from '../src/ops/read.ts';
 import { memoryScopes } from '../src/ops/scopes.ts';
 import { createSnapshots } from '../src/snapshot.ts';
-import { cutToBytes } from '../src/text.ts';
+import { cutToBytes, foldCase } from '../src/text.ts';
 import { fakeStore } from './fake-store.ts';
 
 function note(path: string) {
@@ -140,4 +140,22 @@ test('cutToBytes never splits a multi-byte character', () => {
   assert.equal(cutToBytes(text, 7).text, '世界');
   const emoji = '😀😀😀'; // 4 bytes each
   assert.equal(cutToBytes(emoji, 6).text, '😀');
+});
+
+test('cutToBytes cuts at a line boundary even when it is the first character', () => {
+  assert.deepEqual(cutToBytes('\nabcdef', 4), { text: '', truncated: true });
+});
+
+test('cutToBytes does not leave a dangling CR from a CRLF pair', () => {
+  assert.deepEqual(cutToBytes('a\r\nb\r\nc', 5), { text: 'a\r\nb', truncated: true });
+  assert.deepEqual(cutToBytes('a\r\nb\r\nc', 6), { text: 'a\r\nb', truncated: true });
+  assert.deepEqual(cutToBytes('a\r\nbcdef', 5), { text: 'a', truncated: true });
+});
+
+test('foldCase preserves length and keeps characters whose lower case differs in length', () => {
+  const mixed = 'ABC İ ß 世界 😀 Ω';
+  assert.equal(foldCase(mixed).length, mixed.length);
+  assert.equal(foldCase('ABC'), 'abc');
+  assert.equal(foldCase('İ'), 'İ');
+  assert.equal(foldCase('İSTANBUL'), 'İstanbul');
 });

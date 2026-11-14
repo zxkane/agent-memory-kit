@@ -172,3 +172,15 @@ test('searching 2000 notes of 2 KB stays under 500 ms', async () => {
   assert.equal(out.total, 2000);
   assert.ok(elapsed < 500, `took ${elapsed} ms`);
 });
+
+test('snippet offsets survive characters whose lower case changes length', async () => {
+  const body = `${'İ'.repeat(500)} ${'pad '.repeat(100)}kiwi tail`;
+  const out = await search([n('global/a.md', { body })], { q: 'kiwi' });
+  assert.ok(out.results[0]!.snippet.includes('kiwi tail'));
+});
+
+test('a term with a length-changing capital matches the same text', async () => {
+  const out = await search([n('global/a.md', { body: 'İstanbul notes' })], { q: 'İSTANBUL' });
+  assert.equal(out.total, 1);
+  assert.ok(out.results[0]!.snippet.includes('İstanbul'));
+});

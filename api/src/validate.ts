@@ -1,4 +1,5 @@
 import { ApiError } from './errors.ts';
+import { foldCase } from './text.ts';
 
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
@@ -83,7 +84,7 @@ export function parseQuery(value: unknown): string[] {
     throw invalid('The q field must be 1 to 200 characters.');
   }
   const terms: string[] = [];
-  for (const raw of trimmed.toLowerCase().split(/\s+/)) {
+  for (const raw of foldCase(trimmed).split(/\s+/)) {
     if (raw.length === 1 && raw.charCodeAt(0) < 128) continue;
     if (!terms.includes(raw)) terms.push(raw);
     if (terms.length === 8) break;

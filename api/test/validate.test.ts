@@ -180,3 +180,7 @@ test('onlyParams rejects unknown parameters', () => {
   onlyParams({ scope: 'global', limit: undefined }, ['scope', 'limit']);
   rejects(() => onlyParams({ scope: 'global', [MARKER]: '1' }, ['scope']));
 });
+
+test('parseQuery folds case without changing string length', () => {
+  assert.deepEqual(parseQuery('İSTANBUL Kiwi'), ['İstanbul', 'kiwi']);
+});
