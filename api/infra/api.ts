@@ -2,7 +2,7 @@
 import { RESOURCE_SERVER, ROUTES } from "../src/routes.ts";
 import { bucket } from "./storage.ts";
 import { hubClient, issuer, probeClient, tokenEndpoint } from "./auth.ts";
-import { functionPolicy, logsPolicy } from "./policies.ts";
+import { functionPolicy, logsPolicy, trustPolicy } from "./policies.ts";
 
 export { bucket, tokenEndpoint };
 
@@ -24,6 +24,8 @@ const fn = new sst.aws.Function("MemoryApiFunction", {
   dev: false,
   transform: {
     role: (args: aws.iam.RoleArgs) => {
+      // Set explicitly: the component would otherwise also trust the whole account.
+      args.assumeRolePolicy = JSON.stringify(trustPolicy());
       args.managedPolicyArns = [];
       args.inlinePolicies = $util.all([bucket.arn, logGroup.arn]).apply(([bucketArn, logGroupArn]) => [
         { name: "bucket-access", policy: JSON.stringify(functionPolicy(bucketArn)) },
