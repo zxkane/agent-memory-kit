@@ -10,6 +10,11 @@
 //                                        repo:<owner>/<repository>:ref:refs/heads/main. When set, the same two
 //                                        roles also trust those jobs through the account's existing GitHub
 //                                        OIDC provider, which must exist. Either variable creates the roles.
+//   AGENT_MEMORY_INVOKER_ROLE_ARNS       optional, comma-separated ARNs of the IAM roles that may invoke the
+//                                        function directly, for example the execution role of an AgentCore
+//                                        gateway. When set, the function also answers such invocations.
+//   AGENT_MEMORY_HTTP_API                optional, "on" (the default) or "off". "off" deploys neither the HTTP
+//                                        API nor the token issuer and needs AGENT_MEMORY_INVOKER_ROLE_ARNS.
 export default $config({
   app(input) {
     const region = process.env.AGENT_MEMORY_REGION;
@@ -42,15 +47,24 @@ export default $config({
       args.runtime = "nodejs24.x";
     });
 
+    // Reads and checks the switches before any resource is declared.
+    const { mode } = await import("./infra/mode.ts");
+
     await import("./infra/storage.ts");
-    await import("./infra/auth.ts");
-    const { api, bucket, tokenEndpoint } = await import("./infra/api.ts");
+    const { bucket, fn } = await import("./infra/api.ts");
+
+    const outputs: Record<string, $util.Output<string>> = { bucketName: bucket.bucket };
+    if (mode.httpApi) {
+      const http = await import("./infra/http.ts");
+      outputs.apiUrl = http.api.url;
+      outputs.tokenEndpoint = http.tokenEndpoint;
+    }
+    if (mode.invokerRoleArns.length > 0) {
+      outputs.functionArn = fn.arn;
+    }
+
     await import("./infra/workstation.ts");
 
-    return {
-      apiUrl: api.url,
-      bucketName: bucket.bucket,
-      tokenEndpoint,
-    };
+    return outputs;
   },
 });

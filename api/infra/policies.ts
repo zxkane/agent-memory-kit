@@ -17,6 +17,11 @@ export type PolicyDocument = {
 // Every path segment and the role name must be non-empty.
 const ROLE_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:role\/([\w+=,.@-]+\/)*[\w+=,.@-]+$/;
 
+/** Whether the value is the ARN of one IAM role (no wildcard, no account root, no other kind of principal). */
+export function isRoleArn(value: string): boolean {
+  return ROLE_ARN_RE.test(value);
+}
+
 /**
  * The function's whole permission set. No delete and no list: without s3:ListBucket S3 answers a
  * get of a missing key with 403, which s3Store.get reads as missing (see store.ts).
@@ -156,7 +161,7 @@ export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: str
     throw new Error('Give at least one workstation role ARN or GitHub subject.');
   }
   for (const arn of roleArns) {
-    if (!ROLE_ARN_RE.test(arn)) {
+    if (!isRoleArn(arn)) {
       throw new Error('Each workstation role ARN must be an IAM role ARN.');
     }
   }

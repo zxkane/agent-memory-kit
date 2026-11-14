@@ -6,6 +6,7 @@ import {
   canaryRolePolicy,
   functionPolicy,
   logsPolicy,
+  isRoleArn,
   jobsTrustPolicy,
   trustPolicy,
   workstationTrustPolicy,
@@ -322,5 +323,18 @@ describe('trustPolicy', () => {
 
   it('allows only sts:AssumeRole', () => {
     assert.deepEqual(asList(statements[0].Action), ['sts:AssumeRole']);
+  });
+});
+
+describe('isRoleArn', () => {
+  it('accepts role ARNs with and without a path', () => {
+    assert.equal(isRoleArn(ROLE_A), true);
+    assert.equal(isRoleArn(ROLE_B), true);
+  });
+
+  it('refuses everything else', () => {
+    for (const bad of ['', '*', 'arn:aws:iam::123456789012:root', 'arn:aws:iam::123456789012:role/', 'arn:aws:iam::123456789012:role/a/', 'arn:aws:iam::*:role/a']) {
+      assert.equal(isRoleArn(bad), false, bad);
+    }
   });
 });

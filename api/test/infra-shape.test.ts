@@ -14,13 +14,13 @@ const read = (rel: string): string => readFileSync(new URL(rel, root), 'utf8');
 
 describe('infrastructure source', () => {
   it('has the expected program files', () => {
-    for (const f of ['sst.config.ts', 'infra/policies.ts', 'infra/storage.ts', 'infra/auth.ts', 'infra/api.ts', 'infra/workstation.ts']) {
+    for (const f of ['sst.config.ts', 'infra/policies.ts', 'infra/storage.ts', 'infra/auth.ts', 'infra/api.ts', 'infra/http.ts', 'infra/mode.ts', 'infra/workstation.ts']) {
       assert.ok(files.includes(f), f);
     }
   });
 
   it('builds the routes by iterating ROUTES', () => {
-    const src = read('infra/api.ts');
+    const src = read('infra/http.ts');
     assert.match(src, /import\s*\{[^}]*\bROUTES\b[^}]*\}\s*from/);
     assert.match(src, /for\s*\(\s*const\s+\w+\s+of\s+ROUTES\s*\)|ROUTES\s*\.\s*(forEach|map)\s*\(/);
   });
@@ -52,11 +52,11 @@ describe('infrastructure source', () => {
   const squash = (rel: string): string => read(rel).replace(/\s+/g, '');
 
   it('has exactly one route call, inside the ROUTES loop, with the JWT authorizer and a scope', () => {
-    const src = squash('infra/api.ts');
+    const src = squash('infra/http.ts');
     assert.equal((src.match(/\.route\(/g) ?? []).length, 1);
     assert.doesNotMatch(src, /\.routeUrl\(|\.routePrivate\(/);
     assert.equal((src.match(/\.addAuthorizer\(/g) ?? []).length, 1);
-    const loop = src.match(/for\(const(\w+)ofROUTES\)\{(.*)\}constprefix/);
+    const loop = src.match(/for\(const(\w+)ofROUTES\)\{(.*)\}constparameters/);
     assert.ok(loop, 'ROUTES loop');
     const body = loop[2];
     assert.equal((body.match(/\.route\(/g) ?? []).length, 1);
@@ -92,17 +92,15 @@ describe('infrastructure source', () => {
     assert.equal((squash('infra/auth.ts').match(/explicitAuthFlows:\[\]/g) ?? []).length, 1);
   });
 
-  it('expires noncurrent versions of index/ after one day and keeps the 90-day bucket-wide rule', () => {
+  it('does not version the bucket and keeps one lifecycle rule for abandoned uploads and old versions', () => {
     const src = squash('infra/storage.ts');
+    assert.doesNotMatch(src, /BucketVersioning|versioningConfiguration|dependsOn:\[versioning\]/);
+    assert.equal((src.match(/id:"/g) ?? []).length, 1);
     assert.match(
       src,
-      /id:"expire-old-versions-and-abandoned-uploads",status:"Enabled",filter:\{\},noncurrentVersionExpiration:\{noncurrentDays:90\}/,
+      /rules:\[\{id:"expire-abandoned-uploads-and-old-versions",status:"Enabled",filter:\{\},abortIncompleteMultipartUpload:\{daysAfterInitiation:7\},noncurrentVersionExpiration:\{noncurrentDays:1\},\},\],/,
     );
-    assert.match(
-      src,
-      /id:"expire-index-snapshot-versions",status:"Enabled",filter:\{prefix:"index\/"\},noncurrentVersionExpiration:\{noncurrentDays:1,newerNoncurrentVersions:20\}/,
-    );
-    assert.equal((src.match(/noncurrentVersionExpiration/g) ?? []).length, 2);
+    assert.doesNotMatch(src, /transition|storageClass/i);
   });
 
   it('replaces every underscore of the user pool id in the domain prefix', () => {
@@ -110,7 +108,7 @@ describe('infrastructure source', () => {
   });
 
   it('logs the source IP', () => {
-    assert.match(read('infra/api.ts'), /\$context\.identity\.sourceIp/);
+    assert.match(read('infra/http.ts'), /\$context\.identity\.sourceIp/);
   });
 
   it('creates the two workstation roles and their parameters only inside the branch that requires one of the two variables', () => {
@@ -170,5 +168,89 @@ describe('infrastructure source', () => {
   it('keeps the workstation role variable out of the storage program and loads workstation.ts', () => {
     assert.doesNotMatch(read('infra/storage.ts'), /WORKSTATION_ROLE_ARNS/);
     assert.match(read('sst.config.ts'), /import\("\.\/infra\/workstation\.ts"\)/);
+  });
+
+  describe('deployment switches', () => {
+    it('parses the two variables in mode.ts only, before any resource', () => {
+      assert.match(read('infra/mode.ts'), /AGENT_MEMORY_HTTP_API/);
+      assert.match(read('infra/mode.ts'), /AGENT_MEMORY_INVOKER_ROLE_ARNS/);
+      for (const f of files.filter((f) => f !== 'infra/mode.ts')) {
+        assert.doesNotMatch(read(f), /process\.env\.AGENT_MEMORY_(HTTP_API|INVOKER_ROLE_ARNS)/, f);
+      }
+      const run = squash('sst.config.ts');
+      const modeAt = run.indexOf('import("./infra/mode.ts")');
+      assert.ok(modeAt > 0, 'mode.ts loaded by sst.config.ts');
+      assert.ok(modeAt < run.indexOf('import("./infra/storage.ts")'), 'mode before storage');
+    });
+
+    it('loads the HTTP API program, and with it the token issuer, only when the HTTP API is on', () => {
+      const cfg = squash('sst.config.ts');
+      assert.equal((cfg.match(/import\("\.\/infra\/http\.ts"\)/g) ?? []).length, 1);
+      assert.equal((cfg.match(/import\("\.\/infra\/auth\.ts"\)/g) ?? []).length, 0);
+      assert.match(cfg, /if\(mode\.httpApi\)\{[^}]*import\("\.\/infra\/http\.ts"\)/);
+      assert.doesNotMatch(read('infra/api.ts'), /auth\.ts|sst\.aws\.ApiGatewayV2|addAuthorizer|\.route\(/);
+      assert.match(read('infra/http.ts'), /from\s+"\.\/auth\.ts"/);
+      assert.doesNotMatch(read('infra/http.ts'), /new sst\.aws\.Function/);
+    });
+
+    it('keeps the HTTP API, authorizer, routes, access log and their parameters out of the function program', () => {
+      const api = read('infra/api.ts');
+      for (const name of ['ApiGatewayV2', 'accessLog', 'gateway/url', 'cognito/']) {
+        assert.ok(!api.includes(name), name);
+      }
+      const http = read('infra/http.ts');
+      for (const name of ['ApiGatewayV2', 'accessLog', 'addAuthorizer', 'gateway/url', 'cognito/issuer', 'cognito/hub/client-secret']) {
+        assert.ok(http.includes(name), name);
+      }
+    });
+
+    it('creates the invoker permissions, the variable and the parameter only with invoker roles', () => {
+      const src = squash('infra/api.ts');
+      assert.equal((src.match(/newaws\.lambda\.Permission\(/g) ?? []).length, 1);
+      assert.equal((src.match(/DIRECT_INVOCATION/g) ?? []).length, 1);
+      assert.equal((src.match(/function\/arn/g) ?? []).length, 1);
+      const branch = src.match(/if\(mode\.invokerRoleArns\.length>0\)\{(.*)\}/);
+      assert.ok(branch, 'branch on invoker roles');
+      const body = branch[1] as string;
+      assert.match(body, /newaws\.lambda\.Permission\(/);
+      assert.match(body, /action:"lambda:InvokeFunction"/);
+      assert.match(body, /principal:\w+/);
+      assert.match(body, /function:fn\.name/);
+      assert.match(body, /function\/arn/);
+      assert.doesNotMatch(body, /sourceArn|principal:"\*"|service/i);
+      assert.match(
+        src,
+        /environment:\{BUCKET:bucket\.bucket,\.\.\.\(mode\.invokerRoleArns\.length>0\?\{DIRECT_INVOCATION:"on"\}:\{\}\)\}/,
+      );
+    });
+
+    it('names each permission by index, not by the ARN', () => {
+      assert.match(squash('infra/api.ts'), /newaws\.lambda\.Permission\(`MemoryApiInvoker\$\{index\}`/);
+    });
+
+    it('publishes bucket/name in every mode and leaves the HTTP parameters to http.ts', () => {
+      assert.match(squash('infra/api.ts'), /publishParameter\("bucket\/name"/);
+      assert.match(squash('infra/http.ts'), /\{key:"gateway\/url"/);
+    });
+
+    it('creates the canary role, its policy and its parameter only with the HTTP API', () => {
+      const src = squash('infra/workstation.ts');
+      const canary = src.match(/if\(mode\.httpApi\)\{(.*?)\}newaws\.ssm\.Parameter\("ParamBridgeRoleArn"/);
+      assert.ok(canary, 'branch on mode.httpApi inside the role branch');
+      const body = canary[1] as string;
+      assert.match(body, /newaws\.iam\.Role\("WorkstationCanaryRole"/);
+      assert.match(body, /newaws\.iam\.RolePolicy\("WorkstationCanaryRolePolicy"/);
+      assert.match(body, /canary\/role-arn/);
+      assert.doesNotMatch(src.replace(body, ''), /Canary/);
+      assert.match(src, /newaws\.iam\.Role\("WorkstationBridgeRole"/);
+    });
+
+    it('returns the outputs of the mode', () => {
+      const src = squash('sst.config.ts');
+      assert.match(src, /bucketName:bucket\.bucket/);
+      assert.match(src, /outputs\.functionArn=fn\.arn/);
+      assert.match(src, /apiUrl/);
+      assert.match(src, /tokenEndpoint/);
+    });
   });
 });

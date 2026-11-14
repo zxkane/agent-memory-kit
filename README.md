@@ -770,7 +770,7 @@ A clone that still has the old history refuses to sync with *remote history was 
 **With the bridge, the bucket holds a copy too.** A note that the secret scan did not flag was uploaded to `mem/` and into the search snapshot `index/mem.json`, and the Memory API served it to agents, which may have copied it into notes of their own (`agents/` in the bucket, and from there the mirror repository). Rewriting the notes repository does not remove any of that. After step 4, on the bridge machine (the one that runs `up`):
 
 5. Let its next sync run (or run `workstation/run.sh sync` once): the clone is new, so it does a full upload that replaces the current objects and deletes the ones that no longer exist.
-6. Delete the noncurrent versions of the affected `mem/` keys and of `index/mem.json` in the bucket, by hand. The bucket is versioned: noncurrent versions are kept for 90 days, those of `index/` for one day, except that the 20 newest noncurrent versions of `index/` are kept whatever their age (`api/infra/storage.ts`). Without this the old text stays readable to anyone who may read old versions until then.
+6. Check the bucket for old versions of the affected `mem/` keys and of `index/mem.json`. A bucket this release created is not versioned, so the upload of step 5 replaced the text for good. A bucket that an earlier release versioned keeps its old versions until the lifecycle rule has removed them, about a day after the upgrade (see "Deploy"); delete them by hand if you cannot wait. Until then anyone who may read old versions can still read the old text.
 7. Search `agents/` in the bucket and the mirror repository for copies (`git log -p` in the mirror clone shows whether one was mirrored), remove them through their own means, and rewrite the mirror repository's history the same way if one was committed.
 8. Rotate the secret in any case; this section only limits who can still read it.
 
@@ -828,10 +828,10 @@ The same five operations are also available to a gateway that invokes the functi
 ### Limits and trust
 
 - The API reads a replica of the workstation notes and can write only under `agents/<agent>/`. It has no delete operation.
-- The API cannot tell callers apart. The gateway presents one machine identity, so any caller the gateway lets use `memory_write` can write to any agent's scope, including replacing another agent's note. Which callers may use which tool is the gateway's job. Earlier versions of a replaced note remain available through the bucket's object versions for 90 days.
+- The API cannot tell callers apart. The gateway presents one machine identity, so any caller the gateway lets use `memory_write` can write to any agent's scope, including replacing another agent's note. Which callers may use which tool is the gateway's job. The bucket is not versioned, so a note that is replaced is gone from the bucket. The notes under `mem/` are a copy of the notes repository, and the agents' notes are mirrored into the second repository (see "Mirror the agent notes (mirror repository)"), so a replaced note can be recovered only from there.
 - The function's role trusts only the Lambda service (SST would otherwise also add the account as a trusted principal, so the trust policy is set explicitly).
 - The function has no permission to list the bucket. S3 therefore reports a missing object as "access denied" instead of "not found", and the API treats both as "not found" (404 `not_found` for a read). This is safe for writes: every create is conditional on the object not existing and every update on its current version, so a read that was denied for an object that does exist makes the following write fail as a conflict (409) instead of overwriting it.
-- Two writes of the same note name at the same moment can leave the note file and the search snapshot holding different text (the file from one request, the snapshot from the other) until the next write of that note. Reading the note and searching it may then disagree briefly. No data is lost: S3 keeps the earlier versions.
+- Two writes of the same note name at the same moment can leave the note file and the search snapshot holding different text (the file from one request, the snapshot from the other) until the next write of that note. Reading the note and searching it may then disagree briefly. The next write of that note, or a re-upload by the bridge, makes them agree again.
 - Each agent scope holds at most 200 notes and about 240 KB of text, and there are at most 16 agent scopes. A write that would exceed the first two limits fails with `scope_full`; a write that would exceed the number of scopes or the total size of the agent store fails with `store_full`. There is no way to free space through the API, because it cannot delete. An operator removes notes in the bucket directly.
 - Credentials: a note, a name or a description that looks like a credential is refused with `secret_detected`. This is a safety net with a fixed list of patterns, so a credential in an unusual shape can pass. It is not a guarantee.
 - Notes are data, not instructions. Anything an agent reads through the API was written by a person or an agent and may be wrong or hostile.
@@ -850,11 +850,28 @@ AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>
 
 The infrastructure program is not type-checked in CI, so run `npm run typecheck:infra` before each deploy.
 
+Two variables choose what the deployment contains:
+
+- `AGENT_MEMORY_HTTP_API` is `on` (the default, also when it is not set) or `off`. `off` deploys no HTTP API, no authorizer, no routes and no token issuer (no user pool, domain, resource server or client), and none of the parameters `gateway/url` and `cognito/*`. Any other value stops the deployment.
+- `AGENT_MEMORY_INVOKER_ROLE_ARNS` is a comma-separated list of the ARNs of IAM roles (each must be a role ARN; a wildcard, an account root and a service are refused, and so is anything else). Each role gets a resource permission `lambda:InvokeFunction` on the function (one per role, with that role as principal and no wildcard). The function then answers direct invocations (`DIRECT_INVOCATION=on`; the variable is set only together with invoker roles), and the deployment publishes the parameter `/agent-memory/<stage>/mcp/function/arn` and the output `functionArn`. Without the variable there is no permission, no such variable and no such parameter.
+
+`AGENT_MEMORY_HTTP_API=off` without `AGENT_MEMORY_INVOKER_ROLE_ARNS` stops the deployment before anything is created, because the function would have no way in. The three set-ups:
+
+| Set-up | `AGENT_MEMORY_HTTP_API` | `AGENT_MEMORY_INVOKER_ROLE_ARNS` | Outputs |
+|---|---|---|---|
+| HTTP API only (the default) | not set or `on` | not set | `apiUrl`, `bucketName`, `tokenEndpoint` |
+| HTTP API and direct invocation | not set or `on` | the roles | the same, and `functionArn` |
+| Direct invocation only | `off` | the roles | `bucketName`, `functionArn` |
+
+Every later deploy of the stage must pass the same variables: a deploy without `AGENT_MEMORY_INVOKER_ROLE_ARNS` removes the permissions and the parameter, and switching `AGENT_MEMORY_HTTP_API` removes or creates the HTTP API and the token issuer, which changes the token endpoint and the client credentials. In every set-up the function keeps its own role, with the same two inline policies, and no Lambda function URL exists.
+
+With `AGENT_MEMORY_HTTP_API=off` the canary role and the parameter `canary/role-arn` are not created, because the canary reads parameters that do not exist then. The bridge role and `bridge/role-arn` are not affected.
+
 `AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of the ARNs of the workstation's own IAM roles (the instance role of the machine that runs the bridge and the canary). When it is set (or `AGENT_MEMORY_GITHUB_SUBJECTS` is), the deployment creates two roles, `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary`, and nothing is added to the bucket policy, which holds only the TLS-only deny. Each role has a maximum session of one hour, no managed policy and one inline policy, and its trust policy names only the ARNs in the variable (each must be an IAM role ARN; a wildcard is refused), plus the GitHub jobs of `AGENT_MEMORY_GITHUB_SUBJECTS` when that is set (below). Every ARN in the variable must name a role that exists: IAM refuses a trust policy that names a role it cannot find, and the deployment stops at the creation of the role ("Invalid principal in policy").
 
 - The bridge role may write and delete objects under `mem/`; write `index/mem.json`; read and write `index/bridge.json`; read objects under `agents/`; and list the bucket with the prefixes `mem/` and `agents/`. It cannot write or delete anything else, including `agents/` and `index/agents.json`, which only the API writes.
-- The canary role may read (`ssm:GetParameter`) exactly four parameters of the stage: `gateway/url`, `cognito/token-endpoint`, `cognito/probe/client-id` and `cognito/probe/client-secret`, under `/agent-memory/<stage>/mcp/`. It cannot read the hub client's secret. The default key of Parameter Store lets every principal of the account decrypt, so this permission is the whole grant.
-- The ARNs are published as the plain parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and `/agent-memory/<stage>/mcp/canary/role-arn`. Copy them into the `roleArn` of the bridge and canary blocks.
+- The canary role (only with the HTTP API) may read (`ssm:GetParameter`) exactly four parameters of the stage: `gateway/url`, `cognito/token-endpoint`, `cognito/probe/client-id` and `cognito/probe/client-secret`, under `/agent-memory/<stage>/mcp/`. It cannot read the hub client's secret. The default key of Parameter Store lets every principal of the account decrypt, so this permission is the whole grant.
+- The ARNs are published as the plain parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and, with the HTTP API, `/agent-memory/<stage>/mcp/canary/role-arn`. Copy them into the `roleArn` of the bridge and canary blocks.
 - Within one account, a role named directly as the principal of a trust policy can assume the role without any identity policy of its own, so the workstation's role needs no change; the exception is an explicit deny, a permissions boundary or an organization policy that forbids it.
 
 `AGENT_MEMORY_GITHUB_SUBJECTS` optionally holds a comma-separated list of exact GitHub Actions subjects, so that the two roles also trust GitHub Actions jobs (see "Run the bridge and the canary from GitHub Actions (optional)"). A subject is the `sub` claim of the job's OIDC token, and here it names one repository and one branch: `repo:<owner>/<repository>:ref:refs/heads/<branch>` (for example `repo:<owner>/<repository>:ref:refs/heads/main`). Every other form is refused: a wildcard, a pull request, a tag and a GitHub environment (a job that names an environment gets an environment subject from any branch unless the environment itself restricts branches, so that subject is not bound to a branch). A branch name may use only letters, digits, `.`, `_`, `-` and `/`. Subjects follow GitHub's default subject format; a repository or organisation that customised the subject claim sends another format and is refused. A subject is compared exactly, including upper and lower case. **A subject binds a repository and a branch, not a workflow**: every workflow on that branch that asks for `id-token: write` can assume the roles, whatever triggers it. **Every listed subject may assume both roles** (the bridge role and the canary role), so list only repositories you would trust with both. **A subject names a repository by `<owner>/<name>`, not by an ID.** After the repository or its owner is renamed, transferred or deleted, whoever registers the old `<owner>/<name>` gets tokens with that subject and can assume both roles. Remove or replace the subject and deploy again right after a rename, a transfer or a deletion, before the old name is free for others where possible; this also restores a job that a rename locked out. The trust policy gets one more statement, `sts:AssumeRoleWithWebIdentity` for the account's OIDC provider, with the conditions `token.actions.githubusercontent.com:aud` equal to `sts.amazonaws.com` and `token.actions.githubusercontent.com:sub` equal to one of the subjects. The deployment names the provider and does not create it. **The account must already have the OIDC provider for `token.actions.githubusercontent.com`**; without it no job can assume the roles, and the deployment may be refused when it creates them. To check, run `aws iam list-open-id-connect-providers`: one ARN must end in `oidc-provider/token.actions.githubusercontent.com`. Either variable alone creates the two roles and the two parameters; with both, each role trusts both kinds of principal. With only the role ARNs the deployment is the same as before. Every later deploy of the stage must pass every variable that is in use. A deploy without both variables deletes the two roles; a deploy that passes the role ARNs but not the subjects removes the GitHub trust without a warning, and the jobs then fail to assume the roles.
@@ -863,13 +880,16 @@ Without either variable the deployment creates neither role, no role-ARN paramet
 
 The deployment creates:
 
-- a versioned bucket that holds the replica and the agent scopes; superseded versions expire after 90 days (after 1 day for the search snapshots under `index/`, which are rewritten on every write; the 20 most recent earlier versions of each search snapshot are kept for up to 90 days);
-- a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes; read-only on `prod`), and two scopes, `agent-memory/read` and `agent-memory/write`;
-- an HTTP API with one route per operation and a function behind it;
-- SSM parameters under `/agent-memory/<stage>/mcp/`: `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string) and `bucket/name`;
-- with `AGENT_MEMORY_WORKSTATION_ROLE_ARNS` or `AGENT_MEMORY_GITHUB_SUBJECTS`, the two roles `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary` and the two parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and `/agent-memory/<stage>/mcp/canary/role-arn`.
+- a bucket that holds the replica and the agent scopes. It is not versioned: a note that is replaced is gone from the bucket, and the copies in the notes repository and the mirror repository are the way back. One lifecycle rule aborts incomplete multipart uploads after 7 days and expires noncurrent versions after 1 day. **A bucket that an earlier release versioned:** the upgrade removes the versioning resource, which suspends versioning on that bucket (S3 cannot turn it off again). New writes then replace the object in place, and the lifecycle rule removes the old versions about a day later;
+- with the HTTP API, a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes; read-only on `prod`), and two scopes, `agent-memory/read` and `agent-memory/write`;
+- with the HTTP API, an HTTP API with one route per operation; the function behind it exists in every set-up;
+- SSM parameters under `/agent-memory/<stage>/mcp/`: `bucket/name` in every set-up; with the HTTP API also `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string); with invoker roles `function/arn`;
+- with `AGENT_MEMORY_INVOKER_ROLE_ARNS`, one invoke permission per role;
+- with `AGENT_MEMORY_WORKSTATION_ROLE_ARNS` or `AGENT_MEMORY_GITHUB_SUBJECTS`, the two roles `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary` (the canary only with the HTTP API) and the two parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and `/agent-memory/<stage>/mcp/canary/role-arn`.
 
 ### Check a deployment
+
+This applies to a deployment with the HTTP API only: a deployment with `AGENT_MEMORY_HTTP_API=off` has no URL, no token endpoint and no probe client, so this script and the canary have nothing to check. For direct invocation use the check by hand under "Register the API with an MCP gateway".
 
 After a deploy, from `api/`:
 
@@ -892,7 +912,7 @@ On the `prod` stage the probe client must be read-only: if a token with the writ
 
 ### Register the API with an MCP gateway
 
-A gateway that turns an OpenAPI description into tools can use `api/openapi.json`. Print the document with the stage's URL filled in:
+A gateway that turns an OpenAPI description into tools can use `api/openapi.json` and the HTTP API (a deployment with `AGENT_MEMORY_HTTP_API` not `off`). Print the document with the stage's URL filled in:
 
 ```
 node scripts/render-openapi.ts "$(aws ssm get-parameter --name /agent-memory/<stage>/mcp/gateway/url --query Parameter.Value --output text)"
@@ -900,9 +920,23 @@ node scripts/render-openapi.ts "$(aws ssm get-parameter --name /agent-memory/<st
 
 Register the output as the gateway target, with the OAuth client-credentials flow, the stage's `cognito/token-endpoint`, the `hub` client's ID and secret, and the scopes `agent-memory/read agent-memory/write`. To give some callers read access only, request only `agent-memory/read` for them or leave `memory_write` out of their tools at the gateway.
 
+**A gateway in the same account, without the HTTP API.** An Amazon Bedrock AgentCore gateway can call the function directly. Register the function as a Lambda target and give the target the tool definitions of `api/gateway-tools.json`. The gateway calls the function with its own execution role, so put that role's ARN into `AGENT_MEMORY_INVOKER_ROLE_ARNS` and deploy (with `AGENT_MEMORY_HTTP_API=off` if you want no HTTP API at all); within one account a permission on the function that names the role is enough. The function ARN is the output `functionArn` and the parameter `function/arn`. The tool name arrives as `<target name>___<tool name>` in the Lambda client context.
+
+**Who may call which tool is then the gateway's decision.** The function trusts every invoker it was deployed for: it cannot tell the callers of the gateway apart, and a role named in `AGENT_MEMORY_INVOKER_ROLE_ARNS` can use every tool, including `memory_write` into any agent's scope. List only roles you would trust with that.
+
+A check by hand, from a shell whose credentials belong to one of the invoker roles (or may assume it):
+
+```
+CONTEXT=$(printf '%s' '{"custom":{"bedrockAgentCoreToolName":"check___memory_scopes"}}' | base64 | tr -d '\n')
+aws lambda invoke --function-name <function ARN> --client-context "$CONTEXT" \
+  --payload '{}' --cli-binary-format raw-in-base64-out out.json && cat out.json
+```
+
+A working deployment answers with a JSON object that holds a `scopes` array. Other principals of the account that have their own `lambda:InvokeFunction` permission in an identity policy can invoke the function too, but without the deployment's `DIRECT_INVOCATION=on` the function answers them with `forbidden`; with it, every invoker is trusted the same way, so keep that permission out of broad roles.
+
 ### Cost
 
-You pay per request: API Gateway requests, function invocations and run time, and bucket requests and storage, plus the log storage. A stage that gets no requests costs nothing for the API and the function. The bucket's storage and the token issuer's own charges depend on current AWS pricing; check it rather than relying on a figure written here. The API Gateway stage limits traffic to a small burst, so a runaway caller is throttled.
+You pay per request: API Gateway requests, function invocations and run time, and bucket requests and storage, plus the log storage. A stage that gets no requests costs nothing for the API and the function. Cognito bills only successful token requests and an unused HTTP API costs nothing, so the default set-up costs nothing while it is idle. With direct invocation only there are no token requests and no HTTP API requests at all: you pay for the invocations, the run time, the bucket and the logs. The bucket's storage and the token issuer's own charges depend on current AWS pricing; check it rather than relying on a figure written here. The API Gateway stage limits traffic to a small burst, so a runaway caller is throttled.
 
 ### Remove
 

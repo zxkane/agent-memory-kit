@@ -1,5 +1,6 @@
 /// <reference path="../.sst/platform/config.d.ts" />
 import { bucket, parameterResources } from "./api.ts";
+import { mode } from "./mode.ts";
 import { bridgeRolePolicy, canaryRolePolicy, jobsTrustPolicy } from "./policies.ts";
 
 const roleArns = (process.env.AGENT_MEMORY_WORKSTATION_ROLE_ARNS ?? "")
@@ -37,32 +38,36 @@ if (roleArns.length > 0 || githubSubjects.length > 0) {
     policy: bucket.arn.apply((arn) => JSON.stringify(bridgeRolePolicy(arn))),
   });
 
-  // The four parameters the canary's checks read, and no others (not the hub client's secret).
-  const canaryParameterArns = [
-    "gateway/url",
-    "cognito/token-endpoint",
-    "cognito/probe/client-id",
-    "cognito/probe/client-secret",
-  ].map((key) => parameterResources[key].arn);
+  // The canary reads the HTTP API's parameters, so it exists only with the HTTP API.
+  if (mode.httpApi) {
+    // The four parameters the canary's checks read, and no others (not the hub client's secret).
+    const canaryParameterArns = [
+      "gateway/url",
+      "cognito/token-endpoint",
+      "cognito/probe/client-id",
+      "cognito/probe/client-secret",
+    ].map((key) => parameterResources[key].arn);
 
-  const canaryRole = new aws.iam.Role("WorkstationCanaryRole", {
-    name: `${$app.name}-${$app.stage}-canary`,
-    maxSessionDuration: 3600,
-    assumeRolePolicy: trustDocument,
-  });
-  new aws.iam.RolePolicy("WorkstationCanaryRolePolicy", {
-    role: canaryRole.name,
-    policy: $util.all(canaryParameterArns).apply((arns) => JSON.stringify(canaryRolePolicy(arns))),
-  });
+    const canaryRole = new aws.iam.Role("WorkstationCanaryRole", {
+      name: `${$app.name}-${$app.stage}-canary`,
+      maxSessionDuration: 3600,
+      assumeRolePolicy: trustDocument,
+    });
+    new aws.iam.RolePolicy("WorkstationCanaryRolePolicy", {
+      role: canaryRole.name,
+      policy: $util.all(canaryParameterArns).apply((arns) => JSON.stringify(canaryRolePolicy(arns))),
+    });
+
+    new aws.ssm.Parameter("ParamCanaryRoleArn", {
+      name: `${prefix}/canary/role-arn`,
+      type: "String",
+      value: canaryRole.arn,
+    });
+  }
 
   new aws.ssm.Parameter("ParamBridgeRoleArn", {
     name: `${prefix}/bridge/role-arn`,
     type: "String",
     value: bridgeRole.arn,
-  });
-  new aws.ssm.Parameter("ParamCanaryRoleArn", {
-    name: `${prefix}/canary/role-arn`,
-    type: "String",
-    value: canaryRole.arn,
   });
 }
