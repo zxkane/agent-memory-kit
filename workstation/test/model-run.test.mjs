@@ -547,3 +547,16 @@ test('T1: the organize prompt leaves frontmatter alone, never translates, and gi
   assert.ok(on.includes('then move the notes that belong in global/;'));
   assert.ok(!off.includes('then move the notes'));
 });
+
+test('T2: the repair prompt carries the problems, the reference folder and the whole first task', () => {
+  const task = renderPrompt('organize', { hasGlobal: false });
+  const text = renderPrompt('repair', { problems: '- notes/b.md: a problem', original: '/w/p/original', task, hasGlobal: false });
+  assert.ok(text.includes('- notes/b.md: a problem'));
+  assert.ok(text.includes('/w/p/original holds the notes of notes/ as they were before your previous run. It is for reading only'));
+  assert.ok(text.endsWith(`${task}\n`) || text.endsWith(task));
+  assert.ok(!text.includes('global/'));
+  assert.ok(!text.includes('{{'));
+  assert.ok(renderPrompt('repair', { problems: 'x', original: 'o', task: 't', hasGlobal: true }).includes('global/ the copy of the global folder'));
+  const raw = readFileSync(join(promptsDir, 'repair.md'), 'utf8');
+  assert.ok(!raw.includes('/home/') && !raw.includes('@'));
+});

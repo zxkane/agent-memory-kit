@@ -6,7 +6,7 @@ import {
   chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NOTE_NAME_RE } from '../lib/notes.mjs';
 import { runSync } from '../lib/sync-engine.mjs';
@@ -32,9 +32,17 @@ const args = process.argv.slice(2);
 const addDirs = args.flatMap((a, i) => (a === '--add-dir' ? [args[i + 1]] : []));
 let digest = null;
 for (const d of addDirs) { try { digest = readFileSync(join(d, 'digest.md'), 'utf8'); } catch {} }
-appendFileSync(process.env.FAKE_CALLS, JSON.stringify({ scope, cwd, args, digest, pid: process.pid }) + '\\n');
+// The calls made before this one for the same scope: a second call follows the "second" instruction.
+let earlier = 0;
+try {
+  earlier = readFileSync(process.env.FAKE_CALLS, 'utf8').split('\\n').filter(Boolean).filter((l) => JSON.parse(l).scope === scope).length;
+} catch {}
+const original = join(cwd, basename(cwd) === 'notes' ? '../original' : 'original');
+appendFileSync(process.env.FAKE_CALLS, JSON.stringify({ scope, cwd, args, digest, pid: process.pid, originalSeen: existsSync(original) }) + '\\n');
 const all = JSON.parse(readFileSync(process.env.FAKE_INSTRUCTIONS, 'utf8'));
-const ins = all[scope] ?? all['*'] ?? {};
+const first = all[scope] ?? all['*'] ?? {};
+const ins = earlier > 0 && first.second ? first.second : first;
+for (const [from, to] of Object.entries(ins.copies ?? {})) writeFileSync(join(cwd, to), readFileSync(join(cwd, from)));
 for (const [rel, text] of Object.entries(ins.writes ?? {})) {
   mkdirSync(dirname(join(cwd, rel)), { recursive: true });
   writeFileSync(join(cwd, rel), text);
@@ -196,7 +204,7 @@ test('organize merges a duplicate, commits it with a report and records the stat
   assert.ok(!Number.isNaN(Date.parse(entry.lastOrganize)));
   assert.equal(entry.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
   assert.deepEqual({ ...entry.lastOutcome, at: undefined },
-    { kind: 'organize', at: undefined, outcome: 'applied', stopReason: 'completed', costUsd: 0.25, denials: 0 });
+    { kind: 'organize', at: undefined, outcome: 'applied', stopReason: 'completed', costUsd: 0.25, denials: 0, repairs: 0 });
   assert.equal(statSync(f.stateFile()).mode & 0o777, 0o600);
   assert.deepEqual(readdirSync(f.workRoot()), []);
 
@@ -363,7 +371,7 @@ test('a rejected result changes nothing in the clone; organize records the scope
   const before = treeText(f.repo);
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /^organize p: rejected, nothing applied \(2 rule violation\(s\)\), USD 0\.25, stopped: completed$/m);
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(2 rule violation\(s\)\), USD 0\.50, stopped: completed, one repair run \(2 problem\(s\) found first\)$/m);
   assert.match(r.stdout, /^ {2}- notes\/b\.md: the target note does not exist$/m);
   assert.equal(f.head(), head);
   assert.equal(treeText(f.repo), before);
@@ -375,7 +383,7 @@ test('a rejected result changes nothing in the clone; organize records the scope
   assert.equal(entry.lastOutcome.outcome, 'rejected');
   assert.deepEqual(readdirSync(f.workRoot()), []);
   f.run('organize');
-  assert.equal(f.calls().length, 1);
+  assert.equal(f.calls().length, 2, 'the first run and its one repair run; the second organize run calls no model');
 });
 
 test('a rejected extract keeps its previous lastExtract', (t) => {
@@ -921,7 +929,7 @@ test('extract orders by lastExtractTried: a project rejected every run does not 
   assert.ok(!Number.isNaN(Date.parse(p.lastExtractTried)));
   r = f.run('extract');
   assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'q']);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'p', 'q']);
   p = f.readState().projects.p;
   assert.equal(p.lastExtract, undefined);
   assert.ok(f.readState().projects.q.lastExtractTried);
@@ -1666,4 +1674,171 @@ test('T1: the organize prompt shows the index numbers from the snapshot only whe
   const prompts = Object.fromEntries(f.calls().map((c) => [c.scope, c.args[c.args.indexOf('-p') + 1]]));
   assert.ok(prompts.big.includes(`MEMORY.md is over its limit now: 205 lines and ${Buffer.byteLength(big)} bytes`));
   assert.ok(!prompts.p.includes('over its limit now'));
+});
+
+// T2: one repair run after a result that the rules reject.
+const DETAILS = Array.from({ length: 20 }, (_, i) => `detail${String(i).padStart(2, '0')}word`).join(' ');
+function repairProject(f) {
+  f.seed({
+    'projects/p/MEMORY.md': index('a.md', 'b.md'),
+    'projects/p/a.md': note('a', 'Deploys', 'Deploys go through staging.'),
+    'projects/p/b.md': note('b', 'Details', DETAILS),
+  });
+}
+// The first result retires b.md into a note that does not hold its content: rejected.
+const lossyFirst = () => ({
+  writes: {
+    'notes/a.md': note('a', 'Deploys', 'Deploys go through staging first.'),
+    'notes/b.md': 'MOVED TO [[a]]\n',
+    'notes/MEMORY.md': index('a.md'),
+  },
+});
+// The repair restores b.md and its index line from original/.
+const restoreSecond = () => ({ copies: { 'original/b.md': 'notes/b.md' }, writes: { 'notes/MEMORY.md': index('a.md', 'b.md') } });
+const LOSS_LINE = /notes\/b\.md: most of this note's content is missing after the run/;
+const consolidateCommits = (f) => f.subjects().filter((x) => x.startsWith('consolidate(')).length;
+
+test('T2: a rejected result is repaired once, with original/, and applied', (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  f.instruct({ p: { ...lossyFirst(), second: restoreSecond() } });
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied, 1 change\(s\), USD 0\.50, stopped: completed, one repair run \(1 problem\(s\) found first\)$/m);
+  const calls = f.calls();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].originalSeen, false);
+  assert.equal(calls[1].originalSeen, true);
+  const repairPrompt = calls[1].args[calls[1].args.indexOf('-p') + 1];
+  assert.match(repairPrompt, LOSS_LINE);
+  assert.ok(repairPrompt.includes(calls[0].args[calls[0].args.indexOf('-p') + 1]), 'the organize task is included');
+  assert.equal(calls[1].args[calls[1].args.indexOf('--max-budget-usd') + 1], '4.75');
+  assert.equal(consolidateCommits(f), 1);
+  assert.match(readFileSync(join(f.repo, 'projects/p/a.md'), 'utf8'), /staging first/);
+  assert.equal(readFileSync(join(f.repo, 'projects/p/b.md'), 'utf8'), note('b', 'Details', DETAILS));
+  const text = readFileSync(join(f.repo, `_reports/${today()}-alpha-organize-p.md`), 'utf8');
+  assert.match(text, /^- Model: test-model; turns: 8; cost: USD 0\.50; stopped: completed; denials: 0$/m);
+  assert.match(text, /^- Repair: one repair run; the first check found 1 problem\(s\)$/m);
+  const outcome = f.readState().projects.p.lastOutcome;
+  assert.equal(outcome.repairs, 1);
+  assert.equal(outcome.costUsd, 0.5);
+  assert.deepEqual(readdirSync(f.workRoot()), []);
+});
+
+test('T2: a repair that is still invalid is rejected with the second check\'s violations; no third run', (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  f.instruct({ p: { ...lossyFirst(), second: { writes: { 'notes/a.md': '' } } } });
+  const head = f.head();
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(2 rule violation\(s\)\), USD 0\.50, stopped: completed, one repair run \(1 problem\(s\) found first\)$/m);
+  assert.match(r.stdout, /^ {2}- notes\/a\.md: a note may not be emptied; retire it instead$/m);
+  assert.equal(f.calls().length, 2);
+  assert.equal(f.head(), head);
+  assert.equal(f.readState().projects.p.lastOutcome.repairs, 1);
+});
+
+test('T2: a repair run that does not complete leaves the first check\'s violations', (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  f.instruct({ p: { ...lossyFirst(), second: { silent: true } } });
+  const r = f.run('organize');
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(1 rule violation\(s\)\), USD unknown, stopped: no-result, one repair run \(1 problem\(s\) found first\)$/m);
+  assert.match(r.stdout, LOSS_LINE);
+  assert.equal(f.calls().length, 2);
+  assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
+});
+
+test('T2: no repair when the first run did not complete, when too little budget is left, or when a note changed meanwhile', (t) => {
+  const cases = {
+    'not completed': (f) => f.instruct({ p: { ...lossyFirst(), result: { subtype: 'error_max_turns', is_error: true }, second: restoreSecond() } }),
+    'budget left under 0.10': (f) => {
+      f.setConfig({ maxBudgetUsd: 0.3 });
+      f.instruct({ p: { ...lossyFirst(), second: restoreSecond() } });
+    },
+    'changed meanwhile': (f) => {
+      f.instruct({ p: { ...lossyFirst(), liveWrites: { [join(f.repo, 'projects/p/new.md')]: note('new', 'N', 'A session wrote this.') }, second: restoreSecond() } });
+    },
+  };
+  for (const [name, prepare] of Object.entries(cases)) {
+    const f = fixture(t);
+    repairProject(f);
+    prepare(f);
+    const r = f.run('organize');
+    assert.equal(f.calls().length, 1, name);
+    assert.doesNotMatch(r.stdout, /repair run/, name);
+    assert.equal(f.readState().projects.p.lastOutcome.repairs, 0, name);
+  }
+});
+
+test('T2: a file the repair run writes into original/ never reaches the clone', (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  const second = restoreSecond();
+  second.writes['original/x.md'] = note('x', 'X', 'Written into the reference copy.');
+  f.instruct({ p: { ...lossyFirst(), second } });
+  const r = f.run('organize');
+  assert.match(r.stdout, /^organize p: applied/m);
+  assert.equal(existsSync(join(f.repo, 'projects/p/x.md')), false);
+  assert.ok(!f.remoteFiles().some((x) => x.endsWith('/x.md')));
+  assert.deepEqual(readdirSync(f.workRoot()), []);
+});
+
+test('T2: a signal during the repair run ends the run as aborted; nothing is applied', async (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  f.instruct({ p: { ...lossyFirst(), second: { ...restoreSecond(), sleepMs: 20000 } } });
+  const head = f.head();
+  const child = spawn(RUN_SH, ['consolidate', 'organize'], { env: f.env, stdio: ['ignore', 'pipe', 'ignore'] });
+  let stdout = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
+  t.after(() => {
+    child.kill('SIGKILL');
+    for (const c of f.calls()) {
+      try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ }
+    }
+  });
+  assert.ok(await waitFor(() => f.calls().length === 2), 'the repair run started');
+  child.kill('SIGTERM');
+  assert.deepEqual(await exited, { code: 143, signal: null });
+  assert.match(stdout, /^organize p: aborted, nothing applied/m);
+  assert.equal(f.head(), head);
+  assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
+  assert.deepEqual(readdirSync(f.workRoot()), []);
+});
+
+test('T2: a dry run repairs the same way and applies nothing', (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  f.instruct({ p: { ...lossyFirst(), second: restoreSecond() } });
+  const head = f.head();
+  const r = f.run('organize', '--dry-run');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: dry-run, 1 change\(s\), USD 0\.50, stopped: completed, one repair run \(1 problem\(s\) found first\)$/m);
+  assert.match(r.stdout, /^- Repair: one repair run; the first check found 1 problem\(s\)$/m);
+  assert.equal(f.calls().length, 2);
+  assert.equal(f.head(), head);
+});
+
+test('T2: Extract gets the same repair run, with original/ as an extra folder', (t) => {
+  const f = extractFixture(t);
+  f.instruct({
+    p: {
+      writes: { 'a.md': '' },
+      second: {
+        copies: { '../original/a.md': 'a.md' },
+        writes: { 'port.md': note('port', 'Staging port', 'Staging listens on 8443.'), 'MEMORY.md': index('a.md', 'port.md') },
+      },
+    },
+  });
+  const r = f.run('extract', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract p: applied, 2 change\(s\), USD 0\.50, stopped: completed, one repair run \(1 problem\(s\) found first\)$/m);
+  const [, second] = f.calls();
+  const dirs = second.args.flatMap((a, i) => (a === '--add-dir' ? [second.args[i + 1]] : []));
+  assert.deepEqual(dirs.map((d) => basename(d)).sort(), ['input', 'original']);
+  assert.ok(f.remoteFiles().includes('projects/p/port.md'));
+  assert.equal(readFileSync(join(f.repo, 'projects/p/a.md'), 'utf8'), note('a', 'Old note', 'An old fact.'));
 });

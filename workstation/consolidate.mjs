@@ -32,6 +32,10 @@ const EXTRACT_MAX_WINDOW_MS = 28 * DAY_MS;
 const REPORT_KEEP_DAYS = 90;
 const REVISIT_MS = 28 * DAY_MS;
 const KEEP_MARKER = '.keep';
+// The read-only reference copy of the scope's notes that a repair run gets, in the work folder.
+const ORIGINAL = 'original';
+// The least budget, in USD, that must be left for a repair run.
+const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
@@ -284,7 +288,7 @@ function cleanDescription(text) {
   return d.length > 200 ? `${d.slice(0, 200)}…` : d;
 }
 
-function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation }) {
+function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired = 0 }) {
   const title = `${kind[0].toUpperCase()}${kind.slice(1)}`;
   const suffix = (label) => (label === GLOBAL ? ' (global/)' : '');
   const changed = (label) => ev.changes.some((c) => c.label === label);
@@ -292,6 +296,7 @@ function buildReport({ config, kind, scope, date, model, stopReason, costUsd, tu
   const shownLabels = labels.filter((l) => l === 'notes' || changed(l));
   const lines = [`# ${title} ${scope} — ${date} on ${config.host}`, ''];
   lines.push(`- Model: ${model}; turns: ${turns ?? 'unknown'}; cost: ${usd(costUsd)}; stopped: ${stopReason}; denials: ${denials ?? 'unknown'}`);
+  if (repaired > 0) lines.push(`- Repair: one repair run; the first check found ${repaired} problem(s)`);
   if (conversation) {
     lines.push(conversation.truncated
       ? `- Conversation text: cut to ${conversation.bytes} bytes; ${conversation.sessionsLeftOut} session(s) left out`
@@ -365,7 +370,8 @@ function pruneReports(config, now) {
 
 function stepApply(config, rest) {
   const a = parseStepArgs(rest,
-    ['--work', '--plan-sha256', '--stop-reason', '--cost', '--turns', '--denials', '--model', '--min-retention', '--conversation'], ['--dry-run']);
+    ['--work', '--plan-sha256', '--stop-reason', '--cost', '--turns', '--denials', '--model', '--min-retention', '--conversation', '--repaired'],
+    ['--dry-run', '--keep-original']);
   const dryRun = a['--dry-run'] === true;
   const minRetention = a['--min-retention'] === 'default' ? undefined : parseRetention(a['--min-retention']);
   if (minRetention === null) throw new Error('invalid --min-retention');
@@ -375,6 +381,7 @@ function stepApply(config, rest) {
   const denials = /^\d{1,9}$/.test(a['--denials']) ? Number(a['--denials']) : null;
   const model = a['--model'];
   const conversation = parseConversationArg(a['--conversation']);
+  const repaired = /^\d{1,6}$/.test(a['--repaired']) ? Number(a['--repaired']) : 0;
   const work = checkWork(config, a['--work']);
   const empty = { errors: [], changes: [], ignored: [], stats: {}, liveChanged: [] };
 
@@ -426,7 +433,7 @@ function stepApply(config, rest) {
     if (buf && sha256(buf) === c.hash) descriptions.set(`${c.label}/${c.file}`, cleanDescription(parseNote(buf.toString('utf8')).description));
   }
   const report = () => buildReport({
-    config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation,
+    config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired,
   });
 
   let outcome;
@@ -437,6 +444,11 @@ function stepApply(config, rest) {
   if (outcome) {
     const withReport = dryRun && (outcome === 'dry-run' || outcome === 'rejected');
     const digest = outcome === 'no-change' || outcome === 'rejected' ? folderDigest(pairs[0].liveDir) : null;
+    // For a repair run: a reference copy of the scope's notes as the snapshot took them, from the
+    // live folder, which this evaluation has just found unchanged. Never evaluated or applied.
+    if (outcome === 'rejected' && a['--keep-original'] === true) {
+      snapshot([{ label: 'original', liveDir: pairs[0].liveDir, workDir: join(work, ORIGINAL) }]);
+    }
     out({ ...result, outcome, report: withReport ? report() : null, digest });
     return;
   }
@@ -796,56 +808,108 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
       const overLimit = index.lines > INDEX_MAX_LINES || index.bytes > INDEX_MAX_BYTES;
       prompt = renderPrompt('organize', { hasGlobal, overLimit, indexLines: index.lines, indexBytes: index.bytes });
     }
-    const m = await runModel({
-      command: c.command,
-      args: modelArgs({ prompt, model, maxTurns: c.maxTurns, maxBudgetUsd: c.maxBudgetUsd, addDirs }),
-      cwd, env: c.env, timeoutMs: modelTimeoutMs(c), signal: abort.signal,
-    });
-    const costUsd = typeof m.costUsd === 'number' && m.costUsd >= 0 ? m.costUsd : null;
-    const stopReason = STOP_RE.test(m.stopReason) ? m.stopReason : 'unknown';
-    const denials = Number.isInteger(m.denials) && m.denials >= 0 ? m.denials : 0;
-    const modelInfo = { ran: m.ran, stopReason, costUsd, denials };
-    if (await signalsHandled()) return { outcome: 'aborted', model: modelInfo, work };
-    const args = [
-      'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', stopReason,
-      '--cost', costUsd === null ? 'unknown' : String(costUsd), '--turns', Number.isInteger(m.turns) ? String(m.turns) : 'unknown',
-      '--denials', String(denials),
-      '--model', model, '--min-retention', opts.minRetention === undefined ? 'default' : String(opts.minRetention),
-      '--conversation', conversationArg(digest ? conversationOf(digest) : null),
-    ];
-    if (opts.dryRun) args.push('--dry-run');
-    const applyStep = runStep(args);
-    const res = applyStep.result;
-    // An apply step that finished stands, signal or not: its line says what happened to the notes
-    // and the run stops afterwards. One that ended without its line ended in one of three ways:
-    // - the wait for the sync lock timed out (run.sh exit LOCK_TIMEOUT_CODE): nothing was done;
-    // - SIGINT, SIGTERM or SIGHUP killed it: that is only possible before its handlers existed,
-    //   so before it did anything. The run stops as interrupted by that signal, even when only
-    //   the step received it;
-    // - anything else (SIGKILL, a crash): it may have applied and committed changes, so it is
-    //   never reported as "nothing applied".
-    await signalsHandled();
-    if (!res) {
-      if (lockTimedOut(applyStep)) return { outcome: 'step-failed', step: 'apply', lockTimeout: true, model: modelInfo, work };
-      if (INTERRUPT_SIGNALS.includes(applyStep.signal)) {
-        onSignal(applyStep.signal);
-        return { outcome: 'aborted', model: modelInfo, work };
+    // One model run on the work folder, with its figures made safe.
+    const runOnce = async (runPrompt, budgetUsd, dirs) => {
+      const m = await runModel({
+        command: c.command,
+        args: modelArgs({ prompt: runPrompt, model, maxTurns: c.maxTurns, maxBudgetUsd: budgetUsd, addDirs: dirs }),
+        cwd, env: c.env, timeoutMs: modelTimeoutMs(c), signal: abort.signal,
+      });
+      return {
+        ran: m.ran,
+        stopReason: STOP_RE.test(m.stopReason) ? m.stopReason : 'unknown',
+        costUsd: typeof m.costUsd === 'number' && m.costUsd >= 0 ? m.costUsd : null,
+        turns: Number.isInteger(m.turns) ? m.turns : null,
+        denials: Number.isInteger(m.denials) && m.denials >= 0 ? m.denials : 0,
+        stderrTail: m.stderrTail ?? '',
+      };
+    };
+    const infoOf = (run) => ({ ran: run.ran, stopReason: run.stopReason, costUsd: run.costUsd, denials: run.denials });
+    // The apply step for the model figures of `run`: its result, or how it ended without one.
+    const applyOnce = async (run, { keepOriginal = false, repaired = 0 } = {}) => {
+      const args = [
+        'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', run.stopReason,
+        '--cost', run.costUsd === null ? 'unknown' : String(run.costUsd), '--turns', run.turns === null ? 'unknown' : String(run.turns),
+        '--denials', String(run.denials),
+        '--model', model, '--min-retention', opts.minRetention === undefined ? 'default' : String(opts.minRetention),
+        '--conversation', conversationArg(digest ? conversationOf(digest) : null), '--repaired', String(repaired),
+      ];
+      if (keepOriginal) args.push('--keep-original');
+      if (opts.dryRun) args.push('--dry-run');
+      const applyStep = runStep(args);
+      const res = applyStep.result;
+      const modelInfo = infoOf(run);
+      // An apply step that finished stands, signal or not: its line says what happened to the notes
+      // and the run stops afterwards. One that ended without its line ended in one of three ways:
+      // - the wait for the sync lock timed out (run.sh exit LOCK_TIMEOUT_CODE): nothing was done;
+      // - SIGINT, SIGTERM or SIGHUP killed it: that is only possible before its handlers existed,
+      //   so before it did anything. The run stops as interrupted by that signal, even when only
+      //   the step received it;
+      // - anything else (SIGKILL, a crash): it may have applied and committed changes, so it is
+      //   never reported as "nothing applied".
+      await signalsHandled();
+      if (!res) {
+        if (lockTimedOut(applyStep)) return { outcome: 'step-failed', step: 'apply', lockTimeout: true, model: modelInfo, work };
+        if (INTERRUPT_SIGNALS.includes(applyStep.signal)) {
+          onSignal(applyStep.signal);
+          return { outcome: 'aborted', model: modelInfo, work };
+        }
+        return { outcome: 'apply-interrupted', step: 'apply', model: modelInfo, work };
       }
-      return { outcome: 'apply-interrupted', step: 'apply', model: modelInfo, work };
+      return { ...res, step: 'apply', model: modelInfo, work };
+    };
+
+    const first = await runOnce(prompt, c.maxBudgetUsd, addDirs);
+    if (await signalsHandled()) return { outcome: 'aborted', model: infoOf(first), work };
+    // A result the rules reject gets one repair run when the model completed and enough of the
+    // scope's budget is left (an unknown cost counts as the whole budget).
+    const left = c.maxBudgetUsd - (first.costUsd ?? c.maxBudgetUsd);
+    const mayRepair = first.stopReason === 'completed' && left >= REPAIR_MIN_USD;
+    const res = await applyOnce(first, { keepOriginal: mayRepair });
+    const original = join(work, ORIGINAL);
+    if (res.outcome !== 'rejected' || !mayRepair || !lstatOrNull(original)?.isDirectory()) {
+      // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
+      // `no-change` always means the model completed and found nothing.
+      if (res.outcome === 'no-change' && first.stopReason !== 'completed') {
+        // Beside the scope's work folder, in the run folder: no folder the model can write to.
+        const stderrLog = join(runDir, `model-stderr-${scope}.log`);
+        writeFileSync(stderrLog, first.stderrTail, { mode: 0o600 });
+        chmodSync(stderrLog, 0o600);
+        return { ...res, outcome: 'model-failed', repairs: 0 };
+      }
+      return { ...res, repairs: 0 };
     }
-    // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
-    // `no-change` always means the model completed and found nothing.
-    if (res.outcome === 'no-change' && stopReason !== 'completed') {
-      // Beside the scope's work folder, in the run folder: no folder the model can write to.
-      const stderrLog = join(runDir, `model-stderr-${scope}.log`);
-      writeFileSync(stderrLog, m.stderrTail ?? '', { mode: 0o600 });
-      chmodSync(stderrLog, 0o600);
-      return { ...res, outcome: 'model-failed', step: 'apply', model: modelInfo, work };
-    }
-    return { ...res, step: 'apply', model: modelInfo, work };
+
+    // The repair run: the problems the check found, the notes as they were in original/, and the
+    // same task; what is left of the scope's budget; the configured time limit again.
+    const problems = res.errors ?? [];
+    const repairPrompt = renderPrompt('repair', {
+      problems: problems.map((e) => `- ${e}`).join('\n'), original, task: prompt, hasGlobal,
+    });
+    const second = await runOnce(repairPrompt, Math.floor(left * 100) / 100, opts.kind === 'extract' ? [...addDirs, original] : addDirs);
+    const both = sumRuns(first, second);
+    const repair = { repairs: 1, firstProblems: problems.length };
+    if (await signalsHandled()) return { outcome: 'aborted', model: infoOf(both), work, ...repair };
+    // A repair run that did not complete leaves the first check's result, with its stop reason.
+    if (second.stopReason !== 'completed') return { ...res, model: infoOf(both), ...repair };
+    return { ...(await applyOnce(both, { repaired: problems.length })), ...repair };
   } finally {
     if (!opts.keep) removeTree(work);
   }
+}
+
+// The figures of a first run and its repair run together: costs, turns and denials summed (unknown
+// when either is unknown), and how the repair run ended.
+function sumRuns(first, second) {
+  const add = (x, y) => (x === null || y === null ? null : Math.round((x + y) * 1e6) / 1e6);
+  return {
+    ran: second.ran,
+    stopReason: second.stopReason,
+    costUsd: add(first.costUsd, second.costUsd),
+    turns: add(first.turns, second.turns),
+    denials: first.denials + second.denials,
+    stderrTail: second.stderrTail,
+  };
 }
 
 // What a scope's run cost against the run's ceiling. An unknown cost counts as the scope's whole
@@ -896,6 +960,7 @@ function record(config, state, { kind, scope, res, started, dryRun }) {
   entry.lastOutcome = {
     kind, at: new Date().toISOString(), outcome: res.outcome,
     stopReason: res.model?.stopReason ?? null, costUsd: res.model?.costUsd ?? null, denials: res.model?.denials ?? null,
+    repairs: res.repairs ?? 0,
   };
   if (res.conversation) {
     entry.lastOutcome.truncated = res.conversation.truncated;
@@ -915,6 +980,7 @@ function headline(kind, scope, res) {
   let line = `${kind} ${scope}: ${what}, ${usd(res.model ? res.model.costUsd : 0)}`;
   if (res.model) line += `, stopped: ${res.model.stopReason}`;
   if (res.model?.denials > 0) line += `, ${res.model.denials} denied tool call(s)`;
+  if (res.repairs > 0) line += `, one repair run (${res.firstProblems} problem(s) found first)`;
   if (res.conversation?.truncated) line += ', conversation text cut';
   return line;
 }

@@ -36,7 +36,7 @@ export function fillTemplate(template, vars = {}) {
 }
 
 export function renderPrompt(kind, vars = {}) {
-  if (kind !== 'extract' && kind !== 'organize') {
+  if (kind !== 'extract' && kind !== 'organize' && kind !== 'repair') {
     throw new Error(`unknown prompt kind: ${kind}`);
   }
   return fillTemplate(readFileSync(join(PROMPTS_DIR, `${kind}.md`), 'utf8'), vars);
