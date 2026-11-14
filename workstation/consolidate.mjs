@@ -484,8 +484,15 @@ function stepMain(args) {
   try {
     if (name === 'scan' && rest.length === 0) stepScan(config);
     else if (name === 'snapshot') stepSnapshot(config, rest);
-    else if (name === 'apply') stepApply(config, rest);
-    else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ...');
+    else if (name === 'apply') {
+      // Once started, the apply step finishes and reports, even after Ctrl-C (which reaches the
+      // whole process group), SIGTERM or SIGHUP: killed part-way, it could have written or
+      // committed changes that the driver would then not know of. It is bounded by the lock wait
+      // and the Git network time limits. A Git command killed by the same signal is a failed sync,
+      // reported as such. scan and snapshot change nothing and may die.
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => {});
+      stepApply(config, rest);
+    } else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ...');
     return 0;
   } catch (err) {
     process.stderr.write(`agent-memory consolidate-step ${String(name).slice(0, 20)}: ${firstLine(err)}\n`);
@@ -771,9 +778,10 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     if (opts.dryRun) args.push('--dry-run');
     const res = runStep(args);
     // An apply step that finished stands, signal or not: its line says what happened to the notes
-    // and the run stops afterwards. One that a signal killed applied nothing the driver knows of.
-    const signalled = await signalsHandled();
-    if (!res) return { outcome: signalled ? 'aborted' : 'step-failed', step: 'apply', model: modelInfo, work };
+    // and the run stops afterwards. One that ended without its line (killed outright, or crashed)
+    // may have applied and committed changes: never reported as "nothing applied".
+    await signalsHandled();
+    if (!res) return { outcome: 'apply-interrupted', step: 'apply', model: modelInfo, work };
     // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
     // `no-change` always means the model completed and found nothing.
     if (res.outcome === 'no-change' && stopReason !== 'completed') {
@@ -804,8 +812,9 @@ function modelStarted(res) {
 
 // Moves the scope's marks forward, or not. A dry run moves nothing.
 // - Content marks: `lastExtract` (the start of the next session window), and `lastOrganize` with
-//   `organizedDigest`. They move after `applied`, `no-session` (Extract) and `no-change` (which
-//   means the model completed and found nothing). For Organize also after `rejected` when the
+//   `organizedDigest`. They move after `applied` (for Extract only when the model completed),
+//   `no-session` (Extract) and `no-change` (which means the model completed and found nothing).
+//   `apply-interrupted` never moves them. For Organize also after `rejected` when the
 //   model completed: the same notes would only give the same rejection, so the scope waits until
 //   its content changes, or REVISIT_MS while still over the limits. Half-finished edits of a
 //   model that did not complete prove nothing, and `model-failed` never moves them, so the
@@ -815,7 +824,9 @@ function modelStarted(res) {
 function record(config, state, { kind, scope, res, started, dryRun }) {
   const entry = state.projects[scope] ?? (state.projects[scope] = {});
   const completed = res.model?.stopReason === 'completed';
-  let advance = res.outcome === 'applied' || res.outcome === 'no-change';
+  // An Extract applied after a stop other than `completed` keeps its window: the model may not
+  // have reached every conversation, so the same window is read again (the notes it wrote stay).
+  let advance = (res.outcome === 'applied' && (kind === 'organize' || completed)) || res.outcome === 'no-change';
   if (kind === 'extract') advance ||= res.outcome === 'no-session';
   else advance ||= res.outcome === 'rejected' && completed;
   if (modelStarted(res) && !dryRun) entry[kind === 'extract' ? 'lastExtractTried' : 'lastOrganizeTried'] = started.toISOString();
@@ -840,14 +851,19 @@ function headline(kind, scope, res) {
   else if (res.outcome === 'changed-meanwhile') what = 'changed meanwhile, nothing applied';
   else if (res.outcome === 'aborted') what = 'aborted, nothing applied';
   else if (res.outcome === 'model-failed') what = 'model-failed, nothing applied';
+  else if (res.outcome === 'apply-interrupted') what = 'apply interrupted, changes may have been applied';
   else what = `${res.outcome}, ${res.changes?.length ?? 0} change(s)`;
   let line = `${kind} ${scope}: ${what}, ${usd(res.model ? res.model.costUsd : 0)}`;
   if (res.model) line += `, stopped: ${res.model.stopReason}`;
   return line;
 }
 
-function printScope(kind, scope, res, opts) {
+function printScope(kind, scope, res, opts, repoDir) {
   const lines = [headline(kind, scope, res)];
+  if (res.outcome === 'apply-interrupted') {
+    lines.push('  - the apply step ended without reporting its result; look at the log of the notes repository'
+      + ` (git -C ${repoDir} log) for a consolidate(...) commit, and at its working tree`);
+  }
   const errors = (res.errors ?? []).map((e) => `  - ${e}`);
   if (res.outcome === 'sync-failed') {
     const when = res.step === 'apply' ? 'before applying' : 'before the snapshot';
@@ -943,9 +959,9 @@ async function driverMain(argv) {
       digest = null;
       spent += spentBy(res, c);
       record(config, state, { kind: opts.kind, scope: item.scope, res, started, dryRun: opts.dryRun });
-      printScope(opts.kind, item.scope, res, opts);
+      printScope(opts.kind, item.scope, res, opts, config.repoDir);
       if (res.outcome === 'aborted') break;
-      if (res.outcome === 'step-failed' || res.outcome === 'error') {
+      if (res.outcome === 'step-failed' || res.outcome === 'error' || res.outcome === 'apply-interrupted') {
         failed = true;
         break;
       }

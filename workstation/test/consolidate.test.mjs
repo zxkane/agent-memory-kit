@@ -1124,11 +1124,21 @@ test('run folders older than a day are removed at the start unless marked by --k
 // Makes the n-th `git fetch` of the run slow: it touches `<tmp>/in-step`, then sleeps 3 s. Every
 // fetch is counted in `<tmp>/fetches`. Each sync fetches once: the snapshot step's sync is the
 // first fetch of a scope, the sync before applying the second, the sync after applying the third.
+// The slow fetch also writes the pid of the step that runs it to `<tmp>/step.pid`, and touches
+// `<tmp>/slept` when its sleep is over; when that step is gone by then, it exits without
+// fetching.
 function slowFetch(f, n) {
   const count = join(f.tmp, 'fetches');
   const marker = join(f.tmp, 'in-step');
-  wrapGit(f, `for a in "$@"; do if [[ "$a" == fetch ]]; then k=$(cat "${count}" 2>/dev/null || echo 0); k=$((k+1)); echo $k > "${count}"; if [[ $k == ${n} ]]; then touch "${marker}"; sleep 3; fi; fi; done`);
-  return { marker, fetches: () => Number(readFileSync(count, 'utf8').trim()) };
+  const pidFile = join(f.tmp, 'step.pid');
+  const slept = join(f.tmp, 'slept');
+  wrapGit(f, `for a in "$@"; do if [[ "$a" == fetch ]]; then k=$(cat "${count}" 2>/dev/null || echo 0); k=$((k+1)); echo $k > "${count}"; if [[ $k == ${n} ]]; then echo $PPID > "${pidFile}"; touch "${marker}"; sleep 3; touch "${slept}"; kill -0 $PPID 2>/dev/null || exit 1; fi; fi; done`);
+  return {
+    marker,
+    slept,
+    stepPid: () => Number(readFileSync(pidFile, 'utf8').trim()),
+    fetches: () => Number(readFileSync(count, 'utf8').trim()),
+  };
 }
 
 // Starts `run.sh consolidate <args>` and, once `marker` exists (a locked step is then running),
@@ -1164,6 +1174,75 @@ test('a signal during a locked step ends the run as aborted; the model is never 
     assert.deepEqual(readdirSync(f.workRoot()), [], signal);
     assert.equal(f.readState().projects.p.lastOutcome.outcome, 'aborted');
   }
+});
+
+test('a terminal signal during the sync after applying: the apply stands and its line says applied', async (t) => {
+  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+    const f = fixture(t);
+    duplicateProject(f);
+    f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
+    f.instruct(mergeInstruction());
+    const { marker } = slowFetch(f, 3);
+    const { status, stdout } = await signalDuringStep(t, f, signal, marker, ['organize'], { group: true });
+    assert.deepEqual(status, { code, signal: null }, signal);
+    assert.match(stdout, /^organize p: applied, 3 change\(s\), USD 0\.25, stopped: completed$/m, signal);
+    assert.match(stdout, /push pending/, signal);
+    assert.doesNotMatch(stdout, /nothing applied/, signal);
+    assert.doesNotMatch(stdout, /organize q:/, signal);
+    assert.match(f.subjects()[0], /^consolidate\(alpha\): organize projects\/p/, signal);
+    assert.equal(existsSync(join(f.repo, 'projects/p/b.md')), false, signal);
+    const p = f.readState().projects.p;
+    assert.equal(p.lastOutcome.outcome, 'applied', signal);
+    assert.equal(p.organizedDigest, folderDigest(join(f.repo, 'projects/p')), signal);
+  }
+});
+
+test('an apply step killed outright is reported as possibly applied, never as nothing applied', async (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct(mergeInstruction());
+  const step = slowFetch(f, 3);
+  const child = spawn(RUN_SH, ['consolidate', 'organize'], { env: f.env, stdio: ['ignore', 'pipe', 'ignore'] });
+  let stdout = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
+  t.after(() => child.kill('SIGKILL'));
+  assert.ok(await waitFor(() => existsSync(step.marker)), 'the step started');
+  process.kill(step.stepPid(), 'SIGKILL');
+  const status = await exited;
+  assert.ok(await waitFor(() => existsSync(step.slept)), 'the slow fetch finished');
+  assert.deepEqual(status, { code: 1, signal: null });
+  assert.match(stdout, /^organize p: apply interrupted, changes may have been applied, USD 0\.25, stopped: completed$/m);
+  assert.match(stdout, /log of the notes repository/);
+  assert.doesNotMatch(stdout, /nothing applied/);
+  assert.equal(f.readState().projects.p.lastOutcome.outcome, 'apply-interrupted');
+});
+
+test('an extract applied after a stop other than completed keeps its session window', (t) => {
+  const f = extractFixture(t);
+  f.instruct({
+    p: {
+      writes: { 'port.md': note('port', 'Staging port', 'Staging listens on 8443.'), 'MEMORY.md': index('a.md', 'port.md') },
+      result: { subtype: 'error_max_budget_usd', is_error: true },
+    },
+  });
+  let r = f.run('extract', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract p: applied, 2 change\(s\), USD 0\.25, stopped: error_max_budget_usd$/m);
+  assert.ok(f.remoteFiles().includes('projects/p/port.md'));
+  let p = f.readState().projects.p;
+  assert.equal(p.lastExtract, undefined);
+  assert.ok(!Number.isNaN(Date.parse(p.lastExtractTried)));
+
+  // The same window is read again; a model that completes moves it on.
+  f.instruct({
+    p: { writes: { 'more.md': note('more', 'More', 'Another fact.'), 'MEMORY.md': index('a.md', 'port.md', 'more.md') } },
+  });
+  r = f.run('extract');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract p: applied, 2 change\(s\), USD 0\.25, stopped: completed$/m);
+  p = f.readState().projects.p;
+  assert.ok(!Number.isNaN(Date.parse(p.lastExtract)));
 });
 
 test('a signal while the apply step runs: the finished apply stands and the run stops', async (t) => {
