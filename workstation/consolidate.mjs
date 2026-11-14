@@ -790,7 +790,11 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
       prompt = renderPrompt('extract', { digest: file });
       addDirs.push(input);
     } else {
-      prompt = renderPrompt('organize', { hasGlobal });
+      // The scope's index as the snapshot copied it: the prompt shows its size when it is over a limit.
+      const indexBuf = readRegular(join(work, 'notes', INDEX));
+      const index = indexStats(indexBuf ? indexBuf.toString('utf8') : '');
+      const overLimit = index.lines > INDEX_MAX_LINES || index.bytes > INDEX_MAX_BYTES;
+      prompt = renderPrompt('organize', { hasGlobal, overLimit, indexLines: index.lines, indexBytes: index.bytes });
     }
     const m = await runModel({
       command: c.command,

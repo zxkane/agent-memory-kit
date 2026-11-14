@@ -1656,3 +1656,14 @@ test('item 2: a model that writes model-stderr.log itself and fails is model-fai
   assert.equal(readFileSync(join(call.cwd, 'model-stderr.log'), 'utf8'), 'WRITTEN BY THE MODEL');
   assert.equal(existsSync(join(dirname(call.cwd), 'model-stderr-q.log')), false);
 });
+
+test('T1: the organize prompt shows the index numbers from the snapshot only when it is over its limit', (t) => {
+  const f = fixture(t);
+  const big = overLimitIndex();
+  f.seed({ 'projects/big/MEMORY.md': big, 'projects/big/n0.md': note('n0', 'N0', 'One note.') });
+  duplicateProject(f);
+  f.run('organize');
+  const prompts = Object.fromEntries(f.calls().map((c) => [c.scope, c.args[c.args.indexOf('-p') + 1]]));
+  assert.ok(prompts.big.includes(`MEMORY.md is over its limit now: 205 lines and ${Buffer.byteLength(big)} bytes`));
+  assert.ok(!prompts.p.includes('over its limit now'));
+});
