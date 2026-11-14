@@ -108,7 +108,7 @@ export function parseWrite(body: unknown): WriteRequest {
   if (typeof name !== 'string' || !SLUG_RE.test(name) || name === 'memory') {
     throw invalid('The name field must be a lower-case slug other than memory.');
   }
-  if (typeof description !== 'string' || /[\r\n]/.test(description)) {
+  if (typeof description !== 'string' || /[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(description)) {
     throw invalid('The description field must be a single line of text.');
   }
   const desc = description.trim();

@@ -175,6 +175,13 @@ test('parseWrite rejects invalid bodies without echoing values', () => {
   parseWrite({ ...validBody(), description: 'd'.repeat(300) });
 });
 
+test('parseWrite rejects control and line-separator characters in the description', () => {
+  for (const ch of ['\t', '\u0085', '\u2028', '\u2029', '\u0000', '\u001f', '\u007f']) {
+    rejects(() => parseWrite({ ...validBody(), description: `a${ch}b` }));
+    rejects(() => parseWrite({ ...validBody(), description: `${MARKER}${ch}` }));
+  }
+});
+
 test('onlyParams rejects unknown parameters', () => {
   onlyParams({}, ['scope']);
   onlyParams({ scope: 'global', limit: undefined }, ['scope', 'limit']);
