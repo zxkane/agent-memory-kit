@@ -158,7 +158,9 @@ test('invalid requests never load the snapshots', async () => {
   assert.equal(loads, 0);
 });
 
-test('searching 2000 notes of 2 KB stays under 500 ms', async () => {
+// This guards against accidental quadratic behaviour; it is not a benchmark. The bound is loose
+// (it takes about 200 ms on an idle machine) so that a loaded host does not fail it.
+test('searching 2000 notes of 2 KB stays under 3000 ms', async () => {
   const notes = Array.from({ length: 2000 }, (_, i) =>
     n(`projects/p${i % 10}/note-${i}.md`, {
       name: `note ${i}`,
@@ -170,7 +172,7 @@ test('searching 2000 notes of 2 KB stays under 500 ms', async () => {
   const out = await search(notes, { q: 'needle ipsum zzz' });
   const elapsed = performance.now() - start;
   assert.equal(out.total, 2000);
-  assert.ok(elapsed < 500, `took ${elapsed} ms`);
+  assert.ok(elapsed < 3000, `took ${elapsed} ms`);
 });
 
 test('snippet offsets survive characters whose lower case changes length', async () => {
