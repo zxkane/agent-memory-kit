@@ -28,6 +28,8 @@ const INDEX_MAX_BYTES = 25000;
 const DAY_MS = 24 * 3600 * 1000;
 const EXTRACT_LOOKBACK_MS = 7 * DAY_MS;
 const REPORT_KEEP_DAYS = 90;
+const REVISIT_MS = 28 * DAY_MS;
+const KEEP_MARKER = '.keep';
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
 const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]';
 const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
@@ -207,14 +209,31 @@ function parseStepArgs(rest, valued, flags = []) {
   return opts;
 }
 
+// Why the configured clone cannot be used, or null.
+function cloneProblem(config) {
+  let st = null;
+  try {
+    st = statSync(config.repoDir);
+  } catch (err) {
+    if (!isMissing(err)) throw err;
+  }
+  if (!st?.isDirectory()) return `the notes clone ${config.repoDir} does not exist`;
+  if (lstatOrNull(join(config.repoDir, '.git')) === null) return `${config.repoDir} is not a Git clone of the notes`;
+  return null;
+}
+
 function stepScan(config) {
+  const problem = cloneProblem(config);
+  if (problem) throw new Error(problem);
   const dir = projectsDir(config);
   const projects = listProjects(config).map((name) => ({ name, ...scopeInfo(join(dir, name)) }));
   const g = liveFolder(config, GLOBAL);
   const global = g ? { usable: true, ...scopeInfo(g) } : { usable: false };
   const names = new Set(projects.map((p) => p.name));
   const sessions = [...projectSessionDirs(config)].filter(([name]) => names.has(name));
-  out({ outcome: 'scan', projects, global, sessions });
+  // A project folder named like the global scope would be confused with it; it is never used.
+  const ignored = dir && lstatOrNull(join(dir, GLOBAL))?.isDirectory() ? [GLOBAL] : [];
+  out({ outcome: 'scan', projects, global, sessions, ignored });
 }
 
 function stepSnapshot(config, rest) {
@@ -256,6 +275,23 @@ function validSnap(snap, pairs) {
 // `<label>/<file>` (as evaluate names it) shown relative to the scope: global/ keeps its prefix.
 function display(label, file) {
   return label === GLOBAL ? `global/${file}` : file;
+}
+
+// Error lines of evaluate that name an entry which is not a note file quote its name, which the
+// model chose and which may hold any text. They are replaced by a count per folder.
+function safeErrors(errors, labels) {
+  const kept = [];
+  const counts = new Map();
+  for (const line of errors) {
+    const label = labels.find((l) => line.startsWith(`${l}/"`));
+    if (label) counts.set(label, (counts.get(label) ?? 0) + 1);
+    else kept.push(line);
+  }
+  for (const [label, n] of counts) {
+    const what = n === 1 ? '1 entry that is not a note file' : `${n} entries that are not note files`;
+    kept.push(`${label}/(${what}): not a regular note file`);
+  }
+  return kept;
 }
 
 function splitLoc(entry) {
@@ -364,7 +400,20 @@ function stepApply(config, rest) {
   const plan = JSON.parse(planBuf.toString('utf8'));
   const { kind, scope } = plan;
   if (!KINDS.includes(kind) || scope !== basename(work)) throw new Error('plan.json does not match its work folder');
+  for (const p of plan.pairs ?? []) {
+    if (!lstatOrNull(join(work, p.label))?.isDirectory()) {
+      out({ ...empty, outcome: 'rejected', errors: [`${p.label}: work folder is not a real folder`] });
+      return;
+    }
+  }
+  // Commits what sessions wrote meanwhile under the usual subject, so that the consolidate commit
+  // holds only this run's changes. When it fails, nothing is applied: the commit after applying
+  // would otherwise take in every pending change of the clone.
   const preSync = dryRun ? null : syncInfo(writeStatus(config, runSync(config)));
+  if (preSync && !preSync.ok) {
+    out({ ...empty, outcome: 'sync-failed', sync: preSync, preSync });
+    return;
+  }
   const pairs = pairsFor(config, kind, scope, work);
   if (!pairs || JSON.stringify(pairs) !== JSON.stringify(plan.pairs)) {
     out({ ...empty, outcome: 'changed-meanwhile', reason: 'the scope folder is no longer the folder that was copied', preSync });
@@ -375,7 +424,7 @@ function stepApply(config, rest) {
 
   const ev = evaluate({ pairs, snap, allowRetire: kind === 'organize', minRetention });
   const result = {
-    errors: ev.errors,
+    errors: safeErrors(ev.errors, pairs.map((p) => p.label)),
     changes: ev.changes.map((c) => ({ label: c.label, file: shown(c.file), kind: c.kind, target: c.target })),
     ignored: ev.ignored,
     stats: ev.stats,
@@ -401,7 +450,7 @@ function stepApply(config, rest) {
   else if (dryRun) outcome = 'dry-run';
   if (outcome) {
     const withReport = dryRun && (outcome === 'dry-run' || outcome === 'rejected');
-    const digest = outcome === 'no-change' ? folderDigest(pairs[0].liveDir) : null;
+    const digest = outcome === 'no-change' || outcome === 'rejected' ? folderDigest(pairs[0].liveDir) : null;
     out({ ...result, outcome, report: withReport ? report() : null, digest });
     return;
   }
@@ -477,36 +526,46 @@ function parseDriverArgs(argv) {
   return opts;
 }
 
-// Runs a locked step and returns its JSON line, or null when the step could not run.
+// Runs a locked step and returns its JSON line (which may be `{ outcome: 'error', error }`), or
+// null when the step could not run at all (no lock, no Node, a crash before its line).
 function runStep(args) {
   const r = spawnSync(RUN_SH, ['consolidate-step', ...args], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], maxBuffer: 64 * 1024 * 1024,
   });
-  if (r.error || r.status !== 0) return null;
+  if (r.error || typeof r.stdout !== 'string') return null;
   try {
     const value = JSON.parse(r.stdout.trim().split('\n').at(-1));
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    return value && typeof value === 'object' && !Array.isArray(value) && typeof value.outcome === 'string' ? value : null;
   } catch {
     return null;
   }
 }
 
 const stateFile = (config) => join(config.stateDir, 'consolidate.json');
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const stampOf = (date) => date.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 
-function readState(config) {
-  const projects = Object.create(null);
+// The state file. One that cannot be read or parsed is moved aside, never overwritten; the run
+// then starts from an empty state. Unknown top-level keys are kept.
+function readState(config, now) {
+  const file = stateFile(config);
+  let raw = null;
   try {
-    const raw = JSON.parse(readFileSync(stateFile(config), 'utf8'));
-    const list = raw?.projects;
-    if (list && typeof list === 'object' && !Array.isArray(list)) {
-      for (const [scope, entry] of Object.entries(list)) {
-        if (entry && typeof entry === 'object' && !Array.isArray(entry)) projects[scope] = { ...entry };
-      }
-    }
-  } catch {
-    // Missing or unreadable: every scope starts afresh.
+    raw = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    if (isMissing(err)) return { projects: Object.create(null) };
   }
-  return { projects };
+  if (!isObject(raw) || (raw.projects !== undefined && !isObject(raw.projects))) {
+    const aside = `${file}.unreadable-${stampOf(now)}`;
+    renameSync(file, aside);
+    process.stdout.write(`agent-memory consolidate: the state file could not be read; moved to ${aside}, starting from an empty state.\n`);
+    return { projects: Object.create(null) };
+  }
+  const projects = Object.create(null);
+  for (const [scope, entry] of Object.entries(raw.projects ?? {})) {
+    if (isObject(entry)) projects[scope] = { ...entry };
+  }
+  return { ...raw, projects };
 }
 
 function writeState(config, state) {
@@ -528,14 +587,16 @@ const timeOf = (iso) => {
   return Number.isFinite(t) ? t : null;
 };
 
-// Extract: projects with a session file changed since their last extract, newest first.
+// Extract: projects with a session file changed since their last extract. The one extracted
+// longest ago goes first (never extracted first), so every project gets its turn across runs;
+// ties go to the newest session.
 function extractScopes(scan, state, opts, now) {
   const dirs = new Map(scan.sessions);
   const names = opts.projects.length > 0 ? opts.projects : [...dirs.keys()];
   const list = [];
   for (const scope of names) {
-    const since = timeOf(state.projects[scope]?.lastExtract) ?? now - EXTRACT_LOOKBACK_MS;
-    const files = sessionFilesSince(dirs.get(scope) ?? [], since);
+    const last = timeOf(state.projects[scope]?.lastExtract);
+    const files = sessionFilesSince(dirs.get(scope) ?? [], last ?? now - EXTRACT_LOOKBACK_MS);
     if (opts.projects.length === 0 && files.length === 0) continue;
     let newest = 0;
     for (const file of files) {
@@ -545,42 +606,108 @@ function extractScopes(scan, state, opts, now) {
         // Vanished: does not count.
       }
     }
-    list.push({ scope, files, newest });
+    list.push({ scope, files, newest, last: last ?? -Infinity });
   }
-  if (opts.projects.length === 0) list.sort((x, y) => y.newest - x.newest || byName(x.scope, y.scope));
+  if (opts.projects.length === 0) {
+    list.sort((x, y) => (x.last === y.last ? 0 : x.last - y.last) || y.newest - x.newest || byName(x.scope, y.scope));
+  }
   return list;
 }
 
-// Organize: scopes with notes that are due, over-limit first, then conflicts, then the oldest.
-function organizeScopes(scan, state, opts) {
+// Organize: a scope with notes is due when its content changed since it was last organized (or
+// it never was). One that did not change but is still over the index limits or still holds a
+// conflict copy is due again only after REVISIT_MS: the model could not fix it last time, and
+// taking it every week would crowd out the scopes that changed. Over-limit first, then
+// conflicts, then the scope organized longest ago.
+function organizeScopes(scan, state, opts, now) {
   const infos = [...(scan.global.usable ? [{ name: GLOBAL, ...scan.global }] : []), ...scan.projects];
   if (opts.projects.length > 0) return opts.projects.map((name) => ({ scope: name }));
   const entry = (i) => state.projects[i.name];
-  const due = infos.filter((i) => i.notes > 0 && (i.overLimit || i.conflict || i.digest !== entry(i)?.organizedDigest));
-  const rank = (i) => (i.overLimit ? 0 : i.conflict ? 1 : 2);
   const last = (i) => timeOf(entry(i)?.lastOrganize) ?? -Infinity;
+  const isDue = (i) => {
+    if (i.notes === 0) return false;
+    if (i.digest !== entry(i)?.organizedDigest) return true;
+    return (i.overLimit || i.conflict) && now - last(i) > REVISIT_MS;
+  };
+  const rank = (i) => (i.overLimit ? 0 : i.conflict ? 1 : 2);
+  const due = infos.filter(isDue);
   due.sort((x, y) => rank(x) - rank(y) || (last(x) === last(y) ? 0 : last(x) - last(y)) || byName(x.name, y.name));
   return due.map((i) => ({ scope: i.name }));
 }
 
-// The run folder of this run, removed on SIGINT or SIGTERM unless --keep: it may hold a digest.
-let currentRun = null;
-let keepWork = false;
-
-function onSignal(signal) {
-  if (currentRun && !keepWork) rmSync(currentRun, { recursive: true, force: true });
-  process.exit(signal === 'SIGINT' ? 130 : 143);
+// Removes a folder tree, also one whose folders lost their permissions. Never throws.
+function removeTree(dir) {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return;
+  } catch {
+    // Try again after making every folder of the tree accessible.
+  }
+  const open = (d) => {
+    try {
+      if (!lstatSync(d).isDirectory()) return;
+      chmodSync(d, 0o700);
+      for (const name of readdirSync(d)) open(join(d, name));
+    } catch {
+      // Best effort.
+    }
+  };
+  open(dir);
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch (err) {
+    process.stderr.write(`agent-memory consolidate: could not remove ${dir}: ${firstLine(err)}\n`);
+  }
 }
 
-function makeRunDir(config, started) {
+// Run folders left by a run that was killed: removed when older than a day, unless --keep marked
+// them. They may hold conversation text.
+function removeStaleRuns(config, now) {
+  const root = workRoot(config);
+  let names;
+  try {
+    names = readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const dir = join(root, name);
+    const st = lstatOrNull(dir);
+    if (!st?.isDirectory() || now - st.mtimeMs <= DAY_MS) continue;
+    if (lstatOrNull(join(dir, KEEP_MARKER)) !== null) continue;
+    removeTree(dir);
+  }
+}
+
+function makeRunDir(config, started, keep) {
   const root = workRoot(config);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
-  const id = `${started.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')}-${process.pid}`;
-  const dir = join(root, id);
+  const dir = join(root, `${stampOf(started)}-${process.pid}`);
   mkdirSync(dir, { mode: 0o700 });
   chmodSync(dir, 0o700);
+  if (keep) writeFileSync(join(dir, KEEP_MARKER), 'kept by --keep; may contain conversation text\n', { mode: 0o600 });
   return realpathSync(dir);
+}
+
+// The model's time limit: the configured minutes, or less when AGENT_MEMORY_MODEL_TIMEOUT_MS
+// asks for less (used by tests; it can never raise the limit).
+function modelTimeoutMs(c) {
+  const configured = c.timeoutMinutes * 60 * 1000;
+  const raw = process.env.AGENT_MEMORY_MODEL_TIMEOUT_MS;
+  const lower = typeof raw === 'string' && /^[1-9]\d{0,8}$/.test(raw) ? Number(raw) : null;
+  return lower !== null && lower < configured ? lower : configured;
+}
+
+// SIGINT, SIGTERM or SIGHUP: stop the model, apply nothing more, clean up, exit 128 + n.
+const SIGNAL_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+const abort = new AbortController();
+let interrupted = null;
+
+function onSignal(signal) {
+  if (interrupted) return;
+  interrupted = signal;
+  abort.abort();
 }
 
 // One scope: snapshot (locked), model run on the copy, apply (locked).
@@ -591,8 +718,9 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
   chmodSync(work, 0o700);
   try {
     const snap = runStep(['snapshot', '--work', work, '--kind', opts.kind, '--scope', scope]);
-    if (!snap) return { outcome: 'step-failed', work };
-    if (snap.outcome !== 'snapshot') return { ...snap, work };
+    if (interrupted) return { outcome: 'aborted', work };
+    if (!snap) return { outcome: 'step-failed', step: 'snapshot', work };
+    if (snap.outcome !== 'snapshot') return { ...snap, step: 'snapshot', work };
     const planBuf = readFileSync(join(work, 'plan.json'));
     const hasGlobal = JSON.parse(planBuf.toString('utf8')).pairs.some((p) => p.label === GLOBAL);
     let cwd = work;
@@ -614,11 +742,12 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     const m = await runModel({
       command: c.command,
       args: modelArgs({ prompt, model, maxTurns: c.maxTurns, maxBudgetUsd: c.maxBudgetUsd, addDirs }),
-      cwd, env: c.env, timeoutMs: c.timeoutMinutes * 60 * 1000,
+      cwd, env: c.env, timeoutMs: modelTimeoutMs(c), signal: abort.signal,
     });
     const costUsd = typeof m.costUsd === 'number' && m.costUsd >= 0 ? m.costUsd : null;
     const stopReason = STOP_RE.test(m.stopReason) ? m.stopReason : 'unknown';
     const modelInfo = { ran: m.ran, stopReason, costUsd };
+    if (interrupted) return { outcome: 'aborted', model: modelInfo, work };
     const args = [
       'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', stopReason,
       '--cost', costUsd === null ? 'unknown' : String(costUsd), '--turns', Number.isInteger(m.turns) ? String(m.turns) : 'unknown',
@@ -626,9 +755,10 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     ];
     if (opts.dryRun) args.push('--dry-run');
     const res = runStep(args);
-    return { ...(res ?? { outcome: 'step-failed' }), model: modelInfo, work };
+    if (!res) return { outcome: interrupted ? 'aborted' : 'step-failed', step: 'apply', model: modelInfo, work };
+    return { ...res, step: 'apply', model: modelInfo, work };
   } finally {
-    if (!opts.keep) rmSync(work, { recursive: true, force: true });
+    if (!opts.keep) removeTree(work);
   }
 }
 
@@ -640,10 +770,20 @@ function spentBy(res, c) {
   return ['spawn-failed', 'invalid-timeout'].includes(res.model.stopReason) ? 0 : c.maxBudgetUsd;
 }
 
+// Moves the scope's last-run marks forward, or not. A model that never ran and left nothing does
+// not count. For Organize, `rejected` advances them too (with the digest of the live folder,
+// which then equals the snapshot): the same notes would only give the same rejection, so the
+// scope waits until its content changes, or REVISIT_MS when it is still over the limits.
+// Extract keeps its previous lastExtract after a rejection, so those conversations are read again.
 function record(config, state, { kind, scope, res, started, dryRun }) {
   const entry = state.projects[scope] ?? (state.projects[scope] = {});
   const ran = res.model?.ran === true;
-  const advance = res.outcome === 'no-session' || res.outcome === 'applied' || (res.outcome === 'no-change' && ran);
+  let advance;
+  if (kind === 'extract') {
+    advance = res.outcome === 'no-session' || res.outcome === 'applied' || (res.outcome === 'no-change' && ran);
+  } else {
+    advance = res.outcome === 'applied' || ((res.outcome === 'no-change' || res.outcome === 'rejected') && ran);
+  }
   if (advance && !dryRun) {
     if (kind === 'extract') {
       entry.lastExtract = started.toISOString();
@@ -659,13 +799,26 @@ function record(config, state, { kind, scope, res, started, dryRun }) {
   writeState(config, state);
 }
 
+function headline(kind, scope, res) {
+  let what;
+  if (res.outcome === 'rejected') what = `rejected, nothing applied (${res.errors?.length ?? 0} rule violation(s))`;
+  else if (res.outcome === 'changed-meanwhile') what = 'changed meanwhile, nothing applied';
+  else if (res.outcome === 'aborted') what = 'aborted, nothing applied';
+  else what = `${res.outcome}, ${res.changes?.length ?? 0} change(s)`;
+  let line = `${kind} ${scope}: ${what}, ${usd(res.model ? res.model.costUsd : 0)}`;
+  if (res.model) line += `, stopped: ${res.model.stopReason}`;
+  return line;
+}
+
 function printScope(kind, scope, res, opts) {
-  const lines = [];
-  let head = `${kind} ${scope}: ${res.outcome}, ${res.changes?.length ?? 0} change(s), ${usd(res.model ? res.model.costUsd : 0)}`;
-  if (res.model) head += `, stopped: ${res.model.stopReason}`;
-  lines.push(head);
+  const lines = [headline(kind, scope, res)];
   const errors = (res.errors ?? []).map((e) => `  - ${e}`);
-  if (res.outcome === 'sync-failed') lines.push(`  - the sync before the snapshot failed: ${res.sync?.error ?? 'unknown error'}`);
+  if (res.outcome === 'sync-failed') {
+    const when = res.step === 'apply' ? 'before applying' : 'before the snapshot';
+    lines.push(`  - the sync ${when} failed: ${res.sync?.error ?? 'unknown error'}`);
+  }
+  if (res.outcome === 'error') lines.push(`  - the ${res.step} step failed: ${res.error ?? 'unknown error'}`);
+  if (res.outcome === 'step-failed') lines.push(`  - the ${res.step} step could not run`);
   if (res.reason) lines.push(`  - ${res.reason}`);
   if (res.outcome === 'changed-meanwhile') {
     for (const name of res.liveChanged ?? []) lines.push(`  - changed meanwhile: ${name}`);
@@ -693,13 +846,17 @@ async function driverMain(argv) {
     process.stdout.write(`${NOT_CONFIGURED}\n`);
     return 0;
   }
+  for (const signal of Object.keys(SIGNAL_CODES)) process.on(signal, onSignal);
   const c = config.consolidate;
   const model = opts.model ?? c.model;
   const started = new Date();
+  const now = started.getTime();
+  removeStaleRuns(config, now);
   const scan = runStep(['scan']);
-  if (scan?.outcome !== 'scan') {
-    process.stderr.write('agent-memory consolidate: the scan of the notes could not run.\n');
-    return 1;
+  if (!scan || scan.outcome !== 'scan') {
+    const why = scan?.outcome === 'error' ? scan.error : 'the scan of the notes could not run';
+    process.stderr.write(`agent-memory consolidate: ${why}\n`);
+    return interrupted ? SIGNAL_CODES[interrupted] : 1;
   }
   const projects = new Set(scan.projects.map((p) => p.name));
   for (const name of opts.projects) {
@@ -709,12 +866,12 @@ async function driverMain(argv) {
       return 2;
     }
   }
-  keepWork = opts.keep;
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
+  if ((scan.ignored ?? []).includes(GLOBAL)) {
+    process.stdout.write('agent-memory consolidate: projects/global is never consolidated (a project folder may not be named global).\n');
+  }
 
-  const state = readState(config);
-  const list = opts.kind === 'extract' ? extractScopes(scan, state, opts, started.getTime()) : organizeScopes(scan, state, opts);
+  const state = readState(config, started);
+  const list = opts.kind === 'extract' ? extractScopes(scan, state, opts, now) : organizeScopes(scan, state, opts, now);
   const limit = opts.projects.length > 0 ? Infinity : c.maxProjects;
   const ceiling = c.maxProjects * c.maxBudgetUsd;
   let calls = 0;
@@ -723,7 +880,7 @@ async function driverMain(argv) {
   let failed = false;
   try {
     for (const item of list) {
-      if (calls >= limit) break;
+      if (interrupted || calls >= limit) break;
       if (spent >= ceiling) {
         process.stdout.write(`${opts.kind}: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}\n`);
         break;
@@ -731,6 +888,7 @@ async function driverMain(argv) {
       let digest = null;
       if (opts.kind === 'extract') {
         digest = await buildDigest({ files: item.files, repoDir: config.repoDir, maxBytes: c.maxTranscriptBytes });
+        if (interrupted) break;
         if (digest.sessions === 0) {
           const res = { outcome: 'no-session' };
           record(config, state, { kind: opts.kind, scope: item.scope, res, started, dryRun: opts.dryRun });
@@ -738,21 +896,29 @@ async function driverMain(argv) {
           continue;
         }
       }
-      runDir ??= makeRunDir(config, started);
-      currentRun = runDir;
+      runDir ??= makeRunDir(config, started, opts.keep);
       calls += 1;
       const res = await runScope({ config, opts, model, runDir, scope: item.scope, digest });
       digest = null;
       spent += spentBy(res, c);
       record(config, state, { kind: opts.kind, scope: item.scope, res, started, dryRun: opts.dryRun });
       printScope(opts.kind, item.scope, res, opts);
+      if (res.outcome === 'aborted') break;
       if (res.outcome === 'step-failed' || res.outcome === 'error') {
         failed = true;
         break;
       }
+      if (res.outcome === 'sync-failed') {
+        process.stdout.write(`${opts.kind}: stopped; the sync failed, and the remaining scopes would wait for it too\n`);
+        break;
+      }
     }
   } finally {
-    if (runDir && !opts.keep) rmSync(runDir, { recursive: true, force: true });
+    if (runDir && !opts.keep) removeTree(runDir);
+  }
+  if (interrupted) {
+    process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing more was applied\n`);
+    return SIGNAL_CODES[interrupted];
   }
   if (list.length === 0) process.stdout.write(`${opts.kind}: nothing to do\n`);
   return failed ? 1 : 0;

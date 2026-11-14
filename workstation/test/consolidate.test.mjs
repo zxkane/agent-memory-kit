@@ -23,7 +23,7 @@ const DAY_MS = 24 * 3600 * 1000;
 // A stand-in for the model client. It logs how it was called (and the digest it was given), then
 // edits files in its working directory as the test's instruction file says for its scope.
 const FAKE = `#!${process.execPath}
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { basename, dirname, join } from 'node:path';
 const cwd = process.cwd();
@@ -41,6 +41,11 @@ for (const [rel, text] of Object.entries(ins.writes ?? {})) {
 }
 for (const [path, text] of Object.entries(ins.liveWrites ?? {})) writeFileSync(path, text);
 for (const argv of ins.git ?? []) execFileSync('git', argv, { stdio: 'ignore' });
+for (const [rel, target] of Object.entries(ins.links ?? {})) {
+  rmSync(join(cwd, rel), { recursive: true, force: true });
+  symlinkSync(target, join(cwd, rel));
+}
+for (const [path, mode] of Object.entries(ins.chmod ?? {})) chmodSync(path.startsWith('/') ? path : join(cwd, path), mode);
 if (ins.sleepMs) await new Promise((resolve) => setTimeout(resolve, ins.sleepMs));
 if (ins.silent) process.exit(1);
 const result = { type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.25, num_turns: 4, result: process.env.FAKE_SUMMARY, ...ins.result };
@@ -255,28 +260,92 @@ test('organize of global works on global/ alone', (t) => {
   assert.equal(f.readState().projects.p, undefined);
 });
 
-test('an interrupted run removes its work folder, digest included', async (t) => {
-  const f = extractFixture(t);
-  f.instruct({ p: { sleepMs: 20000 } });
-  const child = spawn(RUN_SH, ['consolidate', 'extract'], { env: f.env, stdio: 'ignore' });
-  const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
-  let call;
+// True while the process runs; a zombie that is not yet reaped counts as gone.
+function alive(pid) {
   try {
-    for (let i = 0; i < 300 && !(call = f.calls()[0]); i++) await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.ok(call, 'the model was called');
-    assert.ok(existsSync(join(dirname(call.cwd), 'input/digest.md')));
-    child.kill('SIGTERM');
-    assert.deepEqual(await exited, { code: 143, signal: null });
-    assert.deepEqual(readdirSync(f.workRoot()), []);
-  } finally {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(check, ms = 15000) {
+  const deadline = Date.now() + ms;
+  let value;
+  while (!(value = check()) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  return value;
+}
+
+// Starts `run.sh consolidate <args>` with a sleeping fake model, waits for the model call, sends
+// `signal` to the driver and returns what is left.
+async function interrupt(t, f, signal, args) {
+  const child = spawn(RUN_SH, ['consolidate', ...args], { env: f.env, stdio: ['ignore', 'pipe', 'ignore'] });
+  let stdout = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
+  let call;
+  t.after(() => {
     child.kill('SIGKILL');
     if (call) {
       try { process.kill(-call.pid, 'SIGKILL'); } catch { /* already gone */ }
     }
+  });
+  call = await waitFor(() => f.calls()[0]);
+  assert.ok(call, 'the model was called');
+  child.kill(signal);
+  const status = await exited;
+  return { call, status, stdout };
+}
+
+const lockIsFree = (f) => spawnSync('flock', ['-n', join(f.home, '.local/state/agent-memory/consolidate.lock'), 'true']).status === 0;
+
+test('SIGTERM during the model run stops the model and removes the work folder, digest included', async (t) => {
+  const f = extractFixture(t);
+  f.instruct({ p: { sleepMs: 20000 } });
+  const head = f.head();
+  const { call, status, stdout } = await interrupt(t, f, 'SIGTERM', ['extract']);
+  assert.deepEqual(status, { code: 143, signal: null });
+  assert.equal(alive(call.pid), false);
+  assert.deepEqual(readdirSync(f.workRoot()), []);
+  assert.equal(f.head(), head);
+  assert.match(stdout, /^extract p: aborted, nothing applied/m);
+  assert.equal(f.readState().projects.p.lastExtract, undefined);
+});
+
+test('SIGINT and SIGHUP stop the model, apply nothing and free the lock', async (t) => {
+  for (const [signal, code] of [['SIGINT', 130], ['SIGHUP', 129]]) {
+    const f = fixture(t);
+    duplicateProject(f);
+    const instruction = mergeInstruction();
+    instruction.p.sleepMs = 20000;
+    f.instruct(instruction);
+    const head = f.head();
+    const { call, status } = await interrupt(t, f, signal, ['organize']);
+    assert.deepEqual(status, { code, signal: null }, signal);
+    assert.equal(alive(call.pid), false, signal);
+    assert.deepEqual(readdirSync(f.workRoot()), [], signal);
+    assert.equal(f.head(), head, signal);
+    assert.ok(existsSync(join(f.repo, 'projects/p/b.md')), signal);
+    assert.ok(lockIsFree(f), signal);
   }
 });
 
-test('a rejected result changes nothing in the clone and keeps the organize state', (t) => {
+test('an interrupted run with --keep keeps its work folder and says so', async (t) => {
+  const f = extractFixture(t);
+  f.instruct({ p: { sleepMs: 20000 } });
+  const { call, status, stdout } = await interrupt(t, f, 'SIGINT', ['extract', '--keep']);
+  assert.equal(status.code, 130);
+  assert.ok(existsSync(join(dirname(call.cwd), 'input/digest.md')));
+  assert.ok(stdout.includes(dirname(call.cwd)));
+  assert.match(stdout, /conversation text/);
+});
+
+test('a rejected result changes nothing in the clone; organize records the scope as tried', (t) => {
   const f = fixture(t);
   duplicateProject(f);
   f.instruct({ p: { writes: { 'notes/b.md': 'MOVED TO [[nothere]]\n', 'notes/MEMORY.md': index('a.md') } } });
@@ -284,16 +353,32 @@ test('a rejected result changes nothing in the clone and keeps the organize stat
   const before = treeText(f.repo);
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /^organize p: rejected/m);
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(2 rule violation\(s\)\), USD 0\.25, stopped: completed$/m);
   assert.match(r.stdout, /^ {2}- notes\/b\.md: the target note does not exist$/m);
   assert.equal(f.head(), head);
   assert.equal(treeText(f.repo), before);
   assert.deepEqual(f.reports(), []);
+  // The same notes would give the same rejection: the scope waits until it changes.
   const entry = f.readState().projects.p;
-  assert.equal(entry.lastOrganize, undefined);
-  assert.equal(entry.organizedDigest, undefined);
+  assert.ok(!Number.isNaN(Date.parse(entry.lastOrganize)));
+  assert.equal(entry.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
   assert.equal(entry.lastOutcome.outcome, 'rejected');
   assert.deepEqual(readdirSync(f.workRoot()), []);
+  f.run('organize');
+  assert.equal(f.calls().length, 1);
+});
+
+test('a rejected extract keeps its previous lastExtract', (t) => {
+  const f = extractFixture(t);
+  const before = new Date(Date.now() - 2 * DAY_MS).toISOString();
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.stateFile(), JSON.stringify({ projects: { p: { lastExtract: before }, h: { lastExtract: before } } }));
+  f.instruct({ p: { writes: { 'a.md': '' } } });
+  const r = f.run('extract');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract p: rejected, nothing applied \(1 rule violation\(s\)\)/m);
+  assert.equal(f.readState().projects.p.lastExtract, before);
+  assert.notEqual(f.readState().projects.h.lastExtract, before);
 });
 
 test('a note written to the live folder during the run means nothing is applied', (t) => {
@@ -305,8 +390,8 @@ test('a note written to the live folder during the run means nothing is applied'
   f.instruct(instruction);
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /^organize p: changed-meanwhile/m);
-  assert.match(r.stdout, /notes\/new\.md/);
+  assert.match(r.stdout, /^organize p: changed meanwhile, nothing applied, USD 0\.25, stopped: completed$/m);
+  assert.match(r.stdout, /^ {2}- changed meanwhile: notes\/new\.md$/m);
   assert.match(readFileSync(live, 'utf8'), /A session wrote this/);
   assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
   assert.doesNotMatch(readFileSync(join(f.repo, 'projects/p/a.md'), 'utf8'), /Merged from b/);
@@ -337,7 +422,7 @@ test('organize picks due scopes only: over-limit, then conflicts, then changed; 
     projects: {
       same: { lastOrganize: old, organizedDigest: folderDigest(join(f.repo, 'projects/same')) },
       changed: { lastOrganize: old, organizedDigest: 'f'.repeat(64) },
-      big: { lastOrganize: recent, organizedDigest: folderDigest(join(f.repo, 'projects/big')) },
+      big: { lastOrganize: recent, organizedDigest: 'e'.repeat(64) },
       conflicted: { lastOrganize: old, organizedDigest: folderDigest(join(f.repo, 'projects/conflicted')) },
     },
   }));
@@ -346,13 +431,57 @@ test('organize picks due scopes only: over-limit, then conflicts, then changed; 
   assert.deepEqual(f.calls().map((c) => c.scope), ['big']);
   assert.match(r.stdout, /^organize big: no-change, 0 change\(s\)/m);
 
+  // big is unchanged since and was organized moments ago: not due, though still over the limit.
   f.setConfig({ maxProjects: 5 });
   r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(f.calls().map((c) => c.scope), ['big', 'big', 'conflicted', 'changed']);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['big', 'conflicted', 'changed']);
   assert.doesNotMatch(r.stdout, /organize same|organize empty|organize global/);
   // A no-change run records the scope as organized.
   assert.equal(f.readState().projects.changed.organizedDigest, folderDigest(join(f.repo, 'projects/changed')));
+});
+
+test('an unchanged scope still over the limit is due again only after 28 days', (t) => {
+  const f = fixture(t);
+  const lines = Array.from({ length: 201 }, (_, i) => `- [n${i}](n${i}.md) — line ${i}`).join('\n') + '\n';
+  f.seed({ 'projects/big/MEMORY.md': lines, 'projects/big/n0.md': note('n0', 'N0', 'One note.') });
+  f.run('organize');
+  f.run('organize');
+  assert.deepEqual(f.calls().map((c) => c.scope), ['big']);
+  const state = f.readState();
+  state.projects.big.lastOrganize = new Date(Date.now() - 27 * DAY_MS).toISOString();
+  writeFileSync(f.stateFile(), JSON.stringify(state));
+  f.run('organize');
+  assert.equal(f.calls().length, 1);
+  state.projects.big.lastOrganize = new Date(Date.now() - 29 * DAY_MS).toISOString();
+  writeFileSync(f.stateFile(), JSON.stringify(state));
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['big', 'big']);
+});
+
+test('with maxProjects 1, two due scopes are both organized over two runs', (t) => {
+  const f = fixture(t, { consolidate: { maxProjects: 1 } });
+  f.seed({ 'projects/one/a.md': note('a', 'A', 'One.'), 'projects/two/a.md': note('a', 'A', 'Two.') });
+  f.run('organize');
+  f.run('organize');
+  f.run('organize');
+  assert.deepEqual(f.calls().map((c) => c.scope).sort(), ['one', 'two']);
+});
+
+test('extract takes the project extracted longest ago first; maxProjects bounds the run', (t) => {
+  const f = extractFixture(t);
+  f.setConfig({ maxProjects: 1 });
+  f.seed({ 'projects/q/MEMORY.md': index('y.md'), 'projects/q/y.md': note('y', 'Y', 'Another project.') });
+  // q's session is older than p's: newest-session-first would take p.
+  f.addSession('-work-q', 'q', 'a question in q', 3 * 3600 * 1000);
+  mkdirSync(f.state, { recursive: true });
+  const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+  writeFileSync(f.stateFile(), JSON.stringify({ projects: { p: { lastExtract: days(2) }, q: { lastExtract: days(5) } } }));
+  f.run('extract');
+  assert.deepEqual(f.calls().map((c) => c.scope), ['q']);
+  f.run('extract');
+  assert.deepEqual(f.calls().map((c) => c.scope), ['q', 'p']);
 });
 
 // A project `p` with one interactive session and a project `h` with only a headless one.
@@ -364,14 +493,14 @@ function extractFixture(t) {
     'projects/h/MEMORY.md': index('x.md'),
     'projects/h/x.md': note('x', 'X', 'Headless project.'),
   });
-  const session = (slug, project, records) => {
+  const session = (slug, project, records, ageMs = 3600 * 1000) => {
     const dir = join(f.claudeDir, 'projects', slug);
     mkdirSync(dir, { recursive: true });
     symlinkSync(join(f.repo, 'projects', project), join(dir, 'memory'));
     const file = join(dir, `${slug}-session.jsonl`);
     writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
-    const hourAgo = new Date(Date.now() - 3600 * 1000);
-    utimesSync(file, hourAgo, hourAgo);
+    const then = new Date(Date.now() - ageMs);
+    utimesSync(file, then, then);
   };
   const turn = (type, text, extra = {}) => ({
     type, timestamp: '2026-11-13T10:00:00Z',
@@ -379,6 +508,8 @@ function extractFixture(t) {
   });
   session('-work-p', 'p', [turn('user', SESSION_PHRASE, { promptSource: 'typed' }), turn('assistant', 'Noted.')]);
   session('-work-h', 'h', [turn('user', 'run the batch', { promptSource: 'sdk' }), turn('assistant', 'Done.')]);
+  f.addSession = (slug, project, text, ageMs) =>
+    session(slug, project, [turn('user', text, { promptSource: 'typed' }), turn('assistant', 'Noted.')], ageMs);
   return f;
 }
 
@@ -442,6 +573,7 @@ test('extract with --keep leaves a private work folder and says so', (t) => {
   assert.equal(statSync(join(scopeDir, 'input')).mode & 0o777, 0o700);
   assert.equal(statSync(join(scopeDir, 'input/digest.md')).mode & 0o777, 0o600);
   assert.ok(existsSync(join(scopeDir, 'plan.json')));
+  assert.ok(existsSync(join(dirname(scopeDir), '.keep')));
   assert.equal(f.readState().projects.p.lastExtract, undefined);
 });
 
@@ -575,9 +707,9 @@ test('--min-retention lowers the bar for one run; values outside 0..1 are a usag
   f.seed({ 'projects/p/MEMORY.md': index('a.md'), 'projects/p/a.md': note('a', 'Many terms', words) });
   f.instruct({ p: { writes: { 'notes/a.md': note('a', 'Few terms', 'Almost nothing is left.') } } });
   let r = f.run('organize');
-  assert.match(r.stdout, /^organize p: rejected/m);
+  assert.match(r.stdout, /^organize p: rejected, nothing applied/m);
   assert.match(r.stdout, /distinct terms/);
-  r = f.run('organize', '--min-retention', '0');
+  r = f.run('organize', '--project', 'p', '--min-retention', '0');
   assert.match(r.stdout, /^organize p: applied, 1 change\(s\)/m);
   for (const bad of ['1.5', '-0.1', 'x', '']) {
     const u = f.run('organize', '--min-retention', bad);
@@ -629,27 +761,234 @@ test('a plan.json changed by the model is refused and nothing is applied', (t) =
   assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
 });
 
-test('a failed sync before the snapshot skips the scope without calling the model', (t) => {
+test('a failed sync before the snapshot skips the scope and stops the run', (t) => {
   const f = fixture(t);
   duplicateProject(f);
+  f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
   sh(f.repo, 'git', ['remote', 'set-url', 'origin', join(f.tmp, 'no-such-remote.git')]);
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^organize p: sync-failed/m);
+  assert.match(r.stdout, /the sync before the snapshot failed/);
+  assert.doesNotMatch(r.stdout, /organize q:/);
+  assert.match(r.stdout, /^organize: stopped; the sync failed/m);
   assert.deepEqual(f.calls(), []);
   assert.equal(f.readState().projects.p.lastOutcome.outcome, 'sync-failed');
 });
 
+const REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+
+// Puts a `git` before the real one on the driver's PATH. `script` runs first and may exit.
+function wrapGit(f, script) {
+  const bin = join(f.tmp, 'bin');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'git'), `#!/bin/bash\n${script}\nexec ${REAL_GIT} "$@"\n`);
+  chmodSync(join(bin, 'git'), 0o755);
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+}
+
 test('a failed sync after an applied change still counts as applied; the push is pending', (t) => {
   const f = fixture(t);
   duplicateProject(f);
-  const instruction = mergeInstruction();
-  instruction.p.git = [['-C', f.repo, 'remote', 'set-url', 'origin', join(f.tmp, 'no-such-remote.git')]];
-  f.instruct(instruction);
+  wrapGit(f, 'for a in "$@"; do if [[ "$a" == push ]]; then echo "fatal: push refused" >&2; exit 1; fi; done');
+  f.instruct(mergeInstruction());
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^organize p: applied/m);
   assert.match(r.stdout, /push pending/);
   assert.match(f.subjects()[0], /^consolidate\(alpha\): organize projects\/p/);
   assert.ok(f.remoteFiles().includes('projects/p/b.md'));
+});
+
+test('a session note in another project during the run gets its own commit; reverting the run keeps it', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/q/MEMORY.md': index('z.md'), 'projects/q/z.md': note('z', 'Z', 'zzz') });
+  const session = join(f.repo, 'projects/q/session.md');
+  const instruction = mergeInstruction();
+  instruction.p.liveWrites = { [session]: note('session', 'S', 'written by a session') };
+  f.instruct(instruction);
+  const r = f.run('organize', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied/m);
+  const files = (rev) => sh(f.repo, 'git', ['show', '--name-only', '--format=', rev]).trim().split('\n').sort();
+  const [consolidate, sync] = f.subjects();
+  assert.match(consolidate, /^consolidate\(alpha\): organize projects\/p \(4 file\(s\)\)$/);
+  assert.deepEqual(files('HEAD'),
+    [`_reports/${today()}-alpha-organize-p.md`, 'projects/p/MEMORY.md', 'projects/p/a.md', 'projects/p/b.md']);
+  assert.equal(sync, 'sync(alpha): 1 file(s)');
+  assert.deepEqual(files('HEAD~1'), ['projects/q/session.md']);
+  sh(f.repo, 'git', ['revert', '--no-edit', 'HEAD']);
+  assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
+  assert.match(readFileSync(session, 'utf8'), /written by a session/);
+});
+
+test('when the sync before applying fails, nothing is applied and nothing unrelated is committed', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/q/MEMORY.md': index('z.md'), 'projects/q/z.md': note('z', 'Z', 'zzz') });
+  const counter = join(f.tmp, 'addcount');
+  // The first `git add` is the snapshot's sync; the second, the sync before applying, fails.
+  wrapGit(f, `for a in "$@"; do if [[ "$a" == add ]]; then n=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${counter}"; if [[ $n == 2 ]]; then echo "fatal: Unable to create index.lock: File exists" >&2; exit 128; fi; fi; done`);
+  const instruction = mergeInstruction();
+  instruction.p.liveWrites = { [join(f.repo, 'projects/q/session.md')]: note('session', 'S', 'written by a session') };
+  f.instruct(instruction);
+  const head = f.head();
+  const r = f.run('organize', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: sync-failed/m);
+  assert.match(r.stdout, /the sync before applying failed/);
+  assert.equal(f.head(), head);
+  assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
+  assert.doesNotMatch(readFileSync(join(f.repo, 'projects/p/a.md'), 'utf8'), /Merged from b/);
+  assert.deepEqual(f.reports(), []);
+  assert.equal(f.readState().projects.p.lastOrganize, undefined);
+});
+
+const asRoot = process.getuid?.() === 0;
+
+test('apply refusing part-way ends as changed meanwhile and commits nothing', { skip: asRoot && 'runs as root' }, (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  const live = join(f.repo, 'projects/p');
+  const instruction = mergeInstruction();
+  instruction.p.chmod = { [live]: 0o555 };
+  f.instruct(instruction);
+  const head = f.head();
+  let r;
+  try {
+    r = f.run('organize');
+  } finally {
+    chmodSync(live, 0o755);
+  }
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: changed meanwhile, nothing applied/m);
+  assert.match(r.stdout, /EACCES/);
+  assert.equal(f.head(), head);
+  assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
+  assert.deepEqual(f.reports(), []);
+});
+
+test('a model that timed out still has its valid edits judged and applied', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.env.AGENT_MEMORY_MODEL_TIMEOUT_MS = '1500';
+  const instruction = mergeInstruction();
+  instruction.p.sleepMs = 30000;
+  f.instruct(instruction);
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied, 3 change\(s\), USD unknown, stopped: timeout$/m);
+  assert.equal(existsSync(join(f.repo, 'projects/p/b.md')), false);
+  assert.equal(alive(f.calls()[0].pid), false);
+});
+
+test('a model command that cannot start still goes through the apply step', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.setConfig({ command: join(f.tmp, 'no-such-model') });
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: no-change, 0 change\(s\), USD unknown, stopped: spawn-failed$/m);
+  const entry = f.readState().projects.p;
+  assert.equal(entry.lastOutcome.outcome, 'no-change');
+  assert.equal(entry.organizedDigest, undefined);
+});
+
+test('a project folder named global is reported and never used', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/global/MEMORY.md': index('x.md'), 'projects/global/x.md': note('x', 'X', 'Never touched.') });
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.split('\n').filter((l) => /projects\/global is never consolidated/.test(l)).length, 1);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
+});
+
+test('a model-chosen name of a non-note file is not printed', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct({ p: { writes: { [`notes/${SESSION_PHRASE}.txt`]: 'x', [`notes/${SESSION_PHRASE}-2.txt`]: 'y' } } });
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(1 rule violation\(s\)\)/m);
+  assert.match(r.stdout, /^ {2}- notes\/\(2 entries that are not note files\): not a regular note file$/m);
+  assert.doesNotMatch(r.stdout + r.stderr, /UNIQUE-SESSION-PHRASE/);
+});
+
+test('a work folder replaced by a link is rejected', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/q/MEMORY.md': index('z.md'), 'projects/q/z.md': note('z', 'Z', 'zzz') });
+  f.instruct({ p: { links: { notes: join(f.repo, 'projects/q') } } });
+  const head = f.head();
+  const r = f.run('organize', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(1 rule violation\(s\)\)/m);
+  assert.match(r.stdout, /^ {2}- notes: work folder is not a real folder$/m);
+  assert.equal(f.head(), head);
+});
+
+test('an error in a step is reported as such and stops the run with exit 1', { skip: asRoot && 'runs as root' }, (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
+  f.instruct({ p: { chmod: { notes: 0o000 } } });
+  const r = f.run('organize');
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: error, 0 change\(s\), USD 0\.25, stopped: completed$/m);
+  assert.match(r.stdout, /^ {2}- the apply step failed: EACCES/m);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
+  assert.deepEqual(readdirSync(f.workRoot()), []);
+});
+
+test('a state file that cannot be parsed is moved aside; unknown keys of a readable one are kept', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.stateFile(), 'not json');
+  let r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /the state file could not be read; moved to .*consolidate\.json\.unreadable-\d{8}T\d{6}Z/);
+  const aside = readdirSync(f.state).filter((n) => n.startsWith('consolidate.json.unreadable-'));
+  assert.equal(aside.length, 1);
+  assert.equal(readFileSync(join(f.state, aside[0]), 'utf8'), 'not json');
+  assert.equal(f.readState().projects.p.lastOutcome.outcome, 'no-change');
+
+  writeFileSync(f.stateFile(), JSON.stringify({ version: 3, projects: { p: { extra: 1 } } }));
+  r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  const state = f.readState();
+  assert.equal(state.version, 3);
+  assert.equal(state.projects.p.extra, 1);
+  assert.ok(state.projects.p.organizedDigest);
+});
+
+test('a missing clone, or a folder that is not a clone, ends the run with a message and exit 1', (t) => {
+  const f = fixture(t);
+  const config = JSON.parse(readFileSync(f.configFile, 'utf8'));
+  const plain = join(f.tmp, 'plain');
+  mkdirSync(plain);
+  for (const [repoDir, why] of [[join(f.tmp, 'nowhere'), /does not exist/], [plain, /is not a Git clone/]]) {
+    writeFileSync(f.configFile, JSON.stringify({ ...config, repoDir }));
+    const r = f.run('organize');
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, why);
+    assert.doesNotMatch(r.stdout, /nothing to do/);
+  }
+  assert.deepEqual(f.calls(), []);
+});
+
+test('run folders older than a day are removed at the start unless marked by --keep', (t) => {
+  const f = fixture(t);
+  const root = f.workRoot();
+  const old = new Date(Date.now() - 2 * DAY_MS);
+  for (const name of ['old-run', 'kept-run', 'fresh-run']) {
+    write(root, `${name}/p/input/digest.md`, SESSION_PHRASE);
+  }
+  writeFileSync(join(root, 'kept-run/.keep'), '');
+  for (const name of ['old-run', 'kept-run']) utimesSync(join(root, name), old, old);
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(readdirSync(root).sort(), ['fresh-run', 'kept-run']);
 });
