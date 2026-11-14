@@ -37,6 +37,9 @@ const clientBase = {
   allowedOauthFlowsUserPoolClient: true,
   allowedOauthScopes: resourceServer.scopeIdentifiers,
   enableTokenRevocation: true,
+  // Client credentials only. The provider may treat an empty list as unset, in
+  // which case Cognito applies its defaults; there are no users either way.
+  explicitAuthFlows: [],
 };
 
 export const hubClient = new aws.cognito.UserPoolClient("MemoryHubClient", {
@@ -46,13 +49,20 @@ export const hubClient = new aws.cognito.UserPoolClient("MemoryHubClient", {
   tokenValidityUnits: { accessToken: "days" },
 });
 
-// Used only by the deployed checks.
-export const probeClient = new aws.cognito.UserPoolClient("MemoryProbeClient", {
-  ...clientBase,
-  name: "probe",
-  accessTokenValidity: 5,
-  tokenValidityUnits: { accessToken: "minutes" },
-});
+// Used only by the deployed checks. On prod it can only read, so a leaked probe
+// secret cannot write notes; the checks skip the write steps without the scope.
+export const probeClient = new aws.cognito.UserPoolClient(
+  "MemoryProbeClient",
+  {
+    ...clientBase,
+    name: "probe",
+    allowedOauthScopes:
+      $app.stage === "prod" ? [`${RESOURCE_SERVER}/read`] : resourceServer.scopeIdentifiers,
+    accessTokenValidity: 5,
+    tokenValidityUnits: { accessToken: "minutes" },
+  },
+  { dependsOn: [resourceServer] },
+);
 
 export const issuer = $interpolate`https://cognito-idp.${region}.amazonaws.com/${userPool.id}`;
 

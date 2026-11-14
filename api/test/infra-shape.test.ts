@@ -48,4 +48,39 @@ describe('infrastructure source', () => {
   it('requires AGENT_MEMORY_REGION', () => {
     assert.match(read('sst.config.ts'), /Set AGENT_MEMORY_REGION to the AWS region to deploy to\./);
   });
+
+  const squash = (rel: string): string => read(rel).replace(/\s+/g, '');
+
+  it('has exactly one route call, inside the ROUTES loop, with the JWT authorizer and a scope', () => {
+    const src = squash('infra/api.ts');
+    assert.equal((src.match(/\.route\(/g) ?? []).length, 1);
+    assert.doesNotMatch(src, /\.routeUrl\(|\.routePrivate\(/);
+    assert.equal((src.match(/\.addAuthorizer\(/g) ?? []).length, 1);
+    const loop = src.match(/for\(const(\w+)ofROUTES\)\{(.*)\}constprefix/);
+    assert.ok(loop, 'ROUTES loop');
+    const body = loop[2];
+    assert.equal((body.match(/\.route\(/g) ?? []).length, 1);
+    assert.match(body, /auth:\{jwt:\{authorizer:authorizer\.id,scopes:\[`\$\{RESOURCE_SERVER\}\/\$\{\w+\.scope\}`\]/);
+  });
+
+  it('gives the function an explicit log group and an empty managed-policy list', () => {
+    const src = squash('infra/api.ts');
+    assert.match(src, /logging:\{logGroup:/);
+    assert.doesNotMatch(src.match(/logging:\{[^}]*\}/)?.[0] ?? '', /retention/);
+    assert.match(src, /role:\(?\w*\)?[^;]*managedPolicyArns=\[\]|managedPolicyArns=\[\]/);
+    assert.match(src, /retentionInDays:30/);
+  });
+
+  it('makes the probe client scopes depend on the stage', () => {
+    const src = squash('infra/auth.ts');
+    assert.match(src, /name:"probe"[\s\S]*allowedOauthScopes:\$app\.stage===/);
+  });
+
+  it('sets explicitAuthFlows explicitly on both clients', () => {
+    assert.equal((squash('infra/auth.ts').match(/explicitAuthFlows:\[\]/g) ?? []).length, 1);
+  });
+
+  it('logs the source IP', () => {
+    assert.match(read('infra/api.ts'), /\$context\.identity\.sourceIp/);
+  });
 });

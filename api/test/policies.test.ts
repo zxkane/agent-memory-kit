@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { bucketPolicy, functionPolicy } from '../infra/policies.ts';
+import { bucketPolicy, functionPolicy, logsPolicy } from '../infra/policies.ts';
 
 const BUCKET = 'arn:aws:s3:::example-bucket';
 const ROLE_A = 'arn:aws:iam::123456789012:role/bridge-a';
@@ -102,8 +102,43 @@ describe('bucketPolicy', () => {
       'arn:aws:iam::123456789012:role/',
       '*',
       'arn:aws:iam::123456789012:role/x y',
+      'arn:aws:iam::123456789012:role//name',
+      'arn:aws:iam::123456789012:role/a//b',
+      'arn:aws:iam::123456789012:role/a/',
     ]) {
       assert.throws(() => bucketPolicy(BUCKET, [bad]), /role/i, bad);
+    }
+  });
+});
+
+describe('bucketPolicy role ARN paths', () => {
+  it('accepts a plain name and a path', () => {
+    for (const ok of ['arn:aws:iam::123456789012:role/name', 'arn:aws:iam::123456789012:role/path/name']) {
+      assert.doesNotThrow(() => bucketPolicy(BUCKET, [ok]), ok);
+    }
+  });
+});
+
+describe('logsPolicy', () => {
+  const LOG_GROUP = 'arn:aws:logs:region-x:123456789012:log-group:/aws/lambda/example';
+  const policy = logsPolicy(LOG_GROUP);
+  const statements = policy.Statement as Statement[];
+
+  it('allows exactly CreateLogStream and PutLogEvents on the group streams', () => {
+    const pairs = statements.flatMap((s) => {
+      assert.equal(s.Effect, 'Allow');
+      return asList(s.Action).flatMap((a) => asList(s.Resource).map((r) => `${a} ${r}`));
+    });
+    assert.deepEqual(
+      pairs.sort(),
+      [`logs:CreateLogStream ${LOG_GROUP}:*`, `logs:PutLogEvents ${LOG_GROUP}:*`].sort(),
+    );
+  });
+
+  it('has no CreateLogGroup and no bare wildcard resource', () => {
+    assert.ok(!JSON.stringify(policy).includes('CreateLogGroup'));
+    for (const s of statements) {
+      for (const r of asList(s.Resource)) assert.notEqual(r, '*');
     }
   });
 });

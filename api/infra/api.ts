@@ -2,19 +2,17 @@
 import { RESOURCE_SERVER, ROUTES } from "../src/routes.ts";
 import { bucket } from "./storage.ts";
 import { hubClient, issuer, probeClient, tokenEndpoint } from "./auth.ts";
-import { functionPolicy } from "./policies.ts";
+import { functionPolicy, logsPolicy } from "./policies.ts";
 
 export { bucket, tokenEndpoint };
 
-// The function's permissions are exactly functionPolicy(bucketArn): no link,
-// no Function URL, nothing else on the bucket.
-const permissions = bucket.arn.apply((arn) =>
-  functionPolicy(arn).Statement.map((statement) => ({
-    effect: statement.Effect === "Allow" ? ("allow" as const) : ("deny" as const),
-    actions: statement.Action,
-    resources: statement.Resource,
-  })),
-);
+// The function's role holds exactly two inline policies, functionPolicy(bucketArn)
+// and logsPolicy(logGroupArn), and no managed policy. The log group is created
+// here so SST does not attach the broad basic-execution managed policy.
+const logGroup = new aws.cloudwatch.LogGroup("MemoryApiLogGroup", {
+  name: `/aws/lambda/${$app.name}-${$app.stage}-api`,
+  retentionInDays: 30,
+});
 
 const fn = new sst.aws.Function("MemoryApiFunction", {
   handler: "src/handler.handler",
@@ -22,15 +20,24 @@ const fn = new sst.aws.Function("MemoryApiFunction", {
   memory: "256 MB",
   timeout: "10 seconds",
   environment: { BUCKET: bucket.bucket },
-  permissions,
-  logging: { retention: "1 month" },
+  logging: { logGroup: logGroup.name },
   dev: false,
+  transform: {
+    role: (args: aws.iam.RoleArgs) => {
+      args.managedPolicyArns = [];
+      args.inlinePolicies = $util.all([bucket.arn, logGroup.arn]).apply(([bucketArn, logGroupArn]) => [
+        { name: "bucket-access", policy: JSON.stringify(functionPolicy(bucketArn)) },
+        { name: "logs", policy: JSON.stringify(logsPolicy(logGroupArn)) },
+      ]);
+    },
+  },
 });
 
 // No query string and no headers. The client ID comes from the validated token.
 const accessLogFormat = JSON.stringify({
   requestId: "$context.requestId",
   requestTime: "$context.requestTime",
+  sourceIp: "$context.identity.sourceIp",
   routeKey: "$context.routeKey",
   status: "$context.status",
   responseLength: "$context.responseLength",

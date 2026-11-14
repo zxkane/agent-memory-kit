@@ -14,7 +14,8 @@ export type PolicyDocument = {
   Statement: PolicyStatement[];
 };
 
-const ROLE_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]+$/;
+// Every path segment and the role name must be non-empty.
+const ROLE_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:role\/([\w+=,.@-]+\/)*[\w+=,.@-]+$/;
 
 /** The function's whole permission set. No delete, no list. */
 export function functionPolicy(bucketArn: string): PolicyDocument {
@@ -30,6 +31,23 @@ export function functionPolicy(bucketArn: string): PolicyDocument {
         Effect: 'Allow',
         Action: ['s3:PutObject'],
         Resource: [`${bucketArn}/agents/*`, `${bucketArn}/index/agents.json`],
+      },
+    ],
+  };
+}
+
+/**
+ * The function's log permissions, kept beside functionPolicy. The log group is
+ * created by the deployment, so there is no CreateLogGroup.
+ */
+export function logsPolicy(logGroupArn: string): PolicyDocument {
+  return {
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Effect: 'Allow',
+        Action: ['logs:CreateLogStream', 'logs:PutLogEvents'],
+        Resource: [`${logGroupArn}:*`],
       },
     ],
   };
