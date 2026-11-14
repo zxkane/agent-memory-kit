@@ -5,6 +5,7 @@
 // silently after one line in hook-errors.log.
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
+import { isatty } from 'node:tty';
 import { loadConfig } from './lib/config.mjs';
 import { buildSessionContext, buildToolContext, logHookError } from './lib/context.mjs';
 import { bindProject } from './lib/identity.mjs';
@@ -83,7 +84,8 @@ function toolContext(config, input) {
 // empty or not JSON.
 function readInput() {
   try {
-    if (process.stdin.isTTY) return undefined;
+    // Not process.stdin: creating that stream switches a pipe to non-blocking reads.
+    if (isatty(0)) return undefined;
     return JSON.parse(readFileSync(0, 'utf8'));
   } catch {
     return undefined;

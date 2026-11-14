@@ -471,6 +471,36 @@ test('session-start claude on a terminal logs the input error and prints nothing
   assert.match(lines[0], /hook input is not valid JSON/);
 });
 
+// The host may write or close stdin after the driver has started.
+function runWithLateInput(f, args, input, { writeAt = 400, endAt = 400 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [join(PKG, 'session-start.mjs'), ...args], { env: f.env, cwd: f.tmp, stdio: ['pipe', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.on('close', (status) => resolve({ status, stdout }));
+    setTimeout(() => child.stdin.write(input), writeAt);
+    setTimeout(() => child.stdin.end(), Math.max(endAt, writeAt));
+  });
+}
+
+for (const [label, timing] of [['written late', { writeAt: 400, endAt: 400 }], ['written at once and closed late', { writeAt: 0, endAt: 400 }]]) {
+  test(`session-start claude reads input ${label}`, async (t) => {
+    const f = fixture(t);
+    const r = await runWithLateInput(f, [], JSON.stringify({ cwd: f.worktree }), timing);
+    assert.equal(r.status, 0);
+    assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /^Shared memory is on\./);
+    assert.equal(realpathSync(f.link), realpathSync(join(f.repo, 'projects', 'example-repo')));
+    assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+  });
+
+  test(`session-start codex uses the cwd of input ${label}`, async (t) => {
+    const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+    const r = await runWithLateInput(f, ['codex'], JSON.stringify({ cwd: f.worktree }), timing);
+    assertToolText(r, f);
+    assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+  });
+}
+
 test('session-start with an unknown tool', (t) => {
   const f = fixture(t);
   const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['vim']);
