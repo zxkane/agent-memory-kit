@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { scanText } from './secret-scan.mjs';
 
 const HOST_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 
@@ -25,6 +26,15 @@ const CONSOLIDATE_KEYS = [
   'timeoutMinutes',
 ];
 
+// Whether an unknown key may be printed by name (the driver and setup.sh echo the problem field):
+// only a word-shaped key (a misspelling is a word), and not one that the secret scan flags, such
+// as a letters-only access key ID. Anything else, for example a token pasted where a key should
+// be, is reported only as "(an unknown key)".
+const WORD_KEY_RE = /^[A-Za-z][A-Za-z_-]{0,31}$/;
+function echoable(key) {
+  return WORD_KEY_RE.test(key) && scanText(key).length === 0;
+}
+
 // The optional consolidation block: `{ value, problem }`. An absent block gives no value and no
 // problem. A present block that is not valid gives no value (consolidation stays off; it never
 // disables the rest of the config) and, as `problem`, the name of the first field that failed
@@ -36,7 +46,7 @@ function parseConsolidate(block) {
   // A key the block does not know (a misspelt one such as `organise`) makes it invalid: ignoring
   // it would silently drop the setting it was meant to be.
   const unknown = Object.keys(block).find((key) => !CONSOLIDATE_KEYS.includes(key));
-  if (unknown !== undefined) return bad(/^[A-Za-z0-9_.-]{1,64}$/.test(unknown) ? unknown : '(an unknown key)');
+  if (unknown !== undefined) return bad(echoable(unknown) ? unknown : '(an unknown key)');
   const { command, model } = block;
   if (typeof command !== 'string' || !isAbsolute(command) || CONTROL_RE.test(command)) return bad('command');
   if (typeof model !== 'string' || !MODEL_RE.test(model)) return bad('model');

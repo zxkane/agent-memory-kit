@@ -1212,3 +1212,354 @@ test('m8: readRegular and noteFiles are exported', (t) => {
   assert.equal(readRegular(join(dir, 'link.md')), null);
   assert.equal(noteFiles(join(dir, 'missing')).size, 0);
 });
+
+// C1: a retired note keeps a term that is in its target, or that another note written in this run
+// newly contains (an added note, or a changed note whose body did not have it).
+function splitScope(t) {
+  const big = [terms('roster', 0, 15), terms('backup', 0, 20), terms('invoice', 0, 20), terms('pager', 0, 20)].join('\n\n');
+  return setup(t, {
+    notes: {
+      'MEMORY.md': '- [Big](big.md) — big\n- [Ops](ops.md) — ops\n- [Other](other.md) — other\n',
+      'big.md': `${big}\n`,
+      'ops.md': `${terms('opsnote', 0, 30)}\n`,
+      'other.md': `${terms('unrelated', 0, 30)} ${terms('shared', 0, 20)}\n`,
+    },
+  });
+}
+
+test('C1: a note split across added notes and one existing note, retired into one of them, passes', (t) => {
+  const s = splitScope(t);
+  s.work('notes', 'roster.md', `${terms('roster', 0, 15)}\n`);
+  s.work('notes', 'backup.md', `${terms('backup', 0, 20)}\n`);
+  s.work('notes', 'invoice.md', `${terms('invoice', 0, 20)}\n`);
+  // Half of the last section went into an existing note; the other half was dropped.
+  s.work('notes', 'ops.md', `${terms('opsnote', 0, 30)} ${terms('pager', 0, 10)}\n`);
+  s.work('notes', 'big.md', 'MOVED TO [[roster]]\n');
+  s.work('notes', 'MEMORY.md', '- [Ops](ops.md) — ops\n- [Other](other.md) — other\n- [Roster](roster.md) — r\n'
+    + '- [Backup](backup.md) — b\n- [Invoice](invoice.md) — i\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  // big.md: its target alone holds 15 of its 75 terms (20%); with the notes newly written in this
+  // run, 65 of them are kept. ops.md keeps all 30.
+  assert.deepEqual(r.stats.retention, { termsBefore: 105, termsKept: 95, share: 95 / 105, checked: 2, lowest: 65 / 75 });
+});
+
+test('C1: a note retired into an unrelated note while the run adds nothing still fails', (t) => {
+  const s = splitScope(t);
+  s.work('notes', 'big.md', 'MOVED TO [[other]]\n');
+  s.work('notes', 'MEMORY.md', '- [Ops](ops.md) — ops\n- [Other](other.md) — other\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.match(r.errors[0], PER_NOTE('big.md'));
+});
+
+test('C1: trivial edits to notes that already held the retired note\'s words do not count', (t) => {
+  const s = setup(t, {
+    notes: {
+      'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n- [C](c.md) — c\n',
+      'a.md': `${terms('common', 0, 40)} ${terms('aonly', 0, 10)}\n`,
+      'b.md': `${terms('common', 0, 40)} ${terms('bonly', 0, 20)}\n`,
+      'c.md': `${terms('conly', 0, 20)}\n`,
+    },
+  });
+  s.work('notes', 'b.md', `${terms('common', 0, 40)} ${terms('bonly', 0, 20)} extraword\n`);
+  s.work('notes', 'a.md', 'MOVED TO [[c]]\n');
+  s.work('notes', 'MEMORY.md', '- [B](b.md) — b\n- [C](c.md) — c\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.match(r.errors[0], PER_NOTE('a.md'));
+});
+
+// C2: in a project run, global/ is a destination only: what was already there may be added to
+// and changed, but not retired or dropped from global/MEMORY.md.
+const GLOBAL_ONLY = /^global\/(\w+)\.md: notes in the global folder are organized only by a run on the global scope \((.+)\)$/;
+const GLOBAL_NOTES = { 'MEMORY.md': '- [Tone](tone.md) — t\n- [Tools](tools.md) — u\n', 'tone.md': 'prefers short answers\n', 'tools.md': 'uses the terminal\n' };
+
+test('C2: a project run may not retire a note that was already in global/', (t) => {
+  for (const stub of ['MOVED TO [[tools]]\n', 'MOVED TO [[global:tools]]\n']) {
+    const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
+    s.work('global', 'tools.md', 'uses the terminal and prefers short answers\n');
+    s.work('global', 'tone.md', stub);
+    s.work('global', 'MEMORY.md', '- [Tools](tools.md) — u\n');
+    const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+    assert.equal(r.ok, false, stub);
+    const mine = r.errors.filter((e) => GLOBAL_ONLY.test(e));
+    assert.deepEqual(mine.map((e) => GLOBAL_ONLY.exec(e)[1]), ['tone', 'tone'], stub);
+    assert.match(mine[0], /may not be retired/);
+    assert.match(mine[1], /may not lose its line in global\/MEMORY\.md/);
+    assert.ok(!r.changes.some((c) => c.label === 'global' && c.kind === 'retire'), stub);
+  }
+});
+
+test('C2: a project run may not drop an existing global note from global/MEMORY.md', (t) => {
+  const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
+  s.work('global', 'MEMORY.md', '- [Tone](tone.md) — t\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => GLOBAL_ONLY.test(e) && e.startsWith('global/tools.md: ')));
+});
+
+test('C2: a project run may still add a global note and add to an existing one', (t) => {
+  const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
+  s.work('global', 'editor.md', 'edits with a modal editor\n');
+  s.work('global', 'tone.md', 'prefers short answers without filler\n');
+  s.work('global', 'MEMORY.md', '- [Tone](tone.md) — t\n- [Tools](tools.md) — u\n- [Editor](editor.md) — e\n');
+  s.work('notes', 'b.md', 'MOVED TO [[global:editor]]\n');
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(existsSync(s.live('notes', 'b.md')), false);
+  assert.equal(readFileSync(s.live('global', 'editor.md'), 'utf8'), 'edits with a modal editor\n');
+});
+
+test('C2: a run on the global scope may merge two global notes', (t) => {
+  // The global scope's own folder is its only pair, labelled notes.
+  const s = setup(t, { notes: GLOBAL_NOTES });
+  s.work('notes', 'tools.md', 'uses the terminal; prefers short answers\n');
+  s.work('notes', 'tone.md', 'MOVED TO [[tools]]\n');
+  s.work('notes', 'MEMORY.md', '- [Tools](tools.md) — u\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(existsSync(s.live('notes', 'tone.md')), false);
+});
+
+// I-1: credit from other notes written in the run counts only for terms that no other note held
+// before the run (terms distinctive to the judged note). Shared project words count only in the
+// note's own new body or in its named target.
+function sharedVocabulary(t) {
+  const common = terms('svc', 0, 20);
+  return setup(t, {
+    notes: {
+      'MEMORY.md': '- [Q](queue.md) — q\n- [W](worker.md) — w\n- [T](timeout.md) — t\n- [R](report.md) — r\n',
+      'queue.md': `${common} ${terms('queue', 0, 20)}\n`,
+      'worker.md': `${common} ${terms('worker', 0, 20)}\n`,
+      'timeout.md': `${common} ${terms('timeout', 0, 20)}\n`,
+      'report.md': `${terms('report', 0, 30)}\n`,
+    },
+  });
+}
+
+test('I-1: a note retired into an unrelated note fails although the run honestly merges notes in the shared words', (t) => {
+  const s = sharedVocabulary(t);
+  s.work('notes', 'pipeline.md', `${terms('svc', 0, 20)} ${terms('queue', 0, 20)} ${terms('worker', 0, 20)}\n`);
+  s.work('notes', 'queue.md', 'MOVED TO [[pipeline]]\n');
+  s.work('notes', 'worker.md', 'MOVED TO [[pipeline]]\n');
+  s.work('notes', 'timeout.md', 'MOVED TO [[report]]\n');
+  s.work('notes', 'MEMORY.md', '- [P](pipeline.md) — p\n- [R](report.md) — r\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  const perNote = r.errors.filter((e) => PER_NOTE('timeout.md').test(e));
+  assert.equal(perNote.length, 1);
+  assert.equal(PER_NOTE('timeout.md').exec(perNote[0])[1], '0');
+  assert.ok(!r.errors.some((e) => e.startsWith('notes/queue.md') || e.startsWith('notes/worker.md')));
+});
+
+test('I-1: a gutted note fails although other edits newly add the project\'s common words', (t) => {
+  const s = sharedVocabulary(t);
+  s.work('notes', 'timeout.md', 'tiny\n');
+  s.work('notes', 'report.md', `${terms('report', 0, 30)} ${terms('svc', 0, 20)}\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.match(r.errors[0], PER_NOTE('timeout.md'));
+});
+
+test('I-1: honest splits 2, 4 and 8 ways, into new notes, existing notes or both, pass', (t) => {
+  for (const ways of [2, 4, 8]) {
+    for (const into of ['new', 'existing', 'mixed']) {
+      const notes = { 'MEMORY.md': '- [Big](big.md) — b\n' };
+      const sections = Array.from({ length: 8 }, (_, i) => terms(`fact${i}x`, 0, 10));
+      // The note also uses words that other notes share; they are not copied into the parts.
+      notes['big.md'] = `${sections.join('\n\n')}\n${terms('svc', 0, 10)}\n`;
+      for (let i = 0; i < ways; i++) {
+        notes[`old${i}.md`] = `${terms(`existing${i}x`, 0, 20)} ${terms('svc', 0, 10)}\n`;
+        notes['MEMORY.md'] += `- [O${i}](old${i}.md) — o\n`;
+      }
+      const s = setup(t, { notes });
+      let index = '';
+      for (let i = 0; i < ways; i++) {
+        const part = sections.filter((_, k) => k % ways === i).join(' ');
+        const toExisting = into === 'existing' || (into === 'mixed' && i % 2 === 1);
+        if (toExisting) {
+          s.work('notes', `old${i}.md`, `${terms(`existing${i}x`, 0, 20)} ${terms('svc', 0, 10)} ${part}\n`);
+        } else {
+          s.work('notes', `part${i}.md`, `${part}\n`);
+          index += `- [P${i}](part${i}.md) — p\n`;
+        }
+      }
+      for (let i = 0; i < ways; i++) index += `- [O${i}](old${i}.md) — o\n`;
+      const target = into === 'existing' ? 'old0' : 'part0';
+      s.work('notes', 'big.md', `MOVED TO [[${target}]]\n`);
+      s.work('notes', 'MEMORY.md', index);
+      const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+      assert.deepEqual(r.errors, [], `${ways} ways into ${into}`);
+    }
+  }
+});
+
+test('I-1: a superseded note retired into the newer note still passes', (t) => {
+  const facts = 'The ingest worker reads batches from queue intake_main, retries three times with backoff, and alerts '
+    + 'the channel ingest_alerts when a batch fails twice. Batches older than seven days are archived to bucket '
+    + 'ingest_archive by the nightly sweeper.';
+  const s = setup(t, {
+    notes: {
+      'MEMORY.md': '- [Old](ingest-old.md) — o\n- [New](ingest.md) — n\n',
+      'ingest-old.md': `${facts}\n`,
+      'ingest.md': `${facts.replace('three times', 'five times').replace('seven days', 'fourteen days')} Updated after the move to the new cluster.\n`,
+    },
+  });
+  s.work('notes', 'ingest-old.md', 'MOVED TO [[ingest]]\n');
+  s.work('notes', 'MEMORY.md', '- [New](ingest.md) — n\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+});
+
+// I-2: in a project run, an existing global note that is changed is judged on its own new body
+// alone and keeps at least 80% of its former distinct terms (from 5 terms), whatever minRetention.
+const GLOBAL_REDUCED = /^global\/([\w-]+)\.md: notes in the global folder are organized only by a run on the global scope \(an existing global note may be added to but not reduced in a project run: lost (\d+) of its (\d+) distinct terms, at most (\d+) allowed\)$/;
+const PREFS = 'Writes British spelling in documents, prefers metric units, wants dates as day month year, and keeps answers short.';
+
+test('I-2: a project run may not empty an existing global note into a project note or a new global note', (t) => {
+  for (const into of ['notes', 'global']) {
+    const s = setup(t, {
+      notes: BASE_NOTES,
+      global: { 'MEMORY.md': '- [Prefs](prefs.md) — p\n', 'prefs.md': `${PREFS}\n` },
+    });
+    s.work('global', 'prefs.md', 'See the project note.\n');
+    if (into === 'notes') {
+      s.work('notes', 'prefs-copy.md', `${PREFS}\n`);
+      s.work('notes', 'MEMORY.md', `${INDEX_AB}- [C](prefs-copy.md) — c\n`);
+    } else {
+      s.work('global', 'prefs-all.md', `${PREFS}\n`);
+      s.work('global', 'MEMORY.md', '- [Prefs](prefs.md) — p\n- [All](prefs-all.md) — a\n');
+    }
+    for (const minRetention of [0.25, 0]) {
+      const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention });
+      assert.equal(r.ok, false, `${into}, ${minRetention}`);
+      const mine = r.errors.filter((e) => GLOBAL_REDUCED.test(e));
+      assert.equal(mine.length, 1, `${into}, ${minRetention}: ${r.errors}`);
+      assert.equal(GLOBAL_REDUCED.exec(mine[0])[1], 'prefs');
+    }
+  }
+});
+
+test('I-2: adding a paragraph to an existing global note, or correcting one value, passes', (t) => {
+  let s = setup(t, { notes: BASE_NOTES, global: { 'MEMORY.md': '- [Prefs](prefs.md) — p\n', 'prefs.md': `${PREFS}\n` } });
+  s.work('global', 'prefs.md', `${PREFS}\n\nAlso prefers plain tables over charts in reports.\n`);
+  let r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+
+  s = setup(t, { notes: BASE_NOTES, global: { 'MEMORY.md': '- [Prefs](prefs.md) — p\n', 'prefs.md': `${terms('value', 0, 20)}\n` } });
+  s.work('global', 'prefs.md', `${terms('value', 0, 19)} corrected\n`);
+  r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention: 0 });
+  assert.deepEqual(r.errors, []);
+});
+
+test('I-2: a run on the global scope that rewrites a global note is judged by the ordinary rule', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [Prefs](prefs.md) — p\n', 'prefs.md': `${terms('value', 0, 40)}\n` } });
+  s.work('notes', 'prefs.md', `${terms('value', 0, 20)}\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.lowest, 0.5);
+});
+
+test('M-1: apply refuses a hand-made retirement of an existing global note in a project run', (t) => {
+  const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
+  s.work('global', 'tone.md', 'MOVED TO [[tools]]\n');
+  const hash = s.snap.global['tone.md'];
+  const changes = [{ label: 'global', file: 'tone.md', kind: 'retire', hash, target: { label: 'global', file: 'tools.md' } }];
+  assert.throws(() => apply({ pairs: s.pairs, changes, snap: s.snap }), /global\/tone\.md: notes in the global folder are organized only by a run on the global scope/);
+  assert.equal(s.readLive('global', 'tone.md'), 'prefers short answers\n');
+});
+
+// Round 2: an existing global note changed in a project run may lose at most min(2, floor(0.2 n))
+// of its n former distinct body terms, judged on its own new body, whatever minRetention.
+function globalNote(t, body) {
+  return setup(t, { notes: BASE_NOTES, global: { 'MEMORY.md': '- [G](tone.md) — g\n', 'tone.md': `${body}\n` } });
+}
+const judge = (s, minRetention = 0.25) => evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention });
+const reduced = (r) => r.errors.filter((e) => GLOBAL_REDUCED.test(e)).map((e) => GLOBAL_REDUCED.exec(e).slice(1).join(' '));
+
+// A global note of fewer than 5 former terms may only be added to: its former body, with runs of
+// whitespace collapsed, must still appear word for word in its new body.
+const GLOBAL_TEXT = /^global\/([\w-]+)\.md: notes in the global folder are organized only by a run on the global scope \(an existing global note may be added to but not reduced in a project run: a short note may only have text added after its existing text\)$/;
+const textChanged = (r) => r.errors.filter((e) => GLOBAL_TEXT.test(e)).map((e) => GLOBAL_TEXT.exec(e)[1]);
+
+test('global loss: a 3-term global note rewritten to other words is rejected; with a sentence added it passes', (t) => {
+  let s = globalNote(t, 'prefers terse answers');
+  s.work('global', 'tone.md', 'likes brief replies\n');
+  for (const minRetention of [0.25, 0]) assert.deepEqual(textChanged(judge(s, minRetention)), ['tone'], String(minRetention));
+  s = globalNote(t, 'prefers terse answers');
+  s.work('global', 'tone.md', 'prefers terse answers and examples in code blocks.\n');
+  assert.deepEqual(judge(s).errors, []);
+});
+
+test('global loss: a 7-term note may lose one term, not two', (t) => {
+  const body = terms('word', 0, 7);
+  let s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 6)}\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
+  s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 5)}\n`);
+  assert.deepEqual(reduced(judge(s, 0)), ['tone 2 7 1']);
+});
+
+test('global loss: a 40-term note may lose two terms, not three', (t) => {
+  const body = terms('word', 0, 40);
+  let s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 38)}\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
+  s = globalNote(t, body);
+  s.work('global', 'tone.md', `${terms('word', 0, 37)}\n`);
+  assert.deepEqual(reduced(judge(s, 0)), ['tone 3 40 2']);
+});
+
+test('global loss: a note whose words are all short or names is protected word for word', (t) => {
+  // "Use uv, not pip." has no term of four or more letters: a term rule could not protect it.
+  let s = globalNote(t, 'Use uv, not pip.');
+  s.work('global', 'tone.md', 'Use pip, not uv.\n');
+  for (const minRetention of [0.25, 0]) assert.deepEqual(textChanged(judge(s, minRetention)), ['tone'], String(minRetention));
+  s = globalNote(t, 'Use uv, not pip.');
+  s.work('global', 'tone.md', 'Use uv,   not pip.\nPin every version in the lock file.\n');
+  assert.deepEqual(judge(s, 0).errors, []);
+});
+
+test('global loss: repairing the frontmatter of a short global note passes', (t) => {
+  const s = globalNote(t, '---\nname: tone\n---\nUse uv, not pip.');
+  s.work('global', 'tone.md', '---\nname: tone\ndescription: Package tool to use\nmetadata:\n  type: feedback\n---\nUse uv, not pip.\n');
+  assert.deepEqual(judge(s, 0).errors, []);
+});
+
+test('global loss: a run on the global scope is judged by the ordinary rule', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [G](tone.md) — g\n', 'tone.md': 'prefers terse answers\n' } });
+  s.work('notes', 'tone.md', 'likes brief replies\n');
+  assert.deepEqual(judge(s).errors, []);
+});
+
+// A short existing global note may only be appended to: after collapsing whitespace, its new body is
+// its former body, or its former body followed by a space and more text.
+test('global loss: a short global note may only have text added after its existing text', (t) => {
+  const former = 'Use uv, not pip.';
+  const rejected = {
+    'a prefix': `Do not: ${former}`,
+    'a quotation': `> ${former}`,
+    'a strike-through': `~~${former}~~`,
+    'an HTML comment': `<!-- ${former} -->`,
+  };
+  for (const [what, body] of Object.entries(rejected)) {
+    const s = globalNote(t, former);
+    s.work('global', 'tone.md', `${body}\n`);
+    assert.deepEqual(textChanged(judge(s, 0)), ['tone'], what);
+  }
+  // The former text only as the start of a longer word.
+  let s = globalNote(t, 'prefers terse answers');
+  s.work('global', 'tone.md', 'prefers terse answersheet layouts\n');
+  assert.deepEqual(textChanged(judge(s, 0)), ['tone']);
+  // Appended after a space: passes.
+  s = globalNote(t, former);
+  s.work('global', 'tone.md', `${former} Pin every version in the lock file.\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
+  s = globalNote(t, former);
+  s.work('global', 'tone.md', `${former}\n`);
+  assert.deepEqual(judge(s, 0).errors, []);
+});

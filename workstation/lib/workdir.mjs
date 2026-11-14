@@ -17,6 +17,18 @@ const EMPTY = Buffer.alloc(0);
 const NOTE_MIN_TERMS = 15;
 const RUN_MIN_TERMS = 60;
 const GLOBAL = 'global';
+const GLOBAL_ONLY = 'notes in the global folder are organized only by a run on the global scope';
+// How many of its n former distinct body terms an existing global note changed in a project run may
+// lose: none below 5 terms, one from 5 to 9, two from 10 on. A fixed small allowance, so that a note
+// cannot be shrunk step by step across runs, nor a short note replaced outright.
+const globalLossAllowed = (n) => Math.min(2, Math.floor(0.2 * n));
+// Below this many former terms (short words and names such as "uv" or "SQL" make no terms) an
+// existing global note changed in a project run may only be appended to: its new body is its former
+// body, or its former body followed by a space and more text (whitespace collapsed). Text put in
+// front, a quotation, a strike-through or a comment around it, or letters joined to its last word
+// all change what the note says.
+const GLOBAL_WORDS_BELOW = 5;
+const collapseSpace = (str) => str.replace(/\s+/g, ' ').trim();
 const HASH_RE = /^[0-9a-f]{64}$/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -269,6 +281,11 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
           errors.push(`${where}: the index may not be retired`);
           continue;
         }
+        // A `global` pair exists only in a project run, where global/ is a destination only.
+        if (label === GLOBAL) {
+          errors.push(`${where}: ${GLOBAL_ONLY} (an existing global note may not be retired in a project run)`);
+          continue;
+        }
         if (!allowRetire) {
           ignored.push(where);
           continue;
@@ -277,8 +294,7 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
         const targetFile = `${stub.name}.md`;
         const targetBuf = work[targetLabel]?.get(targetFile);
         let problem = null;
-        if (stub.folder === 'global' && label === GLOBAL) problem = 'a global note cannot move to global';
-        else if (!work[targetLabel]) problem = 'the target folder is not available';
+        if (!work[targetLabel]) problem = 'the target folder is not available';
         else if (targetFile === INDEX) problem = 'the target is the index';
         else if (targetLabel === label && targetFile === name) problem = 'the note names itself as target';
         else if (!targetBuf) problem = 'the target note does not exist';
@@ -293,6 +309,18 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
       const problem = contentProblem(name, buf, live[label].get(name));
       if (problem) errors.push(`${where}: ${problem}`);
       else changes.push({ label, file: name, kind: isNew ? 'add' : 'change', hash });
+    }
+  }
+
+  // In a project run (the only kind with a `global` pair) an existing global note keeps its line in
+  // global/MEMORY.md: the notes of global/ are organized only by a run on the global scope.
+  if (work[GLOBAL] && changes.some((c) => c.label === GLOBAL && c.file === INDEX)) {
+    const listedBefore = indexRefs(text(live[GLOBAL].get(INDEX) ?? EMPTY));
+    const listedAfter = indexRefs(text(work[GLOBAL].get(INDEX)));
+    for (const name of Object.keys(snap[GLOBAL] ?? {})) {
+      if (listedBefore.has(name) && !listedAfter.has(name)) {
+        errors.push(`${loc(GLOBAL, name)}: ${GLOBAL_ONLY} (an existing global note may not lose its line in global/MEMORY.md in a project run)`);
+      }
     }
   }
 
@@ -332,9 +360,18 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     }
   }
   // Each retired or changed note is judged on its own, by the terms of its body: how many of them
-  // are still somewhere they belong. A retired note must find them in its target. A changed note
-  // keeps a term that is in its own new body, or that another note written in this run newly
-  // contains (an added note, or a changed note whose body did not have the term before).
+  // are still somewhere they belong. A retired note keeps a term that is in the body of the note it
+  // was retired into; a changed note, one that is in its own new body. Either also keeps a term that
+  // no other note held before the run (a term distinctive to it) when another note written in this
+  // run now contains it (an added note, or a changed note whose body did not have it before). So a
+  // note split across several notes is judged by all of them, while the words a project's notes
+  // share count only in the note's own body or its named target: a run that writes other notes in
+  // those words cannot lift a note whose own content was dropped.
+  // In a project run, an existing global note that is changed is judged on its own new body alone,
+  // whatever minRetention: global/ may be added to there, never reduced. A note of fewer than
+  // GLOBAL_WORDS_BELOW former terms may only have text added after its former body (whitespace
+  // collapsed, frontmatter not compared); a longer one may lose at most globalLossAllowed(n) of its
+  // n terms.
   const termCache = new WeakMap();
   const termsOf = (buf) => {
     let set = termCache.get(buf);
@@ -351,6 +388,14 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     const hadTerms = had ? termsOf(had) : new Set();
     for (const t of termsOf(work[c.label].get(c.file))) if (!hadTerms.has(t)) newlyWritten.add(t);
   }
+  // How many notes held each term before the run, over every folder of the run.
+  const holders = new Map();
+  for (const { label } of pairs) {
+    for (const [name, buf] of live[label]) {
+      if (name === INDEX || isStub(buf)) continue;
+      for (const t of termsOf(buf)) holders.set(t, (holders.get(t) ?? 0) + 1);
+    }
+  }
   let termsBefore = 0;
   let termsKept = 0;
   let checked = 0;
@@ -360,13 +405,29 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     const beforeBuf = live[c.label].get(c.file);
     if (!beforeBuf) continue;
     const beforeTerms = termsOf(beforeBuf);
-    const isKept = (t) => (c.kind === 'retire'
-      ? termsOf(afterOf[c.target.label]?.get(c.target.file) ?? EMPTY).has(t)
-      : termsOf(work[c.label].get(c.file)).has(t) || newlyWritten.has(t));
+    const keptTerms = c.kind === 'retire'
+      ? termsOf(afterOf[c.target.label]?.get(c.target.file) ?? EMPTY)
+      : termsOf(work[c.label].get(c.file));
+    // Only a project run has a `global` pair; a change there is to a note that already existed.
+    const globalNote = c.kind === 'change' && c.label === GLOBAL;
+    const isKept = (t) => keptTerms.has(t)
+      || (!globalNote && holders.get(t) === 1 && newlyWritten.has(t));
     let kept = 0;
     for (const t of beforeTerms) if (isKept(t)) kept += 1;
     termsBefore += beforeTerms.size;
     termsKept += kept;
+    const lost = beforeTerms.size - kept;
+    if (globalNote && beforeTerms.size < GLOBAL_WORDS_BELOW) {
+      const was = collapseSpace(bodyOf(stripInvisible(text(beforeBuf))));
+      const now = collapseSpace(bodyOf(stripInvisible(text(work[c.label].get(c.file)))));
+      if (now !== was && !now.startsWith(`${was} `)) {
+        errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: a short note may only have text added after its existing text)`);
+        continue;
+      }
+    } else if (globalNote && lost > globalLossAllowed(beforeTerms.size)) {
+      errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: lost ${lost} of its ${beforeTerms.size} distinct terms, at most ${globalLossAllowed(beforeTerms.size)} allowed)`);
+      continue;
+    }
     if (beforeTerms.size < NOTE_MIN_TERMS) continue;
     const noteShare = kept / beforeTerms.size;
     checked += 1;
@@ -423,6 +484,10 @@ export function apply({ pairs, changes, snap }) {
   const retires = [];
   for (const c of changes) {
     const pair = pairOf(c.label, c.file);
+    // A `global` pair exists only in a project run, where global/ is a destination only.
+    if (c.kind === 'retire' && c.label === GLOBAL) {
+      fail(c.label, c.file, `${GLOBAL_ONLY} (an existing global note may not be retired in a project run)`);
+    }
     if (!NOTE_NAME_RE.test(c.file)) fail(c.label, c.file, 'not a note file name');
     if (!HASH_RE.test(c.hash ?? '')) fail(c.label, c.file, 'change has no validated hash');
     const key = `${c.label}/${c.file}`;

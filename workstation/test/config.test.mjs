@@ -202,3 +202,35 @@ test('item 4: a key the consolidate block does not know makes it invalid, naming
   assert.deepEqual(loadConfig(env).consolidate, every);
   assert.equal(loadConfig(env).consolidateProblem, null);
 });
+
+test('C4: an unknown key that looks like a credential is not echoed', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  const gitHostToken = 'gh' + 'p_' + 'a'.repeat(36);
+  const accessKeyId = 'AK' + 'IA' + 'ABCDEFGHIJKLMNOP';
+  for (const key of [gitHostToken, accessKeyId]) {
+    write({ ...BASE, consolidate: { ...ok, [key]: 'x' } });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.consolidate, null);
+    assert.equal(cfg.consolidateProblem, '(an unknown key)');
+  }
+  write({ ...BASE, consolidate: { ...ok, organise: 'x' } });
+  assert.equal(loadConfig(env).consolidateProblem, 'organise');
+});
+
+test('M-2: only a word-shaped unknown key is echoed', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  const hex64 = 'ab12'.repeat(16);
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const base62 = Array.from({ length: 40 }, (_, i) => alphabet[(i * 7 + 3) % 62]).join('');
+  assert.equal(base62.length, 40);
+  for (const key of [hex64, base62, 'organise2']) {
+    write({ ...BASE, consolidate: { ...ok, [key]: 'x' } });
+    assert.equal(loadConfig(env).consolidateProblem, '(an unknown key)', key);
+  }
+  for (const key of ['organise', 'max_projects']) {
+    write({ ...BASE, consolidate: { ...ok, [key]: 'x' } });
+    assert.equal(loadConfig(env).consolidateProblem, key);
+  }
+});

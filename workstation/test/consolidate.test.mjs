@@ -1581,7 +1581,7 @@ test('m1: an apply that fails after its first write is apply-interrupted, not ch
   duplicateProjectWithGlobal(f);
   const globalDir = join(f.repo, 'global');
   const instruction = mergeInstruction();
-  instruction.p.writes['global/g.md'] = note('g', 'General', 'Something general, edited.');
+  instruction.p.writes['global/g.md'] = note('g', 'General', 'Something general. Edited by this run.');
   instruction.p.chmod = { [globalDir]: 0o555 };
   f.instruct(instruction);
   let r;

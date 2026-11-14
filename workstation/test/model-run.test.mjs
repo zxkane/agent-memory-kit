@@ -44,6 +44,22 @@ async function gone(pid, waitMs = 2000) {
   return !alive(pid);
 }
 
+// The pid a fake command wrote to `path`, once it is there (null after waitMs). A test that relies on
+// a pid file waits for it instead of assuming the fake has run that far.
+async function pidFrom(path, waitMs = 10000) {
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number(readFileSync(path, 'utf8').trim());
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch {
+      // Not written yet.
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return null;
+}
+
 // ---- renderPrompt ----
 
 test('extract prompt contains the digest path twice and no markers', () => {
@@ -221,13 +237,15 @@ test('runModel kills a process that outlives the timeout', async (t) => {
       }
     }
   });
-  const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 700 });
+  // The time limit leaves the fake ample room to start its background process and write both pids.
+  const pending = runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 3000 });
+  const pids = [await pidFrom(join(dir, 'sh.pid')), await pidFrom(join(dir, 'sleep.pid'))];
+  const r = await pending;
   assert.equal(r.ran, false);
   assert.equal(r.stopReason, 'timeout');
-  for (const f of ['sh.pid', 'sleep.pid']) {
-    const pid = Number(readFileSync(join(dir, f), 'utf8'));
-    assert.ok(Number.isInteger(pid) && pid > 0);
-    assert.equal(await gone(pid), true, `${f} process is gone`);
+  for (const [i, f] of ['sh.pid', 'sleep.pid'].entries()) {
+    assert.ok(Number.isInteger(pids[i]) && pids[i] > 0, `${f} was written`);
+    assert.equal(await gone(pids[i]), true, `${f} process is gone`);
   }
 });
 
@@ -242,11 +260,16 @@ test('runModel escalates to SIGKILL when SIGTERM is ignored', async (t) => {
       process.kill(Number(readFileSync(join(dir, 'sh.pid'), 'utf8')), 'SIGKILL');
     } catch {}
   });
+  // The fake installs its trap before it writes its pid; the time limit leaves room for both.
   const started = Date.now();
-  const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 500 });
+  const pending = runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 3000 });
+  const pid = await pidFrom(join(dir, 'sh.pid'));
+  assert.ok(pid, 'the fake wrote its pid, so its trap is in place');
+  const r = await pending;
   assert.equal(r.stopReason, 'timeout');
-  assert.ok(Date.now() - started >= 5000);
-  assert.equal(await gone(Number(readFileSync(join(dir, 'sh.pid'), 'utf8'))), true);
+  // SIGTERM is ignored: only SIGKILL after the 5 s grace period ends it.
+  assert.ok(Date.now() - started >= 3000 + 5000);
+  assert.equal(await gone(pid), true);
 });
 
 test('runModel stops the process group when its signal is aborted', async (t) => {
@@ -477,4 +500,15 @@ test('runModel with a command that cannot start, a tiny time limit or an abort s
   const aborted = await pending;
   assert.ok(['spawn-failed', 'aborted'].includes(aborted.stopReason), aborted.stopReason);
   assert.equal(aborted.ran, false);
+});
+
+test('organize prompt: global/ is a destination only in a project run; a split note names its main target', () => {
+  const off = renderPrompt('organize', { hasGlobal: false });
+  const on = renderPrompt('organize', { hasGlobal: true });
+  const destination = "global/ is a destination only: add a note there, or add to a note that is already there, only for a fact from notes/ that plainly applies to all of the person's projects. Do not retire, split or rename a note that was already in global/, do not remove its line from global/MEMORY.md (rewording its hook is fine), and do not move a note out of global/; those notes are organized in their own run.";
+  assert.ok(on.includes(destination));
+  assert.ok(!off.includes('destination only'));
+  const split = "When a note's content went to several notes, name in its MOVED TO line the note that received the largest part; the other notes need no pointer.";
+  assert.ok(on.includes(split));
+  assert.ok(off.includes(split));
 });
