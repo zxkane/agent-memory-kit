@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../lib/config.mjs';
@@ -190,6 +190,156 @@ test('sync.mjs exits 1 and records the failure when the remote is unusable', (t)
   assert.equal(status.ok, false);
   assert.equal(status.lastSuccess, null);
   assert.ok(status.error);
+});
+
+test('sync.mjs with a pull-only bridge whose clone is unusable: exit 0, the failure recorded as fixed text, no AWS', (t) => {
+  const f = fixture(t);
+  const missing = join(f.tmp, 'agents-missing');
+  writeFileSync(f.configFile, JSON.stringify({
+    enabled: true, host: 'alpha', repoDir: f.repo, stateDir: f.state, claudeDir: f.claudeDir, bridge: { agentsRepoDir: missing },
+  }));
+  const r = run('sync.mjs', '', f.env);
+  assert.equal(r.status, 0);
+  assert.equal(r.stderr, '');
+  const status = JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8'));
+  assert.equal(status.ok, true);
+  assert.equal(status.bridge.up, null);
+  assert.equal(status.bridge.down.ok, false);
+  assert.equal(status.bridge.down.error, 'the agents clone is not usable: the folder does not exist');
+  assert.equal(status.bridge.down.lastSuccess, null);
+  assert.match(status.bridge.down.failingSince, /^\d{4}-/);
+  assert.doesNotMatch(JSON.stringify(status), /agents-missing/);
+});
+
+test('sync.mjs with a bridge block but a failed sync: exit 1, the bridge is not run, its record is kept', (t) => {
+  const f = fixture(t);
+  const missing = join(f.tmp, 'agents-missing');
+  writeFileSync(f.configFile, JSON.stringify({
+    enabled: true, host: 'alpha', repoDir: f.repo, stateDir: f.state, claudeDir: f.claudeDir, bridge: { agentsRepoDir: missing },
+  }));
+  assert.equal(run('sync.mjs', '', f.env).status, 0);
+  const first = JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8'));
+  sh(f.repo, 'git', ['remote', 'set-url', 'origin', join(f.tmp, 'no-such-remote.git')]);
+  assert.equal(run('sync.mjs', '', f.env).status, 1);
+  const second = JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8'));
+  assert.equal(second.ok, false);
+  assert.deepEqual(second.bridge, first.bridge);
+});
+
+// Which files `sync.mjs` loads, recorded by a preloaded module hook (Node's own, no dependency).
+function loadedBySync(f, t) {
+  const dir = tempDir(t);
+  const hook = join(dir, 'record-loads.mjs');
+  writeFileSync(hook, [
+    "import { appendFileSync } from 'node:fs';",
+    "import { registerHooks } from 'node:module';",
+    'registerHooks({ load(url, context, next) { appendFileSync(process.env.AM_LOAD_LOG, `${url}\\n`); return next(url, context); } });',
+    '',
+  ].join('\n'));
+  const log = join(dir, 'loads.log');
+  const r = spawnSync(process.execPath, ['--import', hook, join(PKG, 'sync.mjs')], {
+    input: '', env: { ...f.env, AM_LOAD_LOG: log }, encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  return readFileSync(log, 'utf8');
+}
+
+test('sync.mjs loads no bridge module on a machine without a bridge block', (t) => {
+  const f = fixture(t);
+  const loads = loadedBySync(f, t);
+  assert.match(loads, /lib\/sync-engine\.mjs/);
+  assert.doesNotMatch(loads, /lib\/bridge(-up|-down)?\.mjs/);
+  assert.doesNotMatch(loads, /lib\/(aws|s3)\.mjs/, 'no AWS code is loaded without a bridge block');
+  assert.equal('bridge' in JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8')), false);
+});
+
+test('the config and the session-start text load no AWS code', (t) => {
+  const dir = tempDir(t);
+  const hook = join(dir, 'record-loads.mjs');
+  writeFileSync(hook, [
+    "import { appendFileSync } from 'node:fs';",
+    "import { registerHooks } from 'node:module';",
+    'registerHooks({ load(url, context, next) { appendFileSync(process.env.AM_LOAD_LOG, `${url}\\n`); return next(url, context); } });',
+    '',
+  ].join('\n'));
+  const log = join(dir, 'loads.log');
+  const code = `await import(${JSON.stringify(join(PKG, 'lib/config.mjs'))}); await import(${JSON.stringify(join(PKG, 'lib/context.mjs'))});`;
+  const r = spawnSync(process.execPath, ['--import', hook, '--input-type=module', '-e', code], { env: { ...process.env, AM_LOAD_LOG: log }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const loads = readFileSync(log, 'utf8');
+  assert.match(loads, /lib\/config\.mjs/);
+  assert.doesNotMatch(loads, /lib\/(aws|s3)\.mjs/);
+});
+
+test('sync.mjs loads the bridge modules when a bridge block is configured', (t) => {
+  const f = fixture(t);
+  writeFileSync(f.configFile, JSON.stringify({
+    enabled: true, host: 'alpha', repoDir: f.repo, stateDir: f.state, claudeDir: f.claudeDir, bridge: { agentsRepoDir: join(f.tmp, 'agents-missing') },
+  }));
+  assert.match(loadedBySync(f, t), /lib\/bridge\.mjs/);
+});
+
+// A copy of the kit whose bridge module is replaced by `source`.
+function kitWithBridge(t, source) {
+  const kit = join(tempDir(t), 'kit');
+  cpSync(PKG, kit, { recursive: true });
+  writeFileSync(join(kit, 'lib/bridge.mjs'), source);
+  return kit;
+}
+
+test('sync.mjs: a bridge module that cannot be loaded, or a wrapper that throws, is reported and recorded, not silent', (t) => {
+  for (const source of [
+    'export const nothing = (() => { throw new Error("secret detail of the load failure"); })();\n',
+    'export async function bridgeAfterSync() { throw new Error("secret detail of the wrapper"); }\n',
+    'export const bridgeAfterSync = 5;\n',
+  ]) {
+    const f = fixture(t);
+    writeFileSync(f.configFile, JSON.stringify({
+      enabled: true, host: 'alpha', repoDir: f.repo, stateDir: f.state, claudeDir: f.claudeDir,
+      bridge: { up: true, bucket: 'example-bucket', region: 'ap-northeast-1', agentsRepoDir: join(f.tmp, 'agents-missing') },
+    }));
+    const kit = kitWithBridge(t, source);
+    const r = spawnSync(process.execPath, [join(kit, 'sync.mjs')], { input: '', env: f.env, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stderr, 'agent-memory bridge could not run\n');
+    const status = JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8'));
+    assert.equal(status.ok, true);
+    for (const step of ['up', 'down']) {
+      assert.equal(status.bridge[step].ok, false, step);
+      assert.equal(status.bridge[step].error, 'bridge could not run', step);
+      assert.equal(status.bridge[step].status, null, step);
+      assert.equal(status.bridge[step].lastSuccess, null, step);
+    }
+    assert.doesNotMatch(JSON.stringify(status), /secret detail/);
+  }
+});
+
+test('sync.mjs: a bridge that could not run records only the steps that are configured', (t) => {
+  const f = fixture(t);
+  writeFileSync(f.configFile, JSON.stringify({
+    enabled: true, host: 'alpha', repoDir: f.repo, stateDir: f.state, claudeDir: f.claudeDir, bridge: { agentsRepoDir: join(f.tmp, 'agents-missing') },
+  }));
+  const kit = kitWithBridge(t, 'export async function bridgeAfterSync() { throw new Error("x"); }\n');
+  const r = spawnSync(process.execPath, [join(kit, 'sync.mjs')], { input: '', env: f.env, encoding: 'utf8' });
+  assert.equal(r.status, 0);
+  const status = JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8'));
+  assert.equal(status.bridge.up, null);
+  assert.equal(status.bridge.down.error, 'bridge could not run');
+});
+
+test('sync.mjs: when the sync itself fails, a bridge that cannot load does not overwrite the kept bridge record', (t) => {
+  const f = fixture(t);
+  writeFileSync(f.configFile, JSON.stringify({
+    enabled: true, host: 'alpha', repoDir: f.repo, stateDir: f.state, claudeDir: f.claudeDir, bridge: { agentsRepoDir: join(f.tmp, 'agents-missing') },
+  }));
+  assert.equal(run('sync.mjs', '', f.env).status, 0);
+  const first = JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8'));
+  sh(f.repo, 'git', ['remote', 'set-url', 'origin', join(f.tmp, 'no-such-remote.git')]);
+  const kit = kitWithBridge(t, 'export const nothing = (() => { throw new Error("x"); })();\n');
+  const r = spawnSync(process.execPath, [join(kit, 'sync.mjs')], { input: '', env: f.env, encoding: 'utf8' });
+  assert.equal(r.status, 1);
+  const second = JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8'));
+  assert.deepEqual(second.bridge, first.bridge);
 });
 
 test('sync.mjs exits 0 and writes nothing when not enabled', (t) => {

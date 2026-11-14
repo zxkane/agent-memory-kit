@@ -343,6 +343,185 @@ An Organize run you revert will be done again: the folder's content then differs
 
 What was checked: the options the driver passes were checked against Claude Code's command-line client in its restricted mode, with a full model ID. The test suite runs the whole pipeline against a stand-in for the model, not a real one. A run with a real model and your notes is your own dry run (see "Try it first"): do it before you enable a timer, and check that the report shows `denials: 0`. A model alias (a short name such as a family name) may not resolve in restricted mode, so put the full ID in `model`. Another client needs to accept the same options: `-p`, `--restricted`, `--tools`, `--permission-mode acceptEdits`, `--permission-prompts none`, `--strict-mcp-config`, `--no-session-persistence`, `--output-format json`, `--model`, `--max-turns`, `--max-budget-usd` and `--add-dir`, and report its cost and turns in the JSON result.
 
+## Bridge to S3 and the agents repository (optional)
+
+The bridge connects the notes clone to the optional Memory API (see "Memory API") in both directions, and runs as a part of the sync. Nothing about it is active until you add a `bridge` block to the configuration; a machine without a valid block makes no AWS request and behaves exactly as before.
+
+- **Up (to S3).** The committed notes under `global/` and `projects/` are copied to the bucket, so that the API can list, search and read them. This fills the replica that the API section describes.
+- **Down (agent notes).** What agents wrote through the API (`agents/<agent>/<name>.md` in the bucket) is copied into a second Git repository, the agents repository, and sent to its remote. That repository is separate from the notes repository, and the agent notes never enter the notes clone.
+
+**Which machine.** Run up and down on one machine only: it has `up` and `down` set to `true`. Two machines uploading the same notes, or both mirroring the same bucket into the same repository, would only race each other. Every other machine that should read the agent notes sets only `agentsRepoDir` (no `up`, no `down`): its sync then updates that clone to the remote's state (a pull), needs no bucket and no credentials, and reports `pulled` or `unchanged`.
+
+### Configure
+
+Add a `bridge` block to `~/.config/agent-memory/config.json`. A value of the wrong type, a value outside its rule, a key the block does not know, or a block that asks for nothing (none of `up`, `down` and `agentsRepoDir`) makes the whole block invalid: the bridge is off, the rest of the configuration still works, `setup.sh` clones nothing and names the field, and the session says so (see "Session messages"). Check with a dry run after each edit.
+
+```json
+{
+  "bridge": {
+    "bucket": "<bucket-name>",
+    "region": "<region>",
+    "up": true,
+    "down": true,
+    "agentsRepoDir": "/home/<user>/agent-memory-mirror",
+    "agentsRepoUrl": "<your-mirror-repository>"
+  }
+}
+```
+
+| Field | Default | Meaning and rules |
+|---|---|---|
+| `bucket` | absent | The bucket of the API's deployment (`bucket/name` in its SSM parameters). Required when `up` or `down` is true; a bucket name: 3 to 63 lower-case letters, digits and hyphens, starting and ending with a letter or digit. |
+| `region` | absent | The bucket's region, for example `ap-northeast-1`. Required when `up` or `down` is true. |
+| `up` | `false` | Boolean. Run the upload. |
+| `down` | `false` | Boolean. Mirror the bucket's agent notes into the agents repository. Needs `agentsRepoDir`. |
+| `agentsRepoDir` | absent | Absolute path of the agents clone, without control characters. It must not be the notes clone's folder, inside it or around it. Setting it is what turns the pull on; with `down` false the clone is only updated from its remote. |
+| `agentsRepoUrl` | absent | Only used by `setup.sh`, which clones this URL into `agentsRepoDir` when that folder does not exist (an existing folder is left alone). No spaces or control characters, not starting with `-`, at most 300 characters. `setup.sh` never prints it. Do not put a credential into it: Git stores the URL in the clone's configuration (`.git/config`), in plain text. Use the machine's Git credential setup (a credential helper or SSH keys) instead. `setup.sh` clones branch `main`, the only branch the bridge works on. |
+
+There is no credential in the block. On each run the bridge asks the instance metadata service (IMDSv2) of the EC2 machine for the credentials of the instance role and signs its requests with them; nothing is stored, and each metadata request has a two-second limit. A machine without an instance role cannot run `up` or `down`. The role needs what the API section lists for a workstation role (`AGENT_MEMORY_WORKSTATION_ROLE_ARNS`): write and delete of objects under `mem/`; write of `index/mem.json`; read and write of `index/bridge.json`; read of objects under `agents/`; and listing the bucket with the prefixes `mem/` and `agents/`. It needs no more, and it never reads `mem/` or `index/mem.json` back. A machine that only pulls needs none of it.
+
+### Up: what is sent
+
+Every byte comes from the Git objects of the commit that is checked out and is also `origin/main` (the sync that ran just before has made them equal); the working tree is never read, so a file that is not committed is not sent. Sent: a regular file (also an executable one) that is exactly `global/<file>` or `projects/<project>/<file>`, where the project name follows the API's rule for project names (up to 100 letters, digits, `.`, `_` and `-`, starting with a letter or digit) and the file name its rule for notes (ending in `.md`, up to 197 characters of the same set, starting with a letter or digit). Each becomes the object `mem/<path>`. Not sent, and not in the bucket after the next run:
+
+- files elsewhere (for example `.project` files), in deeper folders, or with names the API cannot address;
+- symbolic links and submodules;
+- a file over 1,000,000 bytes (`too-large`);
+- a file that the secret scan flags (`flagged`). It is left out of the bucket and out of the search snapshot, and an earlier copy is removed from the bucket.
+
+The bridge also writes the search snapshot `index/mem.json`: each note's path, name, description, type and body, without the `MEMORY.md` index files. The snapshot object must stay under 8 MiB, which the API enforces, so the bridge keeps it under 7,000,000 bytes. It starts with up to 100,000 bytes of body per note and, when the snapshot does not fit, lowers that limit by a quarter at a time down to 2,000. `snapshotBytes` and `bodyLimit` in `status.json` show what was used. When not even 2,000 bytes per note fit, the run fails with `bridge-up failed: 0 SnapshotTooLarge` before anything is sent.
+
+**The record.** `index/bridge.json` in the bucket names the commit that was last uploaded, with the machine's host name and the time. It is written last, with a conditional write (only when nobody changed it since it was read), so it never names a commit whose notes were not all sent: puts first, then the snapshot, then deletions, then the record.
+
+**Full and delta uploads.** When the record names a commit that is an ancestor of this clone's commit, only the notes that changed between the two are put or deleted. Otherwise (no record, an unreadable one, or a commit that is not an ancestor) the bridge does a full upload: it lists `mem/`, puts every note whose object differs (compared by the MD5 sum that S3 reports as the ETag) and deletes every addressable `mem/` object that is not in the commit. An object under `mem/` whose key the API cannot address is left alone and counted as `foreign`. `full` in `status.json` says which kind a run was.
+
+**The hourly verification pass.** A run that finds nothing new returns `unchanged` and asks S3 nothing, for up to an hour per commit (the time is kept in `bridge.json` in the state directory). Then, for the same commit, it checks the bucket against the commit as in a full upload, because another machine may have written older content after the record: `verified` means the bucket was right, `repaired` means it found differences and fixed them.
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `uploaded` | The commit was sent and the record written. | Nothing. |
+| `unchanged` | Nothing new, and the last check is less than an hour old. | Nothing. |
+| `verified` | The hourly pass found the bucket as it should be. | Nothing. |
+| `repaired` | The hourly pass found differences, for example after an upload from an older commit, and fixed them. | Nothing; if it repeats every hour, look for another machine that runs `up`. |
+| `behind` | The record names a commit newer than this clone's (another machine uploaded after it). Nothing was sent. | Nothing: the next sync brings this clone up to date. If it stays, this machine is not the one that should run `up`, or its sync is failing. |
+| `raced` | The record changed between reading and writing it, so another machine ran `up` at the same moment. The notes and the snapshot were sent; the record was not written. | The next run retries. If it repeats, two machines have `up` set: turn it off on one. If only one machine runs `up` and `raced` still repeats, the role cannot read `index/bridge.json`: check the bucket grant (every such run also sends the whole snapshot again). |
+| `not-synced` | The commit checked out is not `origin/main` (it holds commits the remote does not, or the sync has not caught up). Nothing was sent. | Check that the sync succeeds (`status.json`, `journalctl --user -u agent-memory-sync.service`). The session warns when this lasts. |
+| `diverged` | This clone's commit is not part of the history the remote holds, or the record's commit is and this clone is the stale one. Nothing was sent. | Clone the notes repository afresh (see "If a secret reached the remote" for how to move a clone aside). The session warns about it. |
+
+### Down: the agents repository is a mirror
+
+The agents clone belongs to the bridge. The bridge writes only its `agents/` folder, as `agents/<agent>/<name>.md`; whatever else is found inside `agents/` (other files or folders, links, ignored files) is removed or replaced. On every run it also fetches `main` of the clone's remote and resets the rest of the clone to it (`reset --hard`, then a clean of untracked files, so also folders that hold a repository of their own). **Never edit the agents clone and never commit in it**: local changes and local commits are discarded on the next run. To change the other files of that repository, change them through its remote (from another clone); they stay as the remote has them.
+
+A run copies the objects under `agents/` of the bucket into the folder. A file on disk is kept when the MD5 sum of its bytes is the object's ETag, so only changed objects are downloaded; files whose objects are gone are deleted. It then stages `agents/`, commits (`bridge(<host>): <n> file(s)`) and sends the commit to `main`. A bucket with more than 5,000 agent notes is refused (`too many agent notes in the bucket`). `mirrored` means a commit was sent, `unchanged` that nothing differed, `pulled` that a pull-only machine's clone moved to the remote's state, and `push-failed` that the commit could not be sent: the commit is discarded and the next run makes it again.
+
+**What is skipped.** Each skipped object is counted in `status.json`, never named there. Bridge down reports at most 200 skipped objects per run, so the three counts cover those 200 only; `skippedMore` in `status.json` is the number left out of them:
+
+| Reason | Meaning |
+|---|---|
+| `bad-key` | The key under `agents/` is not `agents/<agent>/<file>.md` with an agent name (lower-case letters, digits and hyphens, up to 40) and a file name that follow the API's rules. |
+| `too-large` | The object is over 200,000 bytes. |
+| `flagged` | The secret scan flags its content. |
+
+**The marker file, and when the bridge refuses.** The bridge resets and cleans a clone, which would destroy anything else, so it first checks that the folder is meant to be a mirror. The branch `main` of the second repository must hold a file named `.agent-memory-mirror` at its root. Create it once, by hand, as an empty committed file:
+
+```
+git clone <your-mirror-repository> agent-memory-mirror
+cd agent-memory-mirror
+git switch -c main
+touch .agent-memory-mirror
+git add .agent-memory-mirror
+git commit -m "chore: mark this repository as the agent notes mirror"
+git push origin main
+```
+
+(For a repository that already has a `main`, skip the `switch`. The bridge works on `main` only, and `setup.sh` clones that branch.) Then run `setup.sh` (or just wait for the next sync, when the folder exists). Without the marker nothing in the clone is changed. The bridge also refuses, with the error `the agents clone is not usable: <reason>`, when the folder does not exist or is not the top level of a Git work tree; when it overlaps the notes clone, checked on real paths so that a symbolic link cannot hide one inside the other; when it is not on `main` or has no `origin`; when its `origin` is the same remote as the notes clone's (compared as host and path, ignoring the scheme, user, port, `.git` and the case of the host); when the remote's `main` has no marker; or when `agents` in the remote is a link or not a folder. These need the owner: fix the clone or the remote, and the next run goes on. The session warns, with a hint to check the agents clone and its marker file.
+
+**ETags.** Files on disk are compared with the objects' ETags as MD5 sums, which holds for objects stored in a plain bucket. A bucket whose ETags are not MD5 sums (for example one with KMS encryption) makes the bridge fetch every object on every run: the content is still right and nothing new is committed, but each run downloads all agent notes.
+
+### Run it once by hand
+
+`workstation/run.sh sync` runs the sync and then the bridge, under the sync lock (it exits quietly when a sync is already running). Read the result in `~/.local/state/agent-memory/status.json`: the `bridge` key holds one record per configured step (`up`, `down`), with `ok`, the status word (`uploaded`, `unchanged`, `mirrored`, `pulled`, ...) and, for a failure, the `error`. A bridge that cannot run at all prints `agent-memory bridge could not run` to the terminal. After a first deploy, run it twice: the first run is a full upload (`up.full` is `true`), the second reports `unchanged` and, within the hour, makes no S3 request.
+
+### Time, status and warnings
+
+The sync has its own limits and is not cut by the bridge's deadline. One deadline, 110 seconds after the run starts, covers the bridge, below the unit's 120-second limit; the bridge itself gets at most 75 seconds of it. A sync that alone takes more than about 105 seconds leaves less than five, and then the bridge is not started (see below). Everything that can block for long is cut at the deadline: the requests to S3, and the Git network commands of both steps (each gets the time left before the deadline, and is not started when less than two seconds are left). Only local work (Git on a local clone, writing `status.json`) can run past it, in the remaining 10 seconds. With less than five seconds left after the sync the bridge is not started at all, and a step that cannot start before the deadline is not started either: it is recorded as failed with `no time left after the sync` (or `time limit` when the step before it used the time up), and the next run tries again. A step that reaches the deadline is recorded with `time limit`; one that hangs is left behind. The bridge never runs after a failed sync, and a failing step never makes the sync fail or changes its exit code.
+
+`status.json` gains a `bridge` key with one record per configured step (`up`, `down`; `null` for a step that is not configured). It holds the status word, `ok`, an `error` (the status itself for `behind`, `raced`, `not-synced`, `diverged` and `push-failed`; for a failure otherwise one of `<operation> failed: <HTTP status> <code>` from AWS, `credentials failed: 0 Unavailable`, `time limit`, `no time left after the sync`, a fixed text such as `bridge down failed while trying to <stage>`, `bridge up failed`, or `bridge could not run`, which is what each configured step records when a bridge module cannot be loaded or the bridge throws; the sync then also prints `agent-memory bridge could not run` to its journal, once), the time of the run (`at`), `lastSuccess`, `failingSince` (the first failed run since the last success), the commit and counts: for up `full`, `puts`, `deletes`, `foreign`, `snapshotBytes`, `bodyLimit` and `skipped` (`flagged`, `too-large`); for down `written`, `removed`, `skipped` (`bad-key`, `too-large`, `flagged`) and `skippedMore`. Never a key, a path, a URL or a commit message. After a failed sync, and when a consolidation run writes the status file, the records stay as they were; without a `bridge` block the key is not written.
+
+The session warns when a configured step's last run failed and it has not succeeded for longer than `staleAfterSeconds` (see "Session messages").
+
+### Turn it off
+
+Remove the `bridge` block and the next sync does nothing for the bridge; the `bridge` key then disappears from `status.json`. Setting `up` and `down` to `false` and removing `agentsRepoDir` keeps the block valid but empty: the sync then does nothing for the bridge either, and `status.json` keeps `bridge` with both steps `null`. Nothing is deleted: the objects stay in the bucket (delete them by hand if you want them gone, or use the API's own removal) and the agents clone stays on disk. To keep the bridge but stop only the mirror, set `down` to `false`: that machine then only pulls.
+
+## Canary for the memory API (optional)
+
+The canary runs the checks of "Check a deployment" on a schedule, from a workstation, against a deployed stage of the Memory API. In plain words it checks that the API still refuses what it must refuse and serves what it must serve: a request without a token, a malformed token and a token from another issuer are refused (401); a token that may only read cannot write (403 from the gateway); the read routes answer; a missing note and a missing scope read as 404 `not_found`; every answer has the fields `openapi.json` documents; and an unknown path is not served. It never runs the slow expiry check (8). Nothing about it is active until you add a `canary` block to the configuration; a machine without a valid block behaves exactly as before.
+
+On a stage whose probe client may write, the checks also write one probe note, `agents/probe/deployed-check.md`, and read it back; each run replaces it. The probe client of the `prod` stage is read-only, so a run against `prod` writes nothing (and reports a failure if a token with the write scope can be issued there).
+
+The result is a file on the machine. A failure shows up as a warning at the start of the next Claude Code, Codex or Kiro session (see "Session messages"), which is how you notice it; nothing is sent anywhere.
+
+### Configure
+
+Add a `canary` block to `~/.config/agent-memory/config.json`. `stage` and `region` are required. A value outside its rule, or a key the block does not know (a misspelling such as `scheduel`), makes the whole block invalid: the canary is off, the rest of the configuration still works, `setup.sh` leaves the canary units as they are and names the field, and the session says so.
+
+```json
+{
+  "canary": {
+    "stage": "prod",
+    "region": "<region>",
+    "schedule": "*-*-* 00/6:15:00"
+  }
+}
+```
+
+| Field | Default | Meaning and rules |
+|---|---|---|
+| `stage` | required | The stage of the deployment whose parameters hold its values: 1 to 32 lower-case letters, digits and hyphens, for example `prod`. |
+| `region` | required | The region of those parameters, for example `ap-northeast-1`. |
+| `schedule` | absent | A systemd calendar expression for the timer, under the same rule as the consolidation schedules: at most 80 characters from letters, digits, space and `* : , . / ~ -`, with at least one that is not a space (when `systemd-analyze` is installed, `setup.sh` also asks it). The example runs at a quarter past midnight, 06, 12 and 18 o'clock. Without a schedule no timer is written and the canary runs only by hand. |
+
+After editing the configuration run `./setup.sh` again. With a `schedule` it writes `agent-memory-canary.service` and `agent-memory-canary.timer` to `~/.config/systemd/user/` and enables the timer (not with `--no-enable`); `--dry-run` lists them. The timer has `Persistent=true`, so a run missed while the machine was off is made up, and `RandomizedDelaySec=5min`. The service is stopped after 300 seconds.
+
+### What the machine needs
+
+There is no credential in the block. Like the bridge, the canary asks the instance metadata service (IMDSv2) of the EC2 machine for the credentials of the instance role and signs its requests with them. The role must be allowed to read four parameters of the stage:
+
+- `ssm:GetParameter` on `/agent-memory/<stage>/mcp/gateway/url`, `/agent-memory/<stage>/mcp/cognito/token-endpoint`, `/agent-memory/<stage>/mcp/cognito/probe/client-id` and `/agent-memory/<stage>/mcp/cognito/probe/client-secret`.
+
+The secret parameter is a SecureString that the deployment creates without naming a key, so it is encrypted under the account's default key for Parameter Store (`aws/ssm`). Access to that key is not given by a separate permission, so `ssm:GetParameter` is enough. Only if you re-encrypt the parameter with a customer-managed key does the role also need `kms:Decrypt` on that key. Every read asks for decryption.
+
+A machine without such a role records `credentials failed: 0 Unavailable` (or the HTTP status of the metadata service in place of the 0) on every run. The probe secret is read into memory for one run, used to ask the token endpoint for tokens, and dropped when the run ends. It is never written to a file or printed; neither is a token, a URL or any other value read from Parameter Store, and a printed line has them removed in case a check ever carried one.
+
+### The result
+
+`~/.local/state/agent-memory/canary.json` (mode 600, replaced through a temporary file and a rename) holds:
+
+```json
+{ "lastRun": "<time>", "ok": false, "failed": [3, 8], "error": null, "lastSuccess": "<time>" }
+```
+
+- `failed` lists the failed checks by number only: the integer a check's name starts with in "Check a deployment" (`5a` is 5), or 0 for a name without one. No name, no detail.
+- `error` is `null` or one of `<operation> failed: <HTTP status> <code>` from AWS (for example `ssm failed: 400 AccessDeniedException`, or `credentials failed: 0 Unavailable`), `time limit`, `checks stopped` or `canary failed`. Nothing else is ever put there.
+- `lastSuccess` is the time of the last run that passed; a run that does not pass keeps the previous value.
+
+The session shows the first line of "Session messages" for the canary while the last run failed, and the second when nothing has passed for three days (the timer has stopped). Removing the `canary` block silences both.
+
+**Time limit.** One deadline of 240 seconds covers a whole run, the reads of the parameters included. Every request is cut at it and a run that reaches it ends with the error `time limit`. Each request of the checks also has its own limit of 15 seconds.
+
+### Run it by hand
+
+```
+workstation/run.sh canary
+```
+
+It prints one `PASS`, `FAIL` or `SKIP` line per check, in the form of `verify-deployed.ts`, then one summary line (`canary ok: <n> checks` or `canary failed: <reason>`), and exits 0 when everything passed and 1 otherwise. With no `canary` block it prints nothing and exits 0; with an invalid one it prints one line naming the field and exits 1. It takes no lock, so it can run while a sync or a consolidation is running, and it updates `canary.json` as a timer run does.
+
+### Turn it off
+
+Remove the `canary` block, or only its `schedule`, and run `./setup.sh`: it disables the timer and removes both unit files. Without the block the session no longer reports the canary; with the block but without a `schedule`, a failed run recorded earlier is still reported until a run by hand passes. `canary.json` stays on disk and can be deleted.
+
 ## Session messages
 
 At the start of a session you may see one of these lines. `<...>` stands for a value filled in by the session.
@@ -355,6 +534,12 @@ At the start of a session you may see one of these lines. `<...>` stands for a v
 - *This repository shares its name with another project in shared memory (`<identity>`), so its memory stays on this machine.* See `.project` above.
 - *WARNING: this repository's remote no longer matches the project its memory is linked to (`<identity>`).* The link is left alone; edit `.project` if the repository moved.
 - *WARNING: memory sync has not succeeded since `<time>`. Notes written now stay on this machine until it recovers.* (or *since it was set up*). The timer has not completed a sync recently (default: ten minutes; set `staleAfterSeconds` in the config file to change it). Check `status.json` and `journalctl --user -u agent-memory-sync.service`.
+- *WARNING: the memory bridge (to S3) has not succeeded since `<time>`: `<reason>`.* (or *(agent notes)*, and *since it was set up*). A bridge step's last run failed and it has not succeeded for longer than `staleAfterSeconds`; with no success at all, the first failed run counts. The reason is the status word (`behind`, `raced`, `not-synced`, `diverged`, `push-failed`), `time limit`, `no time left after the sync`, `<operation> failed: <HTTP status> <code>`, a fixed text of the bridge, or `failed` for anything else; nothing else of `status.json` is shown. For `diverged` the line adds *Clone the notes repository afresh.*, for `not-synced` *This clone holds commits the remote does not; check that the sync succeeds.*, and for *the agents clone is not usable: ...* *Check the agents clone and its marker file .agent-memory-mirror.* See "Bridge to S3 and the agents repository".
+- *WARNING: the bridge block in the agent-memory config is invalid (`<field>`); the bridge is off.* The block failed the rules in "Bridge to S3 and the agents repository"; fix the named field.
+- *WARNING: the memory API canary failed at `<time>`: `<reason>`.* The last canary run did not pass (see "Canary for the memory API (optional)"). The reason is `checks <numbers> failed` (the numbers of the checks that failed, as in "Check a deployment"), `time limit`, `checks stopped`, `canary failed`, `<operation> failed: <HTTP status> <code>` from AWS (for example `ssm failed: 400 AccessDeniedException`, or `credentials failed: 0 Unavailable` when there is no instance role), or `failed`. It stays until a later run passes.
+- *WARNING: the memory API canary has not passed since `<time>`.* (or *since it was set up*). The last run passed, but nothing has passed for more than three days; this needs a `schedule`, and means the timer is not running or its runs do not finish. Check `journalctl --user -u agent-memory-canary.service`.
+- *WARNING: the memory API canary is configured but has not run yet.* A `canary` block with a `schedule` is set but there is no `canary.json`: `setup.sh` was not run again after the block was added, the timer was not enabled (`--no-enable`), `systemd-analyze` rejected the schedule, or the first run stopped before it recorded anything. Run `./setup.sh`, then `workstation/run.sh canary`.
+- *WARNING: the canary block in the agent-memory config is invalid (`<field>`); the canary is off.* The block failed the rules in "Canary for the memory API (optional)"; fix the named field.
 - *WARNING: the secret scan set aside `<n>` file(s) in `<state directory>`/quarantine. Review them.* See the next section.
 - *WARNING: `<n>` project folder(s) were claimed by a different repository on another machine. Notes written here before that may be mixed in; see `<state directory>`/status.json.* See the next section.
 - *Note: `<n>` note(s) changed on two machines; both versions were kept as \*.conflict-\*.md.*
@@ -387,6 +572,13 @@ Keep the notes repository private and do not write credentials into notes.
 
 A clone that still has the old history refuses to sync with *remote history was rewritten; re-clone `<clone>` (see README)*, so it cannot push the removed commits back.
 
+**With the bridge, the bucket holds a copy too.** A note that the secret scan did not flag was uploaded to `mem/` and into the search snapshot `index/mem.json`, and the Memory API served it to agents, which may have copied it into notes of their own (`agents/` in the bucket, and from there the mirror repository). Rewriting the notes repository does not remove any of that. After step 4, on the bridge machine (the one that runs `up`):
+
+5. Let its next sync run (or run `workstation/run.sh sync` once): the clone is new, so it does a full upload that replaces the current objects and deletes the ones that no longer exist.
+6. Delete the noncurrent versions of the affected `mem/` keys and of `index/mem.json` in the bucket, by hand. The bucket is versioned: noncurrent versions are kept for 90 days, those of `index/` for one day, except that the 20 newest noncurrent versions of `index/` are kept whatever their age (`api/infra/storage.ts`). Without this the old text stays readable to anyone who may read old versions until then.
+7. Search `agents/` in the bucket and the mirror repository for copies (`git log -p` in the mirror clone shows whether one was mirrored), remove them through their own means, and rewrite the mirror repository's history the same way if one was committed.
+8. Rotate the secret in any case; this section only limits who can still read it.
+
 ## Turn it off
 
 On each machine:
@@ -395,6 +587,8 @@ On each machine:
 2. Disable the timer: `systemctl --user disable --now agent-memory-sync.timer`, and, if you enabled consolidation, `agent-memory-extract.timer` and `agent-memory-organize.timer` the same way.
 3. Remove the two hook entries from `~/.claude/settings.json`: the commands that end with `# agent-memory-kit`, one under `SessionStart` and one under `PreToolUse`. `./setup.sh --no-hooks --no-enable`, run before step 1, does this for you, and also removes the Codex and Kiro hook entries (a `~/.codex/hooks.json` that is a symbolic link or in a linked folder is not edited, nor is a linked Kiro file removed; setup says what to remove).
 4. To unlink the memory folders: each linked folder `~/.claude/projects/<folder name>/memory` is a symlink into the clone, with a `memory.local-backup-<timestamp>` folder beside it. Remove the symlink, create the `memory` folder again and copy the project's notes from `~/agent-memory/projects/<name>/` into it. Delete the backup folders once you have confirmed that their notes are in the clone.
+
+Deleting the configuration file also stops the bridge. To stop only the bridge, see its own "Turn it off".
 
 Your notes stay in `~/agent-memory` and in the remote repository.
 
@@ -409,7 +603,7 @@ The `api/` directory holds an optional HTTP API for tools that cannot reach your
 
 The notes in the bucket are meant to be a replica of the workstation notes. The API reads the replica and writes only under `agents/<agent>/`. Those agent scopes are not part of the clone on your machines.
 
-**The replica writer is not part of this repository yet.** Nothing here copies workstation notes into `mem/` or builds `index/mem.json`, so a fresh deployment has an empty replica: `memory_scopes` lists only agent scopes, and reads and searches of `global` and `projects/<project>` find nothing until a writer (the roles named in `AGENT_MEMORY_WORKSTATION_ROLE_ARNS`) fills it. A writer must produce:
+**The replica writer is the workstation bridge** (see "Bridge to S3 and the agents repository (optional)"). A fresh deployment has an empty replica until a machine runs it: `memory_scopes` lists only agent scopes, and reads and searches of `global` and `projects/<project>` find nothing until a writer (the roles named in `AGENT_MEMORY_WORKSTATION_ROLE_ARNS`) fills it. A writer must produce:
 
 - the notes as objects under `mem/`: `mem/global/<file>.md` and `mem/projects/<project>/<file>.md`, with each scope's index at `mem/<scope>/MEMORY.md`;
 - the search snapshot `index/mem.json`:
@@ -459,7 +653,7 @@ AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>
 
 The infrastructure program is not type-checked in CI, so run `npm run typecheck:infra` before each deploy.
 
-`AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of IAM role ARNs that may write the replica (the `mem/` and `index/` prefixes) and read the agent scopes, for the job that copies the workstation notes into the bucket. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
+`AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of IAM role ARNs that may copy the workstation notes into the bucket. Such a role may write and delete objects under `mem/`; write `index/mem.json`; read and write `index/bridge.json`; read objects under `agents/`; and list the bucket with the prefixes `mem/` and `agents/`. It cannot write or delete anything else, including `index/agents.json`, which only the API writes. Pass the list at deploy time in the environment of the deploy command, for example `AGENT_MEMORY_WORKSTATION_ROLE_ARNS=arn:aws:iam::<aws-account-id>:role/<role-name> AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>`; separate several ARNs with commas. **Every later deploy of the stage must pass the variable again**: a deploy without it removes the grants, and the bridge then fails with `list failed: 403 AccessDenied` until the next deploy that has it. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
 
 The deployment creates:
 

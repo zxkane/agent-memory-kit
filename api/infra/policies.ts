@@ -91,12 +91,31 @@ export function bucketPolicy(bucketArn: string, workstationRoleArns: string[]): 
   ];
   if (workstationRoleArns.length > 0) {
     const principal = { AWS: workstationRoleArns };
+    // The bridge needs only these objects, and only the actions it uses. It writes notes and their
+    // snapshot but never reads them back from the bucket (it compares the listing's ETags); it reads
+    // its own record index/bridge.json, and the agent notes under agents/. A read of index/bridge.json
+    // before it exists answers 403 (the role has no list permission there), which the bridge treats
+    // as "no record" by design. The list permission names prefixes so that listing cannot reveal
+    // other keys, and index/ has no delete and no wildcard because the API alone writes
+    // index/agents.json.
     statements.push(
       {
         Effect: 'Allow',
         Principal: principal,
-        Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
-        Resource: [`${bucketArn}/mem/*`, `${bucketArn}/index/*`],
+        Action: ['s3:PutObject', 's3:DeleteObject'],
+        Resource: [`${bucketArn}/mem/*`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:PutObject'],
+        Resource: [`${bucketArn}/index/mem.json`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:GetObject', 's3:PutObject'],
+        Resource: [`${bucketArn}/index/bridge.json`],
       },
       {
         Effect: 'Allow',
@@ -109,7 +128,7 @@ export function bucketPolicy(bucketArn: string, workstationRoleArns: string[]): 
         Principal: principal,
         Action: ['s3:ListBucket'],
         Resource: [bucketArn],
-        Condition: { StringLike: { 's3:prefix': ['mem/*', 'index/*', 'agents/*'] } },
+        Condition: { StringLike: { 's3:prefix': ['mem/*', 'agents/*'] } },
       },
     );
   }

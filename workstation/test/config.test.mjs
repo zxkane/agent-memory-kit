@@ -33,7 +33,7 @@ test('applies defaults', (t) => {
   assert.deepEqual(loadConfig(env), {
     host: 'alpha', repoDir: '/home/u/agent-memory', repoUrl: null,
     stateDir: join(dir, '.local/state/agent-memory'), claudeDir: join(dir, '.claude'),
-    staleAfterSeconds: 600, consolidate: null, consolidateProblem: null,
+    staleAfterSeconds: 600, consolidate: null, consolidateProblem: null, bridge: null, bridgeProblem: null, canary: null, canaryProblem: null,
   });
 });
 
@@ -46,7 +46,7 @@ test('reads the default path under HOME and honors explicit values', (t) => {
   }));
   assert.deepEqual(loadConfig({ HOME: dir }), {
     host: 'beta', repoDir: '/r', repoUrl: 'git@example.com:u/m.git',
-    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30, consolidate: null, consolidateProblem: null,
+    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30, consolidate: null, consolidateProblem: null, bridge: null, bridgeProblem: null, canary: null, canaryProblem: null,
   });
 });
 
@@ -203,6 +203,167 @@ test('item 4: a key the consolidate block does not know makes it invalid, naming
   assert.equal(loadConfig(env).consolidateProblem, null);
 });
 
+const BRIDGE_OK = {
+  bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: true,
+  agentsRepoDir: '/home/u/agent-memory-mirror', agentsRepoUrl: 'https://example.com/agents.git',
+};
+
+test('bridge is null, with no problem, when the block is absent or null', (t) => {
+  const { env, write } = setup(t);
+  write(BASE);
+  assert.deepEqual([loadConfig(env).bridge, loadConfig(env).bridgeProblem], [null, null]);
+  write({ ...BASE, bridge: null });
+  assert.deepEqual([loadConfig(env).bridge, loadConfig(env).bridgeProblem], [null, null]);
+});
+
+test('bridge: a valid block with every field, and the defaults', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, bridge: BRIDGE_OK });
+  assert.deepEqual(loadConfig(env).bridge, BRIDGE_OK);
+  assert.equal(loadConfig(env).bridgeProblem, null);
+  write({ ...BASE, bridge: { up: true, bucket: 'example-bucket', region: 'ap-northeast-1' } });
+  assert.deepEqual(loadConfig(env).bridge, {
+    bucket: 'example-bucket', region: 'ap-northeast-1', up: true, down: false, agentsRepoDir: null, agentsRepoUrl: null,
+  });
+  write({ ...BASE, bridge: { agentsRepoDir: '/srv/agents' } });
+  assert.deepEqual(loadConfig(env).bridge, {
+    bucket: null, region: null, up: false, down: false, agentsRepoDir: '/srv/agents', agentsRepoUrl: null,
+  });
+  write({ ...BASE, bridge: { up: false } });
+  assert.equal(loadConfig(env).bridge.up, false);
+});
+
+test('bridge: each broken rule gives no bridge, names the field, and keeps the rest of the config', (t) => {
+  const { env, write } = setup(t);
+  const ok = { bucket: 'example-bucket', region: 'ap-northeast-1', up: true };
+  const cases = [
+    [{ ...ok, down: true, agentsRepoDir: '/home/u/agent-memory' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: '/home/u/agent-memory/sub' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: '/home/u' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: '/' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: '/home/u/agent-memory/' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: 'relative/dir' }, 'agentsRepoDir'],
+    [{ ...ok, agentsRepoDir: '/srv/a\nb' }, 'agentsRepoDir'],
+    [{ ...ok, down: true }, 'agentsRepoDir'],
+    [{ ...ok, bucket: undefined }, 'bucket'],
+    [{ ...ok, bucket: 'Example-bucket' }, 'bucket'],
+    [{ ...ok, bucket: 'example.bucket' }, 'bucket'],
+    [{ ...ok, region: undefined }, 'region'],
+    [{ ...ok, region: 'nowhere' }, 'region'],
+    [{ ...ok, up: 'true' }, 'up'],
+    [{ ...ok, down: 1 }, 'down'],
+    [{ ...ok, agentsRepoUrl: '' }, 'agentsRepoUrl'],
+    [{ ...ok, agentsRepoUrl: 5 }, 'agentsRepoUrl'],
+    [{ ...ok, agentsRepoUrl: '--upload-pack=x' }, 'agentsRepoUrl'],
+    [{ ...ok, agentsRepoUrl: 'https://example.com/a b.git' }, 'agentsRepoUrl'],
+    [{ ...ok, agentsRepoUrl: 'https://example.com/a\n.git' }, 'agentsRepoUrl'],
+    [{ ...ok, agentsRepoUrl: `https://example.com/${'a'.repeat(300)}` }, 'agentsRepoUrl'],
+    [{ ...ok, up: null }, 'up'],
+    [{ ...ok, down: null }, 'down'],
+    [{ ...ok, down: true, agentsRepoDir: '/home/u/other/../agent-memory/sub' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: '/home/u/agent-memory//' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: '/home/u/agent-memory/x/..' }, 'agentsRepoDir'],
+    [{ ...ok, down: true, agentsRepoDir: '/home/u/x/../' }, 'agentsRepoDir'],
+    [{ bucket: 'example-bucket' }, 'bridge'],
+    [{}, 'bridge'],
+    ['text', 'bridge'],
+    [[], 'bridge'],
+    [{ ...ok, upp: true }, 'upp'],
+    [{ ...ok, 'a b': true }, '(an unknown key)'],
+  ];
+  for (const [block, field] of cases) {
+    write({ ...BASE, bridge: block });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.bridge, null, JSON.stringify(block));
+    assert.equal(cfg.bridgeProblem, field, JSON.stringify(block));
+    assert.equal(cfg.host, 'alpha');
+    assert.equal(cfg.repoDir, '/home/u/agent-memory');
+  }
+});
+
+test('bridge: a sibling folder with a common name prefix is not inside repoDir', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, bridge: { down: true, bucket: 'example-bucket', region: 'ap-northeast-1', agentsRepoDir: '/home/u/agent-memory-mirror' } });
+  assert.equal(loadConfig(env).bridgeProblem, null);
+});
+
+test('bridge: an agentsRepoDir with .. segments that resolves outside repoDir is accepted', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, bridge: { down: true, bucket: 'example-bucket', region: 'ap-northeast-1', agentsRepoDir: '/home/u/x/../agents/' } });
+  assert.equal(loadConfig(env).bridgeProblem, null);
+});
+
+// ---- canary block ----
+
+const CANARY_OK = { stage: 'prod', region: 'ap-northeast-1', schedule: '*-*-* *:00:00' };
+
+test('canary is null, with no problem, when the block is absent or null', (t) => {
+  const { env, write } = setup(t);
+  write(BASE);
+  assert.deepEqual([loadConfig(env).canary, loadConfig(env).canaryProblem], [null, null]);
+  write({ ...BASE, canary: null });
+  assert.deepEqual([loadConfig(env).canary, loadConfig(env).canaryProblem], [null, null]);
+});
+
+test('canary: a valid block, with and without a schedule', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, canary: CANARY_OK });
+  assert.deepEqual(loadConfig(env).canary, CANARY_OK);
+  assert.equal(loadConfig(env).canaryProblem, null);
+  write({ ...BASE, canary: { stage: 'dev-2', region: 'us-east-1' } });
+  assert.deepEqual(loadConfig(env).canary, { stage: 'dev-2', region: 'us-east-1', schedule: null });
+  write({ ...BASE, canary: { stage: 'a'.repeat(32), region: 'eu-central-1', schedule: null } });
+  assert.equal(loadConfig(env).canary.schedule, null);
+});
+
+test('canary: each broken field gives no canary, names the field, and keeps the rest of the config', (t) => {
+  const { env, write } = setup(t);
+  const ok = { stage: 'prod', region: 'ap-northeast-1' };
+  const cases = [
+    [{ ...ok, stage: undefined }, 'stage'],
+    [{ ...ok, stage: 'Prod' }, 'stage'],
+    [{ ...ok, stage: '' }, 'stage'],
+    [{ ...ok, stage: 'a'.repeat(33) }, 'stage'],
+    [{ ...ok, stage: 'my_stage' }, 'stage'],
+    [{ ...ok, stage: 'prod\n' }, 'stage'],
+    [{ ...ok, stage: 5 }, 'stage'],
+    [{ ...ok, region: undefined }, 'region'],
+    [{ ...ok, region: 'nowhere' }, 'region'],
+    [{ ...ok, region: 5 }, 'region'],
+    [{ ...ok, schedule: '' }, 'schedule'],
+    [{ ...ok, schedule: '   ' }, 'schedule'],
+    [{ ...ok, schedule: 5 }, 'schedule'],
+    [{ ...ok, schedule: 'hourly;rm' }, 'schedule'],
+    [{ ...ok, schedule: 'a'.repeat(81) }, 'schedule'],
+    [{ ...ok, scheduel: 'hourly' }, 'scheduel'],
+    [{ ...ok, 'a b': 1 }, '(an unknown key)'],
+    [{ ...ok, ['x'.repeat(65)]: 1 }, '(an unknown key)'],
+    ['text', 'canary'],
+    [[], 'canary'],
+    [7, 'canary'],
+  ];
+  for (const [block, field] of cases) {
+    write({ ...BASE, canary: block });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.canary, null, JSON.stringify(block));
+    assert.equal(cfg.canaryProblem, field, JSON.stringify(block));
+    assert.equal(cfg.host, 'alpha');
+    assert.equal(cfg.repoDir, '/home/u/agent-memory');
+  }
+});
+
+test('canary: an invalid block does not disable the other blocks, nor they it', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, canary: { stage: 'Bad' }, bridge: { agentsRepoDir: '/srv/agents' } });
+  const cfg = loadConfig(env);
+  assert.equal(cfg.canaryProblem, 'stage');
+  assert.equal(cfg.bridge.agentsRepoDir, '/srv/agents');
+  write({ ...BASE, canary: CANARY_OK, bridge: { bucket: 'X_bad', up: true, region: 'ap-northeast-1' } });
+  const other = loadConfig(env);
+  assert.deepEqual(other.canary, CANARY_OK);
+  assert.equal(other.bridgeProblem, 'bucket');
+});
+
 test('C4: an unknown key that looks like a credential is not echoed', (t) => {
   const { env, write } = setup(t);
   const ok = { command: '/bin/m', model: 'm1' };
@@ -232,5 +393,24 @@ test('M-2: only a word-shaped unknown key is echoed', (t) => {
   for (const key of ['organise', 'max_projects']) {
     write({ ...BASE, consolidate: { ...ok, [key]: 'x' } });
     assert.equal(loadConfig(env).consolidateProblem, key);
+  }
+});
+
+test('one echo rule for all three blocks: a word is named, a credential-like or other key is not', (t) => {
+  const { env, write } = setup(t);
+  const gitHostToken = 'gh' + 'p_' + 'a'.repeat(36);
+  const accessKeyId = 'AK' + 'IA' + 'ABCDEFGHIJKLMNOP';
+  const blocks = {
+    consolidate: { command: '/bin/m', model: 'm1' },
+    bridge: { bucket: 'example-bucket', region: 'ap-northeast-1', up: true },
+    canary: { stage: 'prod', region: 'ap-northeast-1' },
+  };
+  for (const [name, ok] of Object.entries(blocks)) {
+    for (const key of [gitHostToken, accessKeyId, 'organise2', 'ab12'.repeat(16), 'a b']) {
+      write({ ...BASE, [name]: { ...ok, [key]: 'x' } });
+      assert.equal(loadConfig(env)[`${name}Problem`], '(an unknown key)', `${name} ${key.slice(0, 8)}`);
+    }
+    write({ ...BASE, [name]: { ...ok, misspelt: 'x' } });
+    assert.equal(loadConfig(env)[`${name}Problem`], 'misspelt', name);
   }
 });

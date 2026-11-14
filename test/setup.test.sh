@@ -445,6 +445,266 @@ check 'failing reload after a removal exits 0' test "$status" -eq 0
 check 'failing reload still removed the organize files' test ! -e "$udir/agent-memory-organize.timer" -a ! -e "$udir/agent-memory-organize.service"
 check 'failing reload is reported' has_text "$out" 'could not reload systemd'
 
+# Bridge: the second repository is cloned where bridge.agentsRepoDir says, when it is missing.
+agents_remote="$tmp/agents-remote.git"
+agents_dir="$tmp/agents-clone"
+git init -q --bare -b main "$agents_remote"
+set_bridge() { # set_bridge <json of the bridge block, or "none">
+    node -e '
+        const fs = require("node:fs");
+        const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        delete c.consolidate;
+        if (process.argv[2] === "none") delete c.bridge;
+        else c.bridge = JSON.parse(process.argv[2]);
+        fs.writeFileSync(process.argv[1], JSON.stringify(c, null, 2) + "\n");
+    ' "$cfg" "$1"
+}
+bridge_block="{\"agentsRepoDir\":\"$agents_dir\",\"agentsRepoUrl\":\"$agents_remote\"}"
+fresh_home
+run_setup --init alpha --repo-url "$remote" --no-enable
+set_bridge none
+run_setup --dry-run
+check 'no bridge block: dry run prints nothing about the agents repository' bash -c '! grep -qi "agents" <<< "$1"' _ "$out"
+run_setup --no-enable
+check 'no bridge block: run prints nothing about the agents repository' bash -c '! grep -qi "agents" <<< "$1"' _ "$out"
+check 'no bridge block: nothing is cloned' test ! -e "$agents_dir"
+set_bridge "$bridge_block"
+run_setup --dry-run
+check 'bridge dry run exits 0' test "$status" -eq 0
+check 'bridge dry run says it would clone' has_text "$out" "would clone the agents repository into $agents_dir"
+check 'bridge dry run never prints the URL' bash -c '! grep -qF -- "$2" <<< "$1"' _ "$out" "$agents_remote"
+check 'bridge dry run creates nothing' test ! -e "$agents_dir"
+run_setup --no-enable
+check 'bridge run exits 0' test "$status" -eq 0
+check 'bridge run clones the agents repository' test -d "$agents_dir/.git"
+check 'bridge run says where' has_text "$out" "cloned the agents repository into $agents_dir"
+check 'bridge run never prints the URL' bash -c '! grep -qF -- "$2" <<< "$1"' _ "$out" "$agents_remote"
+check 'bridge run leaves the origin of the clone as configured' test "$(git -C "$agents_dir" remote get-url origin)" = "$agents_remote"
+# An existing directory is left alone, in a dry run and in a run.
+printf 'mine\n' > "$agents_dir/keep.txt"
+head_before="$(git -C "$agents_dir" rev-parse --git-dir)"
+run_setup --dry-run
+check 'existing agents directory: dry run says nothing about cloning' bash -c '! grep -qi "clone the agents" <<< "$1"' _ "$out"
+run_setup --no-enable
+check 'existing agents directory: run says nothing about cloning' bash -c '! grep -qi "clone the agents" <<< "$1"' _ "$out"
+check 'existing agents directory is left alone' test "$(cat "$agents_dir/keep.txt")" = mine -a "$(git -C "$agents_dir" rev-parse --git-dir)" = "$head_before"
+# An existing directory that is not a clone is left alone too (the bridge refuses it at run time).
+rm -rf "$agents_dir"
+mkdir "$agents_dir"
+run_setup --no-enable
+check 'a plain existing directory is not cloned into' test ! -e "$agents_dir/.git"
+check 'a plain existing directory does not fail setup' test "$status" -eq 0
+rm -rf "$agents_dir"
+# A bridge block without a URL clones nothing and says nothing.
+set_bridge "{\"agentsRepoDir\":\"$agents_dir\"}"
+run_setup --no-enable
+check 'bridge without a URL exits 0' test "$status" -eq 0
+check 'bridge without a URL clones nothing' test ! -e "$agents_dir"
+# An invalid bridge block: one line naming the field, nothing cloned.
+set_bridge "{\"agentsRepoDir\":\"$agents_dir\",\"agentsRepoUrl\":\"$agents_remote\",\"bucket\":\"X_bad\",\"up\":true,\"region\":\"ap-northeast-1\"}"
+for mode in --dry-run --no-enable; do
+    run_setup "$mode"
+    check "invalid bridge block ($mode) exits 0" test "$status" -eq 0
+    check "invalid bridge block ($mode) names the field" has_text "$out" "the bridge block in $cfg is invalid (bucket); the agents repository was not cloned."
+    check "invalid bridge block ($mode) clones nothing" test ! -e "$agents_dir"
+done
+# A clone that fails does not abort setup and does not print the URL.
+set_bridge "{\"agentsRepoDir\":\"$agents_dir\",\"agentsRepoUrl\":\"$tmp/no-such-remote.git\"}"
+run_setup --no-enable
+check 'a failing agents clone does not abort setup' test "$status" -eq 0
+check 'a failing agents clone is reported' has_text "$out" "could not clone the agents repository into $agents_dir"
+check 'a failing agents clone leaves nothing behind' test ! -e "$agents_dir"
+check 'a failing agents clone does not print the URL' bash -c '! grep -qF -- "$2" <<< "$1"' _ "$out" "$tmp/no-such-remote.git"
+# The bridge works on main only: a remote whose only branch is another one is not cloned.
+other_remote="$tmp/agents-master.git"
+git init -q --bare -b master "$other_remote"
+git init -q -b master "$tmp/agents-master-seed"
+git -C "$tmp/agents-master-seed" -c user.name=seed -c user.email=seed@example.com commit -q --allow-empty -m 'chore: initial'
+git -C "$tmp/agents-master-seed" push -q "$other_remote" master
+set_bridge "{\"agentsRepoDir\":\"$agents_dir\",\"agentsRepoUrl\":\"$other_remote\"}"
+run_setup --no-enable
+check 'a remote without a main branch is not cloned' test ! -e "$agents_dir"
+check 'a remote without a main branch is reported' has_text "$out" "could not clone the agents repository into $agents_dir"
+check 'a remote without a main branch says so' has_text "$out" 'the agents repository has no main branch'
+check 'a remote without a main branch does not print the URL' bash -c '! grep -qF -- "$2" <<< "$1"' _ "$out" "$other_remote"
+# F1: a remote that cannot be reached is said to be unreachable, without its URL; nothing is cloned.
+set_bridge "{\"agentsRepoDir\":\"$agents_dir\",\"agentsRepoUrl\":\"$tmp/no-such-remote.git\"}"
+run_setup --no-enable
+check 'an unreachable agents remote says it cannot be reached' has_text "$out" 'the remote could not be reached'
+check 'an unreachable agents remote clones nothing' test ! -e "$agents_dir"
+check 'an unreachable agents remote does not print the URL' bash -c '! grep -qF -- "$2" <<< "$1"' _ "$out" "$tmp/no-such-remote.git"
+# A branch whose name only ends like main (foo/refs/heads/main) is not main.
+nested_remote="$tmp/agents-nested.git"
+git init -q --bare -b foo/refs/heads/main "$nested_remote"
+git init -q -b foo/refs/heads/main "$tmp/agents-nested-seed"
+git -C "$tmp/agents-nested-seed" -c user.name=seed -c user.email=seed@example.com commit -q --allow-empty -m 'chore: initial'
+git -C "$tmp/agents-nested-seed" push -q "$nested_remote" foo/refs/heads/main
+set_bridge "{\"agentsRepoDir\":\"$agents_dir\",\"agentsRepoUrl\":\"$nested_remote\"}"
+run_setup --no-enable
+check 'a remote whose only branch is foo/refs/heads/main is not cloned' test ! -e "$agents_dir"
+check 'a remote whose only branch is foo/refs/heads/main has no main branch' has_text "$out" 'the agents repository has no main branch'
+check 'an unreachable agents remote does not abort setup' test "$status" -eq 0
+# F1: a remote with no branch at all is cloned, the local branch is main, and the person is told what is missing.
+empty_remote="$tmp/agents-empty.git"
+git init -q --bare -b trunk "$empty_remote"
+set_bridge "{\"agentsRepoDir\":\"$agents_dir\",\"agentsRepoUrl\":\"$empty_remote\"}"
+run_setup --no-enable
+check 'an empty agents remote exits 0' test "$status" -eq 0
+check 'an empty agents remote is cloned' test -d "$agents_dir/.git"
+check 'an empty agents remote says where it was cloned' has_text "$out" "cloned the agents repository into $agents_dir"
+check 'an empty agents remote says it is empty and needs the marker on main' has_text "$out" 'the agents repository is empty; add the marker file .agent-memory-mirror to it on main.'
+check 'an empty agents remote does not print the URL' bash -c '! grep -qF -- "$2" <<< "$1"' _ "$out" "$empty_remote"
+check 'an empty agents remote leaves the local branch on main' test "$(git -C "$agents_dir" symbolic-ref --short HEAD)" = main
+git -C "$agents_dir" -c user.name=seed -c user.email=seed@example.com commit -q --allow-empty -m 'chore: first'
+check 'a first commit creates main' test "$(git -C "$agents_dir" rev-parse --abbrev-ref HEAD)" = main
+check 'a first commit creates no other branch' test "$(git -C "$agents_dir" branch --format='%(refname:short)')" = main
+rm -rf "$agents_dir"
+# w2: a folder that reaches the notes clone through a link is not cloned into, in a dry run and a run.
+ln -s "$home/agent-memory" "$tmp/notes-link"
+for inside in "$tmp/notes-link/mirror" "$tmp/notes-link/deeper/mirror"; do
+    set_bridge "{\"agentsRepoDir\":\"$inside\",\"agentsRepoUrl\":\"$empty_remote\"}"
+    for mode in --dry-run --no-enable; do
+        run_setup "$mode"
+        check "a mirror folder inside the notes clone through a link ($mode) exits 0" test "$status" -eq 0
+        check "a mirror folder inside the notes clone through a link ($mode) says so" has_text "$out" 'overlaps the notes clone (by real path)'
+        check "a mirror folder inside the notes clone through a link ($mode) is not cloned" test ! -e "$home/agent-memory/mirror" -a ! -e "$home/agent-memory/deeper"
+        check "a mirror folder inside the notes clone through a link ($mode) does not say it would clone" bash -c '! grep -q "clone the agents repository" <<< "$1"' _ "$out"
+        check "a mirror folder inside the notes clone through a link ($mode) does not print the URL" bash -c '! grep -qF -- "$2" <<< "$1"' _ "$out" "$empty_remote"
+    done
+done
+check 'nothing was cloned into the notes clone' test -z "$(git -C "$home/agent-memory" status --porcelain)"
+rm -f "$tmp/notes-link"
+
+# Canary: one timer for the deployed checks, written from canary.schedule like the consolidation timers.
+set_canary() { # set_canary <json of the canary block, or "none">
+    node -e '
+        const fs = require("node:fs");
+        const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        delete c.consolidate;
+        delete c.bridge;
+        if (process.argv[2] === "none") delete c.canary;
+        else c.canary = JSON.parse(process.argv[2]);
+        fs.writeFileSync(process.argv[1], JSON.stringify(c, null, 2) + "\n");
+    ' "$cfg" "$1"
+}
+canary_block='{"stage":"prod","region":"ap-northeast-1","schedule":"*-*-* 00/6:15:00"}'
+csvc="$udir/agent-memory-canary.service"
+ctim="$udir/agent-memory-canary.timer"
+fresh_home
+run_setup --init alpha --repo-url "$remote" --no-enable
+set_canary none
+run_setup --dry-run
+check 'no canary block: dry run prints nothing about it' bash -c '! grep -qi canary <<< "$1"' _ "$out"
+run_setup --no-enable
+check 'no canary block: run prints nothing about it' bash -c '! grep -qi canary <<< "$1"' _ "$out"
+check 'no canary block: no unit' test ! -e "$csvc" -a ! -e "$ctim"
+set_canary "$canary_block"
+rm -rf "$udir" "$calls"
+run_setup --dry-run
+check 'canary dry run exits 0' test "$status" -eq 0
+check 'canary dry run names the units' has_text "$out" "would write $udir/agent-memory-canary.service and agent-memory-canary.timer"
+check 'canary dry run says it would enable the timer' has_text "$out" 'enable --now agent-memory-sync.timer agent-memory-canary.timer'
+check 'canary dry run writes nothing' test ! -e "$udir"
+check 'canary dry run does not call systemctl' no_calls
+run_setup --no-enable
+check 'canary run exits 0' test "$status" -eq 0
+check 'canary run says it wrote the units' has_text "$out" 'wrote agent-memory-canary.service and agent-memory-canary.timer'
+check 'canary no-enable does not call systemctl' no_calls
+check 'canary service exists' test -f "$csvc"
+check 'canary timer exists' test -f "$ctim"
+check 'canary service is oneshot' has_line "$csvc" 'Type=oneshot'
+check 'canary service PATH' has_line "$csvc" "Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin"
+check 'canary service ExecStart' has_line "$csvc" "ExecStart=\"$kit/workstation/run.sh\" canary"
+check 'canary service timeout' has_line "$csvc" 'TimeoutStartSec=300'
+check 'canary service umask' has_line "$csvc" 'UMask=0077'
+check 'canary service is marked as managed' has_line "$csvc" '# Managed by agent-memory-kit setup.sh.'
+check 'canary service has no Nice and no KillMode' bash -c '! grep -qE "Nice|KillMode" "$1"' _ "$csvc"
+check 'canary timer OnCalendar' has_line "$ctim" 'OnCalendar=*-*-* 00/6:15:00'
+check 'canary timer persistent' has_line "$ctim" 'Persistent=true'
+check 'canary timer jitter' has_line "$ctim" 'RandomizedDelaySec=5min'
+check 'canary timer wanted by timers.target' has_line "$ctim" 'WantedBy=timers.target'
+check 'canary run writes no consolidation unit' test ! -e "$udir/agent-memory-extract.timer" -a ! -e "$udir/agent-memory-organize.timer"
+run_setup
+check 'canary enabling run exits 0' test "$status" -eq 0
+check 'canary run enables the canary timer' has_line "$calls" '--user enable --now agent-memory-canary.timer'
+check 'canary run still enables the sync timer' has_line "$calls" '--user enable --now agent-memory-sync.timer'
+check 'canary run reloads once' test "$(grep -cxF -- '--user daemon-reload' "$calls")" -eq 1
+# The canary and the consolidation timers are independent of each other.
+set_canary "$canary_block"
+node -e '
+    const fs = require("node:fs");
+    const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    c.consolidate = { command: "/path/to/claude", model: "model-id", extract: "Sat *-*-* 03:00" };
+    fs.writeFileSync(process.argv[1], JSON.stringify(c, null, 2) + "\n");
+' "$cfg"
+run_setup --no-enable
+check 'canary and extract timers are both written' test -f "$ctim" -a -f "$udir/agent-memory-extract.timer"
+check 'canary alongside consolidation leaves the organize units absent' test ! -e "$udir/agent-memory-organize.timer"
+# Removing the schedule (block kept) or the whole block disables the timer and removes both unit files.
+set_canary '{"stage":"prod","region":"ap-northeast-1"}'
+run_setup --dry-run
+check 'canary removal dry run names the service' has_text "$out" "would remove $csvc"
+check 'canary removal dry run names the timer' has_text "$out" "would remove $ctim"
+check 'canary removal dry run removes nothing' test -f "$ctim" -a -f "$csvc"
+rm -f "$calls"
+run_setup
+check 'canary removal exits 0' test "$status" -eq 0
+check 'canary removal disables the timer' has_line "$calls" '--user disable --now agent-memory-canary.timer'
+check 'canary removal removes both files' test ! -e "$csvc" -a ! -e "$ctim"
+check 'canary removal says so' has_text "$out" 'removed agent-memory-canary.service and agent-memory-canary.timer'
+run_setup --dry-run
+check 'a second canary dry run has no canary left to remove' bash -c '! grep -qi "would remove.*canary" <<< "$1"' _ "$out"
+set_canary "$canary_block"
+run_setup --no-enable
+check 'canary units come back' test -f "$csvc" -a -f "$ctim"
+set_canary none
+rm -f "$calls"
+run_setup
+check 'removing the whole canary block removes its units' test ! -e "$csvc" -a ! -e "$ctim"
+check 'removing the whole canary block disables the timer' has_line "$calls" '--user disable --now agent-memory-canary.timer'
+# An invalid block leaves existing units alone and names the field; so does an unknown key.
+set_canary "$canary_block"
+run_setup --no-enable
+cp "$ctim" "$tmp/canary.timer.before"
+cp "$csvc" "$tmp/canary.service.before"
+for bad in '{"stage":"Prod","region":"ap-northeast-1","schedule":"hourly"}:stage' '{"stage":"prod","region":"ap-northeast-1","schedual":"hourly"}:schedual'; do
+    set_canary "${bad%:*}"
+    canary_line="the canary block in $cfg is invalid (${bad##*:}); the canary units were left as they are."
+    rm -f "$calls"
+    run_setup --dry-run
+    check "invalid canary block dry run exits 0 (${bad##*:})" test "$status" -eq 0
+    check "invalid canary block dry run names the field (${bad##*:})" has_text "$out" "$canary_line"
+    check "invalid canary block dry run would touch no canary unit (${bad##*:})" bash -c '! grep -qE "would (write|remove) .*agent-memory-canary" <<< "$1"' _ "$out"
+    run_setup
+    check "invalid canary block run exits 0 (${bad##*:})" test "$status" -eq 0
+    check "invalid canary block run names the field (${bad##*:})" has_text "$out" "$canary_line"
+    check "invalid canary block keeps the timer (${bad##*:})" cmp -s "$ctim" "$tmp/canary.timer.before"
+    check "invalid canary block keeps the service (${bad##*:})" cmp -s "$csvc" "$tmp/canary.service.before"
+    check "invalid canary block does not disable the timer (${bad##*:})" bash -c '! grep -q "disable" "$1"' _ "$calls"
+    check "invalid canary block does not enable the canary timer (${bad##*:})" bash -c '! grep -q "enable --now agent-memory-canary" "$1"' _ "$calls"
+    check "invalid canary block still enables the sync timer (${bad##*:})" has_line "$calls" '--user enable --now agent-memory-sync.timer'
+done
+# A valid consolidate block is not disturbed by an invalid canary block, and the other way round.
+node -e '
+    const fs = require("node:fs");
+    const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    c.consolidate = { command: "/path/to/claude", model: "model-id", extract: "Sun *-*-* 03:00" };
+    fs.writeFileSync(process.argv[1], JSON.stringify(c, null, 2) + "\n");
+' "$cfg"
+run_setup --no-enable
+check 'an invalid canary block does not stop the extract timer from being written' has_line "$udir/agent-memory-extract.timer" 'OnCalendar=Sun *-*-* 03:00'
+check 'an invalid canary block says nothing about consolidation' bash -c '! grep -q "consolidate block" <<< "$1"' _ "$out"
+# systemd-analyze rejecting the canary schedule leaves its units as they are.
+set_canary '{"stage":"prod","region":"ap-northeast-1","schedule":"Saturday 3am"}'
+rm -f "$calls"
+setup_path="$sa_reject:$bin:$PATH" run_setup
+check 'a rejected canary schedule exits 0' test "$status" -eq 0
+check 'a rejected canary schedule names it' has_text "$out" 'the canary schedule "Saturday 3am" is not a valid systemd calendar expression (systemd-analyze calendar rejected it); the canary units were left as they are.'
+check 'a rejected canary schedule keeps the timer as it was' cmp -s "$ctim" "$tmp/canary.timer.before"
+check 'a rejected canary schedule does not enable it' bash -c '! grep -q "enable --now agent-memory-canary.timer" "$1"' _ "$calls"
+set_canary none
+run_setup --no-enable
+
 # Node.js 24 or later is accepted, an older one is not.
 real_node="$(command -v node)"
 for version in 25 23; do

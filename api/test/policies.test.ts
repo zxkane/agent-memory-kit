@@ -65,34 +65,63 @@ describe('bucketPolicy', () => {
     assert.deepEqual(s.Condition, { Bool: { 'aws:SecureTransport': 'false' } });
   });
 
-  it('with two roles grants the bridge access to both principals', () => {
+  it('with two roles grants the bridge exactly five statements to both principals', () => {
     const statements = bucketPolicy(BUCKET, [ROLE_A, ROLE_B]).Statement as Statement[];
-    const allows = statements.filter((s) => s.Effect === 'Allow');
-    assert.equal(allows.length, 3);
-    for (const s of allows) {
-      assert.deepEqual(s.Principal, { AWS: [ROLE_A, ROLE_B] });
-    }
-    const pairs = allows
-      .flatMap((s) => asList(s.Action).flatMap((a) => asList(s.Resource).map((r) => `${a} ${r}`)))
-      .sort();
-    assert.deepEqual(
-      pairs,
-      [
-        `s3:GetObject ${BUCKET}/mem/*`,
-        `s3:PutObject ${BUCKET}/mem/*`,
-        `s3:DeleteObject ${BUCKET}/mem/*`,
-        `s3:GetObject ${BUCKET}/index/*`,
-        `s3:PutObject ${BUCKET}/index/*`,
-        `s3:DeleteObject ${BUCKET}/index/*`,
-        `s3:GetObject ${BUCKET}/agents/*`,
-        `s3:ListBucket ${BUCKET}`,
-      ].sort(),
-    );
-    const list = allows.find((s) => asList(s.Action).includes('s3:ListBucket'));
-    assert.deepEqual(list?.Condition, {
-      StringLike: { 's3:prefix': ['mem/*', 'index/*', 'agents/*'] },
-    });
     assert.equal(statements.filter((s) => s.Effect === 'Deny').length, 1);
+    const principal = { AWS: [ROLE_A, ROLE_B] };
+    assert.deepEqual(statements.slice(1), [
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:PutObject', 's3:DeleteObject'],
+        Resource: [`${BUCKET}/mem/*`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:PutObject'],
+        Resource: [`${BUCKET}/index/mem.json`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:GetObject', 's3:PutObject'],
+        Resource: [`${BUCKET}/index/bridge.json`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:GetObject'],
+        Resource: [`${BUCKET}/agents/*`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:ListBucket'],
+        Resource: [BUCKET],
+        Condition: { StringLike: { 's3:prefix': ['mem/*', 'agents/*'] } },
+      },
+    ]);
+  });
+
+  it('gives the roles no write or delete on index/agents.json or agents/, no delete under index/, and no index/* resource', () => {
+    const allows = (bucketPolicy(BUCKET, [ROLE_A]).Statement as Statement[]).filter(
+      (s) => s.Effect === 'Allow',
+    );
+    for (const s of allows) {
+      const actions = asList(s.Action);
+      for (const r of asList(s.Resource)) {
+        assert.notEqual(r, `${BUCKET}/index/*`);
+        assert.notEqual(r, `${BUCKET}/*`);
+        if (r.startsWith(`${BUCKET}/index/`)) {
+          assert.ok(!actions.includes('s3:DeleteObject'), r);
+        }
+        if (r === `${BUCKET}/index/agents.json` || r.startsWith(`${BUCKET}/agents/`)) {
+          assert.ok(!actions.includes('s3:PutObject'), r);
+          assert.ok(!actions.includes('s3:DeleteObject'), r);
+        }
+      }
+    }
   });
 
   it('throws on a malformed role ARN', () => {

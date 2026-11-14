@@ -534,6 +534,101 @@ test('writeStatus keeps lastSuccess across a failed run and counts quarantine an
   assert.equal(writeStatus(c, okResult, new Date('2026-11-13T07:04:00Z')).quarantineCount, 0);
 });
 
+test('writeStatus without a bridge argument writes exactly the file it wrote before the bridge existed', (t) => {
+  const stateDir = join(tempDir(t), 'state');
+  const c = { repoDir: join(tempDir(t), 'no-repo'), host: 'alpha', stateDir };
+  const okRun = { ok: true, committed: 1, merged: false, pushed: true, quarantined: [], conflicts: [], markerConflicts: ['projects/q'], error: null };
+  const failedRun = { ...okRun, ok: false, committed: 0, pushed: false, markerConflicts: [], error: 'fatal: unreachable' };
+  writeStatus(c, okRun, new Date('2026-11-13T07:00:00Z'));
+  writeStatus(c, failedRun, new Date('2026-11-13T07:02:00Z'));
+  // Written by the code as it was before the bridge key was added.
+  const before = '{\n  "ok": false,\n  "committed": 0,\n  "merged": false,\n  "pushed": false,\n  "quarantined": [],\n  "conflicts": [],\n  "markerConflicts": [\n    "projects/q"\n  ],\n  "error": "fatal: unreachable",\n  "lastRun": "2026-11-13T07:02:00.000Z",\n  "lastSuccess": "2026-11-13T07:00:00.000Z",\n  "quarantineCount": 0,\n  "conflictCount": 0\n}\n';
+  assert.equal(readFileSync(join(stateDir, 'status.json'), 'utf8'), before);
+  writeStatus(c, failedRun, new Date('2026-11-13T07:02:00Z'), null);
+  assert.equal(readFileSync(join(stateDir, 'status.json'), 'utf8'), before);
+});
+
+const syncOk = { ok: true, committed: 0, merged: false, pushed: false, quarantined: [], conflicts: [], error: null };
+const stepOk = (at) => ({ ok: true, status: 'uploaded', error: null, at, puts: 1 });
+const stepBad = (at, error = 'raced') => ({ ok: false, status: 'raced', error, at });
+
+test('writeStatus records the bridge steps, keeps lastSuccess across failures and tracks failingSince', (t) => {
+  const stateDir = join(tempDir(t), 'state');
+  const c = { repoDir: join(tempDir(t), 'no-repo'), host: 'alpha', stateDir };
+  const t0 = '2026-11-13T07:00:00.000Z';
+  const t1 = '2026-11-13T07:02:00.000Z';
+  const t2 = '2026-11-13T07:04:00.000Z';
+  const t3 = '2026-11-13T07:06:00.000Z';
+  const first = writeStatus(c, syncOk, new Date(t0), { up: stepOk(t0), down: null });
+  assert.deepEqual(first.bridge, { up: { ...stepOk(t0), lastSuccess: t0 }, down: null });
+  assert.equal('failingSince' in first.bridge.up, false);
+
+  const second = writeStatus(c, syncOk, new Date(t1), { up: stepBad(t1), down: null });
+  assert.deepEqual(second.bridge.up, { ...stepBad(t1), lastSuccess: t0, failingSince: t1 });
+
+  const third = writeStatus(c, syncOk, new Date(t2), { up: stepBad(t2, 'time limit'), down: null });
+  assert.deepEqual(third.bridge.up, { ...stepBad(t2, 'time limit'), lastSuccess: t0, failingSince: t1 });
+  assert.deepEqual(readStatus(c).bridge, third.bridge);
+
+  const fourth = writeStatus(c, syncOk, new Date(t3), { up: stepOk(t3), down: null });
+  assert.deepEqual(fourth.bridge.up, { ...stepOk(t3), lastSuccess: t3 });
+});
+
+test('writeStatus: a step that never succeeded has a null lastSuccess; each step is tracked on its own', (t) => {
+  const stateDir = join(tempDir(t), 'state');
+  const c = { repoDir: join(tempDir(t), 'no-repo'), host: 'alpha', stateDir };
+  const t0 = '2026-11-13T07:00:00.000Z';
+  const s = writeStatus(c, syncOk, new Date(t0), { up: stepBad(t0), down: stepOk(t0) });
+  assert.deepEqual(s.bridge.up, { ...stepBad(t0), lastSuccess: null, failingSince: t0 });
+  assert.equal(s.bridge.down.lastSuccess, t0);
+});
+
+test('writeStatus: a step passed as undefined (not run this time) is kept as it was; null removes it', (t) => {
+  const stateDir = join(tempDir(t), 'state');
+  const c = { repoDir: join(tempDir(t), 'no-repo'), host: 'alpha', stateDir };
+  const t0 = '2026-11-13T07:00:00.000Z';
+  const t1 = '2026-11-13T07:02:00.000Z';
+  const first = writeStatus(c, syncOk, new Date(t0), { up: stepBad(t0), down: stepOk(t0) });
+  const kept = writeStatus(c, { ...syncOk, ok: false, error: 'x' }, new Date(t1), { up: undefined, down: undefined });
+  assert.deepEqual(kept.bridge, first.bridge);
+  const dropped = writeStatus(c, syncOk, new Date(t1), { up: null, down: undefined });
+  assert.deepEqual(dropped.bridge, { up: null, down: first.bridge.down });
+});
+
+test('writeStatus without the bridge argument carries the previous record over; null removes the key', (t) => {
+  const stateDir = join(tempDir(t), 'state');
+  const c = { repoDir: join(tempDir(t), 'no-repo'), host: 'alpha', stateDir };
+  const t0 = '2026-11-13T07:00:00.000Z';
+  const t1 = '2026-11-13T07:02:00.000Z';
+  const t2 = '2026-11-13T07:04:00.000Z';
+  const t3 = '2026-11-13T07:06:00.000Z';
+  writeStatus(c, syncOk, new Date(t0), { up: stepOk(t0), down: null });
+  const failing = writeStatus(c, syncOk, new Date(t1), { up: stepBad(t1), down: null });
+  // A writer that knows nothing of the bridge (the consolidation driver) passes no argument.
+  const carried = writeStatus(c, syncOk, new Date(t2));
+  assert.deepEqual(carried.bridge, failing.bridge);
+  assert.equal(carried.bridge.up.lastSuccess, t0);
+  assert.equal(carried.bridge.up.failingSince, t1);
+  assert.deepEqual(readStatus(c).bridge, failing.bridge);
+  // The next failing bridge run goes on from the carried record.
+  const again = writeStatus(c, syncOk, new Date(t3), { up: stepBad(t3, 'time limit'), down: null });
+  assert.equal(again.bridge.up.failingSince, t1);
+  assert.equal(again.bridge.up.lastSuccess, t0);
+  assert.equal('bridge' in writeStatus(c, syncOk, new Date(t3), null), false);
+  assert.equal('bridge' in readStatus(c), false);
+});
+
+test('a first failing bridge run after a status written without one gets its own failingSince', (t) => {
+  const stateDir = join(tempDir(t), 'state');
+  const c = { repoDir: join(tempDir(t), 'no-repo'), host: 'alpha', stateDir };
+  const t0 = '2026-11-13T07:00:00.000Z';
+  const t1 = '2026-11-13T07:02:00.000Z';
+  writeStatus(c, syncOk, new Date(t0), { up: stepOk(t0), down: null });
+  writeStatus(c, syncOk, new Date(t0));
+  const failed = writeStatus(c, syncOk, new Date(t1), { up: stepBad(t1), down: null });
+  assert.deepEqual(failed.bridge.up, { ...stepBad(t1), lastSuccess: t0, failingSince: t1 });
+});
+
 test('writeStatus starts with a null lastSuccess when the first run fails', (t) => {
   const { a } = makeRemoteAndClones(t);
   const c = cfg(a, 'alpha', join(tempDir(t), 'state'));
