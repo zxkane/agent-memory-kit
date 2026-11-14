@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 
 const PROMPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'prompts');
 const MAX_STDOUT_BYTES = 1024 * 1024;
+// The end of the client's standard error that is kept for diagnosis (never printed).
+const MAX_STDERR_TAIL_BYTES = 64 * 1024;
 const MAX_SUMMARY_CHARS = 2000;
 const KILL_GRACE_MS = 5000;
 const DRAIN_MS = 200;
@@ -58,8 +60,8 @@ export function modelArgs({ prompt, model, maxTurns, maxBudgetUsd, addDirs = [] 
   return args;
 }
 
-function failure(stopReason) {
-  return { ran: false, stopReason, costUsd: null, turns: null, denials: 0, summary: '' };
+function failure(stopReason, stderrTail = '') {
+  return { ran: false, stopReason, costUsd: null, turns: null, denials: 0, summary: '', stderrTail };
 }
 
 function finiteOrNull(value) {
@@ -80,7 +82,7 @@ function parseOutput(text) {
   return data !== null && typeof data === 'object' && !Array.isArray(data) ? data : null;
 }
 
-function summarize(data, timedOut) {
+function summarize(data, timedOut, stderrTail) {
   let stopReason;
   if (timedOut) {
     stopReason = 'timeout';
@@ -98,6 +100,7 @@ function summarize(data, timedOut) {
     turns: finiteOrNull(data.num_turns),
     denials: Array.isArray(data.permission_denials) ? data.permission_denials.length : 0,
     summary: typeof data.result === 'string' ? data.result.slice(0, MAX_SUMMARY_CHARS) : '',
+    stderrTail,
   };
 }
 
@@ -134,7 +137,7 @@ export function runModel({ command, args = [], cwd, env, timeoutMs, signal }) {
       child = spawn(command, args, {
         cwd,
         env: childEnv(env),
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
       });
     } catch {
@@ -144,6 +147,8 @@ export function runModel({ command, args = [], cwd, env, timeoutMs, signal }) {
 
     const chunks = [];
     let size = 0;
+    let errTail = Buffer.alloc(0);
+    const stderrTail = () => errTail.toString('utf8');
     let overflow = false;
     let timedOut = false;
     let aborted = false;
@@ -167,19 +172,21 @@ export function runModel({ command, args = [], cwd, env, timeoutMs, signal }) {
     const conclude = () => {
       if (settled) return;
       child.stdout.destroy();
+      child.stderr.destroy();
+      const tail = stderrTail();
       if ((timedOut || aborted) && child.pid !== undefined) killGroup(child.pid, 'SIGKILL');
       if (aborted) {
-        finish(failure('aborted'));
+        finish(failure('aborted', tail));
         return;
       }
       const data = overflow ? null : parseOutput(Buffer.concat(chunks).toString('utf8'));
-      if (data) finish(summarize(data, timedOut));
-      else finish(failure(timedOut ? 'timeout' : 'no-result'));
+      if (data) finish(summarize(data, timedOut, tail));
+      else finish(failure(timedOut ? 'timeout' : 'no-result', tail));
     };
 
     child.on('error', () => {
       // Failed to start (or to be signalled): there is no child to wait for.
-      finish(failure(child.pid === undefined ? 'spawn-failed' : 'no-result'));
+      finish(failure(child.pid === undefined ? 'spawn-failed' : 'no-result', stderrTail()));
     });
 
     child.stdout.on('data', (chunk) => {
@@ -193,6 +200,12 @@ export function runModel({ command, args = [], cwd, env, timeoutMs, signal }) {
       chunks.push(chunk);
     });
     child.stdout.on('error', () => {});
+    child.stderr.on('data', (chunk) => {
+      errTail = errTail.length + chunk.length > MAX_STDERR_TAIL_BYTES
+        ? Buffer.concat([errTail, chunk]).subarray(-MAX_STDERR_TAIL_BYTES)
+        : Buffer.concat([errTail, chunk]);
+    });
+    child.stderr.on('error', () => {});
 
     // A background process that inherited stdout can hold the pipe open after the
     // child is gone, so 'close' alone may never come: after 'exit', drain briefly.

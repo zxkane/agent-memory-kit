@@ -36,7 +36,7 @@ function loc(label, name) {
 // The bytes of a regular file, or null when the path is missing, is a symbolic link or is not a
 // regular file. The open itself refuses a symbolic link, so a swap between check and read is safe.
 // With `info`, the file's permission bits are stored in `info.mode`, read from the open descriptor.
-function readRegular(path, info = null) {
+export function readRegular(path, info = null) {
   let fd;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -86,6 +86,12 @@ function scanDir(dir, { strict = false } = {}) {
     else other.push(name);
   }
   return { files, other };
+}
+
+// The regular note files of a folder (name to bytes), sorted by name; a missing folder has none.
+// A file that cannot be read throws.
+export function noteFiles(dir) {
+  return scanDir(dir, { strict: true }).files;
 }
 
 export function snapshot(pairs) {
@@ -484,16 +490,25 @@ export function apply({ pairs, changes, snap }) {
     fail(label, rest.join('/'), 'live folder changed since the snapshot');
   }
   // Indexes last, so that a failure part-way leaves an index that lists only notes that exist.
+  // An error after the first write is tagged `partial`: some of the result is already live.
   writes.sort((a, b) => (a.file === INDEX) - (b.file === INDEX));
-  for (const { pair, file, buf, mode } of writes) {
-    mkdirSync(pair.liveDir, { recursive: true });
-    writeAtomic(pair.liveDir, file, buf, mode);
-  }
-  for (const c of retires) {
-    try {
-      unlinkSync(join(pairOf(c.label, c.file).liveDir, c.file));
-    } catch (err) {
-      if (!isMissing(err)) throw err;
+  let wrote = false;
+  try {
+    for (const { pair, file, buf, mode } of writes) {
+      mkdirSync(pair.liveDir, { recursive: true });
+      writeAtomic(pair.liveDir, file, buf, mode);
+      wrote = true;
     }
+    for (const c of retires) {
+      try {
+        unlinkSync(join(pairOf(c.label, c.file).liveDir, c.file));
+        wrote = true;
+      } catch (err) {
+        if (!isMissing(err)) throw err;
+      }
+    }
+  } catch (err) {
+    if (wrote) err.partial = true;
+    throw err;
   }
 }

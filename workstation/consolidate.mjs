@@ -7,18 +7,18 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
-  realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
+  chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { configPath, loadConfig } from './lib/config.mjs';
+import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
 import { runSync, writeStatus } from './lib/sync-engine.mjs';
 import { buildDigest, projectSessionDirs, sessionFilesSince } from './lib/transcripts.mjs';
-import { apply, evaluate, snapshot } from './lib/workdir.mjs';
+import { apply, evaluate, noteFiles, readRegular, snapshot } from './lib/workdir.mjs';
 
 const RUN_SH = join(dirname(fileURLToPath(import.meta.url)), 'run.sh');
 const KINDS = ['extract', 'organize'];
@@ -40,7 +40,6 @@ const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
 const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
-const MODEL_RE = /^[^\s\u0000-\u001f\u007f-][^\s\u0000-\u001f\u007f]{0,299}$/;
 const RETENTION_RE = /^(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
@@ -71,49 +70,6 @@ function lstatOrNull(path) {
     if (isMissing(err)) return null;
     throw err;
   }
-}
-
-// The bytes of a regular file, or null for anything else; a symbolic link is never followed.
-function readRegular(path) {
-  let fd;
-  try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  } catch (err) {
-    if (isMissing(err) || err.code === 'ELOOP') return null;
-    throw err;
-  }
-  try {
-    const st = fstatSync(fd);
-    if (!st.isFile()) return null;
-    const buf = Buffer.alloc(st.size);
-    let off = 0;
-    while (off < st.size) {
-      const n = readSync(fd, buf, off, st.size - off, off);
-      if (n === 0) break;
-      off += n;
-    }
-    return buf.subarray(0, off);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-// Note files of a folder (name to bytes), sorted by name. A missing folder has none.
-function noteFiles(dir) {
-  const files = new Map();
-  let names;
-  try {
-    names = readdirSync(dir);
-  } catch (err) {
-    if (isMissing(err)) return files;
-    throw err;
-  }
-  for (const name of names.sort()) {
-    if (!NOTE_NAME_RE.test(name)) continue;
-    const buf = readRegular(join(dir, name));
-    if (buf) files.set(name, buf);
-  }
-  return files;
 }
 
 // SHA-256 over the sorted `name:hash` lines of a folder's note files.
@@ -328,14 +284,14 @@ function cleanDescription(text) {
   return d.length > 200 ? `${d.slice(0, 200)}…` : d;
 }
 
-function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, pairs, snap, ev, descriptions, conversation }) {
+function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation }) {
   const title = `${kind[0].toUpperCase()}${kind.slice(1)}`;
   const suffix = (label) => (label === GLOBAL ? ' (global/)' : '');
   const changed = (label) => ev.changes.some((c) => c.label === label);
   const labels = pairs.map((p) => p.label);
   const shownLabels = labels.filter((l) => l === 'notes' || changed(l));
   const lines = [`# ${title} ${scope} — ${date} on ${config.host}`, ''];
-  lines.push(`- Model: ${model}; turns: ${turns ?? 'unknown'}; cost: ${usd(costUsd)}; stopped: ${stopReason}`);
+  lines.push(`- Model: ${model}; turns: ${turns ?? 'unknown'}; cost: ${usd(costUsd)}; stopped: ${stopReason}; denials: ${denials ?? 'unknown'}`);
   if (conversation) {
     lines.push(conversation.truncated
       ? `- Conversation text: cut to ${conversation.bytes} bytes; ${conversation.sessionsLeftOut} session(s) left out`
@@ -409,13 +365,14 @@ function pruneReports(config, now) {
 
 function stepApply(config, rest) {
   const a = parseStepArgs(rest,
-    ['--work', '--plan-sha256', '--stop-reason', '--cost', '--turns', '--model', '--min-retention', '--conversation'], ['--dry-run']);
+    ['--work', '--plan-sha256', '--stop-reason', '--cost', '--turns', '--denials', '--model', '--min-retention', '--conversation'], ['--dry-run']);
   const dryRun = a['--dry-run'] === true;
   const minRetention = a['--min-retention'] === 'default' ? undefined : parseRetention(a['--min-retention']);
   if (minRetention === null) throw new Error('invalid --min-retention');
   const stopReason = STOP_RE.test(a['--stop-reason']) ? a['--stop-reason'] : 'unknown';
   const costUsd = /^\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(a['--cost']) ? Number(a['--cost']) : null;
   const turns = /^\d{1,9}$/.test(a['--turns']) ? Number(a['--turns']) : null;
+  const denials = /^\d{1,9}$/.test(a['--denials']) ? Number(a['--denials']) : null;
   const model = a['--model'];
   const conversation = parseConversationArg(a['--conversation']);
   const work = checkWork(config, a['--work']);
@@ -469,7 +426,7 @@ function stepApply(config, rest) {
     if (buf && sha256(buf) === c.hash) descriptions.set(`${c.label}/${c.file}`, cleanDescription(parseNote(buf.toString('utf8')).description));
   }
   const report = () => buildReport({
-    config, kind, scope, date, model, stopReason, costUsd, turns, pairs, snap, ev, descriptions, conversation,
+    config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation,
   });
 
   let outcome;
@@ -487,7 +444,9 @@ function stepApply(config, rest) {
   try {
     apply({ pairs, changes: ev.changes, snap });
   } catch (err) {
-    out({ ...result, outcome: 'changed-meanwhile', reason: firstLine(err) });
+    // Before the first write nothing was applied: something moved since evaluate. After it, part
+    // of the result is live and uncommitted (the next sync commits it); say so, never "nothing".
+    out({ ...result, outcome: err.partial ? 'apply-interrupted' : 'changed-meanwhile', reason: firstLine(err) });
     return;
   }
   const digest = folderDigest(pairs[0].liveDir);
@@ -829,11 +788,13 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     });
     const costUsd = typeof m.costUsd === 'number' && m.costUsd >= 0 ? m.costUsd : null;
     const stopReason = STOP_RE.test(m.stopReason) ? m.stopReason : 'unknown';
-    const modelInfo = { ran: m.ran, stopReason, costUsd };
+    const denials = Number.isInteger(m.denials) && m.denials >= 0 ? m.denials : 0;
+    const modelInfo = { ran: m.ran, stopReason, costUsd, denials };
     if (await signalsHandled()) return { outcome: 'aborted', model: modelInfo, work };
     const args = [
       'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', stopReason,
       '--cost', costUsd === null ? 'unknown' : String(costUsd), '--turns', Number.isInteger(m.turns) ? String(m.turns) : 'unknown',
+      '--denials', String(denials),
       '--model', model, '--min-retention', opts.minRetention === undefined ? 'default' : String(opts.minRetention),
       '--conversation', conversationArg(digest ? conversationOf(digest) : null),
     ];
@@ -860,6 +821,7 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
     // `no-change` always means the model completed and found nothing.
     if (res.outcome === 'no-change' && stopReason !== 'completed') {
+      writeFileSync(join(work, 'model-stderr.log'), m.stderrTail ?? '', { mode: 0o600, flag: 'wx' });
       return { ...res, outcome: 'model-failed', step: 'apply', model: modelInfo, work };
     }
     return { ...res, step: 'apply', model: modelInfo, work };
@@ -915,7 +877,7 @@ function record(config, state, { kind, scope, res, started, dryRun }) {
   }
   entry.lastOutcome = {
     kind, at: new Date().toISOString(), outcome: res.outcome,
-    stopReason: res.model?.stopReason ?? null, costUsd: res.model?.costUsd ?? null,
+    stopReason: res.model?.stopReason ?? null, costUsd: res.model?.costUsd ?? null, denials: res.model?.denials ?? null,
   };
   if (res.conversation) {
     entry.lastOutcome.truncated = res.conversation.truncated;
@@ -934,6 +896,7 @@ function headline(kind, scope, res) {
   else what = `${res.outcome}, ${res.changes?.length ?? 0} change(s)`;
   let line = `${kind} ${scope}: ${what}, ${usd(res.model ? res.model.costUsd : 0)}`;
   if (res.model) line += `, stopped: ${res.model.stopReason}`;
+  if (res.model?.denials > 0) line += `, ${res.model.denials} denied tool call(s)`;
   if (res.conversation?.truncated) line += ', conversation text cut';
   return line;
 }

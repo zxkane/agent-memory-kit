@@ -271,7 +271,7 @@ test('runModel stops the process group when its signal is aborted', async (t) =>
   while (!existsSync(join(dir, 'sleep.pid')) && Date.now() - started < 5000) await new Promise((r) => setTimeout(r, 20));
   controller.abort();
   const r = await pending;
-  assert.deepEqual(r, { ran: false, stopReason: 'aborted', costUsd: null, turns: null, denials: 0, summary: '' });
+  assert.deepEqual(r, { ran: false, stopReason: 'aborted', costUsd: null, turns: null, denials: 0, summary: '', stderrTail: '' });
   assert.ok(Date.now() - started < 10000);
   for (const f of ['sh.pid', 'sleep.pid']) {
     assert.equal(await gone(Number(readFileSync(join(dir, f), 'utf8'))), true, `${f} process is gone`);
@@ -446,4 +446,21 @@ test('organize prompt exempts retired files and explains global links and mergin
   assert.ok(on.includes('add or update its line in global/MEMORY.md'));
   assert.ok(on.includes('A link from a note in notes/ to a note in global/ is written [[global:name]].'));
   assert.ok(!off.includes('[[global:'));
+});
+
+test('m10: runModel keeps the last 64 KB of the client\'s standard error, and prints none of it', async (t) => {
+  const dir = tmp(t);
+  const command = fakeCommand(dir, [
+    `head -c 70000 /dev/zero | tr '\\0' 'e' >&2`,
+    `printf 'STDERR-END-MARKER' >&2`,
+    `echo '{"subtype":"success","is_error":false}'`,
+  ].join('\n'));
+  const r = await runModel({ command, args: [], cwd: dir, env: {}, timeoutMs: 10000 });
+  assert.equal(r.stopReason, 'completed');
+  assert.equal(Buffer.byteLength(r.stderrTail, 'utf8'), 64 * 1024);
+  assert.ok(r.stderrTail.endsWith('STDERR-END-MARKER'));
+  const quiet = await runModel({ command: fakeCommand(dir, `echo '{"subtype":"success","is_error":false}'`, 'q.sh'), args: [], cwd: dir, env: {}, timeoutMs: 10000 });
+  assert.equal(quiet.stderrTail, '');
+  const missing = await runModel({ command: join(dir, 'nope'), args: [], cwd: dir, env: {}, timeoutMs: 10000 });
+  assert.equal(missing.stderrTail, '');
 });

@@ -6,6 +6,9 @@ const HOST_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 const CALENDAR_RE = /^[A-Za-z0-9 *:,./~-]{1,80}$/;
+// A model ID: no whitespace or control character, not starting with "-" (it is passed as the
+// value of the client's --model option), at most 300 characters. Shared with the driver's --model.
+export const MODEL_RE = /^[^\s\u0000-\u001f\u007f-][^\s\u0000-\u001f\u007f]{0,299}$/;
 
 function intIn(value, fallback, min, max) {
   const v = value === undefined ? fallback : value;
@@ -27,7 +30,7 @@ function parseConsolidate(block) {
   if (typeof block !== 'object' || Array.isArray(block)) return bad('consolidate');
   const { command, model } = block;
   if (typeof command !== 'string' || !isAbsolute(command) || CONTROL_RE.test(command)) return bad('command');
-  if (typeof model !== 'string' || !/^\S+$/.test(model)) return bad('model');
+  if (typeof model !== 'string' || !MODEL_RE.test(model)) return bad('model');
   const env = block.env ?? {};
   if (env === null || typeof env !== 'object' || Array.isArray(env)) return bad('env');
   for (const [k, v] of Object.entries(env)) {

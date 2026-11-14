@@ -6,7 +6,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { apply, evaluate, liveDiffers, noteTokens, snapshot } from '../lib/workdir.mjs';
+import { apply, evaluate, liveDiffers, noteFiles, noteTokens, readRegular, snapshot } from '../lib/workdir.mjs';
 import { tempDir } from './helpers.mjs';
 
 const sha = (text) => createHash('sha256').update(text).digest('hex');
@@ -1152,4 +1152,63 @@ test('F1: apply checks the same folders as evaluate, just before its first write
   writeFileSync(s.live('global', 'g2.md'), 'written after evaluate');
   apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
   assert.equal(s.readLive('notes', 'a.md'), 'alpha, edited');
+});
+
+test('m7: a retirement that names its target with .md is accepted and applied', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' } });
+  s.work('notes', 'a.md', 'alpha and beta');
+  s.work('notes', 'b.md', 'MOVED TO [[a.md]]\n');
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.changes.find((c) => c.kind === 'retire').target, { label: 'notes', file: 'a.md' });
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(existsSync(s.live('notes', 'b.md')), false);
+  assert.equal(s.readLive('notes', 'a.md'), 'alpha and beta');
+});
+
+test('m1: an error after the first write is tagged partial; one before it is not', { skip: process.getuid?.() === 0 && 'runs as root' }, (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' }, global: { 'g.md': 'general' } });
+  s.work('notes', 'a.md', 'alpha, edited');
+  s.work('global', 'g.md', 'general, edited');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  const globalDir = s.pairs[1].liveDir;
+  chmodSync(globalDir, 0o555);
+  let err = null;
+  try {
+    apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  } catch (e) {
+    err = e;
+  } finally {
+    chmodSync(globalDir, 0o755);
+  }
+  assert.ok(err);
+  assert.equal(err.partial, true);
+  assert.equal(s.readLive('notes', 'a.md'), 'alpha, edited');
+
+  const s2 = setup(t, { notes: { 'MEMORY.md': INDEX_AB, 'a.md': 'alpha', 'b.md': 'beta' } });
+  s2.work('notes', 'a.md', 'alpha, edited');
+  const r2 = evaluate({ pairs: s2.pairs, snap: s2.snap, allowRetire: true });
+  const notesDir = s2.pairs[0].liveDir;
+  chmodSync(notesDir, 0o555);
+  let err2 = null;
+  try {
+    apply({ pairs: s2.pairs, changes: r2.changes, snap: s2.snap });
+  } catch (e) {
+    err2 = e;
+  } finally {
+    chmodSync(notesDir, 0o755);
+  }
+  assert.ok(err2);
+  assert.equal(err2.partial, undefined);
+});
+
+test('m8: readRegular and noteFiles are exported', (t) => {
+  const dir = tempDir(t);
+  write(dir, { 'b.md': 'b', 'a.md': 'a', 'x.txt': 'x' });
+  symlinkSync(join(dir, 'a.md'), join(dir, 'link.md'));
+  assert.deepEqual([...noteFiles(dir).keys()], ['a.md', 'b.md']);
+  assert.equal(readRegular(join(dir, 'a.md')).toString(), 'a');
+  assert.equal(readRegular(join(dir, 'link.md')), null);
+  assert.equal(noteFiles(join(dir, 'missing')).size, 0);
 });

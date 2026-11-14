@@ -127,6 +127,14 @@ else
 fi
 # A consolidate block that is present but invalid leaves the consolidation units as they are:
 # reading it as "no schedule" would remove timers that the person did not ask to remove.
+# True when systemd-analyze is on the PATH and rejects the calendar expression $2 of scope $1;
+# then prints one line, and that scope's units are left as they are. Without the tool, nothing
+# is checked here (setup's own check in config.mjs still applies).
+calendar_rejected() { # calendar_rejected <extract|organize> <calendar>
+    command -v systemd-analyze > /dev/null 2>&1 || return 1
+    systemd-analyze calendar "$2" > /dev/null 2>&1 && return 1
+    printf 'the %s schedule "%s" is not a valid systemd calendar expression (systemd-analyze calendar rejected it); the %s units were left as they are.\n' "$1" "$2" "$1"
+}
 invalid_block_line() {
     printf 'the consolidate block in %s is invalid (%s); the consolidation units were left as they are.\n' "$config_file" "$consolidate_problem"
 }
@@ -182,7 +190,9 @@ if [[ $dry_run -eq 1 ]]; then
     for scope in extract organize; do
         [[ -z "$consolidate_problem" ]] || break
         cal_var="${scope}_cal"
-        if [[ -n "${!cal_var}" ]]; then
+        if [[ -n "${!cal_var}" ]] && calendar_rejected "$scope" "${!cal_var}"; then
+            continue
+        elif [[ -n "${!cal_var}" ]]; then
             printf 'would write %s/agent-memory-%s.service and agent-memory-%s.timer\n' "$unit_dir" "$scope" "$scope"
             timers_on="$timers_on agent-memory-$scope.timer"
         else
@@ -295,7 +305,9 @@ UNIT
 for scope in extract organize; do
     [[ -z "$consolidate_problem" ]] || break
     cal_var="${scope}_cal"
-    if [[ -n "${!cal_var}" ]]; then
+    if [[ -n "${!cal_var}" ]] && calendar_rejected "$scope" "${!cal_var}"; then
+        continue
+    elif [[ -n "${!cal_var}" ]]; then
         write_consolidate_units "$scope" "${!cal_var}"
         printf 'wrote agent-memory-%s.service and agent-memory-%s.timer\n' "$scope" "$scope"
     elif [[ -e "$unit_dir/agent-memory-$scope.timer" || -e "$unit_dir/agent-memory-$scope.service" ]]; then

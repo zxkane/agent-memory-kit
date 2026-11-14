@@ -82,3 +82,10 @@ test('indexStats counts lines and UTF-8 bytes', () => {
   assert.deepEqual(indexStats('a\nb'), { lines: 2, bytes: 3 });
   assert.deepEqual(indexStats('日本語'), { lines: 1, bytes: 9 });
 });
+
+test('m7: stubTarget strips exactly one trailing .md from the name', () => {
+  assert.deepEqual(stubTarget('MOVED TO [[a.md]]'), { folder: 'same', name: 'a' });
+  assert.deepEqual(stubTarget('MOVED TO [[global:deploy-region.md]]'), { folder: 'global', name: 'deploy-region' });
+  assert.deepEqual(stubTarget('MOVED TO [[a.md.md]]'), { folder: 'same', name: 'a.md' });
+  assert.deepEqual(stubTarget('MOVED TO [[a.mdx]]'), { folder: 'same', name: 'a.mdx' });
+});

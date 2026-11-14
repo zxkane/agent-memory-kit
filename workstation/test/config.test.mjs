@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadConfig } from '../lib/config.mjs';
+import { MODEL_RE, loadConfig } from '../lib/config.mjs';
 import { tempDir } from './helpers.mjs';
 
 function setup(t) {
@@ -169,4 +169,18 @@ test('F4: an invalid consolidate block names the first field that failed; absent
   assert.equal(loadConfig(env).consolidateProblem, null);
   write({ ...BASE, consolidate: ok });
   assert.equal(loadConfig(env).consolidateProblem, null);
+});
+
+test('m13: the model is checked with MODEL_RE, the rule of the --model option', (t) => {
+  const { env, write } = setup(t);
+  for (const model of ['-x', 'a\u0001b', 'a\u007fb', 'x'.repeat(301)]) {
+    assert.equal(MODEL_RE.test(model), false, model);
+    write({ ...BASE, consolidate: { command: '/bin/m', model } });
+    assert.equal(loadConfig(env).consolidateProblem, 'model', model);
+  }
+  for (const model of ['m1', 'vendor.family-1-2', 'name[1m]', 'x'.repeat(300)]) {
+    assert.equal(MODEL_RE.test(model), true, model);
+    write({ ...BASE, consolidate: { command: '/bin/m', model } });
+    assert.equal(loadConfig(env).consolidate.model, model);
+  }
 });

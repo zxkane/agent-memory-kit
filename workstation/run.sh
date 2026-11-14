@@ -64,6 +64,11 @@ case "$mode" in
         exec "$node_path" "$root/migrate.mjs" "${@:2}"
         ;;
     consolidate)
+        # A step writes into the clone and runs only through consolidate-step, under the sync lock.
+        if [[ "${2:-}" == --step* ]]; then
+            printf '%s\n' 'usage: run.sh consolidate extract|organize [options]' >&2
+            exit 2
+        fi
         require_node
         take_consolidate_lock
         if ! flock -n 8; then

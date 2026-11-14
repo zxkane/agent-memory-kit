@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -56,6 +56,7 @@ if (ins.holdLock) {
   if (!existsSync(marker)) process.exit(3);
 }
 if (ins.sleepMs) await new Promise((resolve) => setTimeout(resolve, ins.sleepMs));
+if (ins.stderr) process.stderr.write(ins.stderr);
 if (ins.silent) process.exit(1);
 const result = { type: 'result', subtype: 'success', is_error: false, total_cost_usd: 0.25, num_turns: 4, result: process.env.FAKE_SUMMARY, ...ins.result };
 process.stdout.write(JSON.stringify(result) + '\\n');
@@ -181,7 +182,7 @@ test('organize merges a duplicate, commits it with a report and records the stat
 
   const text = readFileSync(join(f.repo, report), 'utf8');
   assert.match(text, new RegExp(`^# Organize p — ${today()} on alpha$`, 'm'));
-  assert.match(text, /^- Model: test-model; turns: 4; cost: USD 0\.25; stopped: completed$/m);
+  assert.match(text, /^- Model: test-model; turns: 4; cost: USD 0\.25; stopped: completed; denials: 0$/m);
   assert.match(text, /^- Index: 2 lines, \d+ bytes → 1 lines, \d+ bytes$/m);
   assert.match(text, /^- Notes not listed in the index: 0 → 0$/m);
   assert.match(text, /^- Notes: \d+ bytes → \d+ bytes; retired: \d+ bytes$/m);
@@ -195,7 +196,7 @@ test('organize merges a duplicate, commits it with a report and records the stat
   assert.ok(!Number.isNaN(Date.parse(entry.lastOrganize)));
   assert.equal(entry.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
   assert.deepEqual({ ...entry.lastOutcome, at: undefined },
-    { kind: 'organize', at: undefined, outcome: 'applied', stopReason: 'completed', costUsd: 0.25 });
+    { kind: 'organize', at: undefined, outcome: 'applied', stopReason: 'completed', costUsd: 0.25, denials: 0 });
   assert.equal(statSync(f.stateFile()).mode & 0o777, 0o600);
   assert.deepEqual(readdirSync(f.workRoot()), []);
 
@@ -742,7 +743,7 @@ test('a run stopped by its budget after a valid partial change is applied and re
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^organize p: applied, 3 change\(s\), USD 5\.01, stopped: error_max_budget_usd$/m);
   const text = readFileSync(join(f.repo, `_reports/${today()}-alpha-organize-p.md`), 'utf8');
-  assert.match(text, /^- Model: test-model; turns: 9; cost: USD 5\.01; stopped: error_max_budget_usd$/m);
+  assert.match(text, /^- Model: test-model; turns: 9; cost: USD 5\.01; stopped: error_max_budget_usd; denials: 0$/m);
 });
 
 test('a model run that changed nothing is no-change, with no commit', (t) => {
@@ -1528,4 +1529,75 @@ test('a signal between two scopes: the next snapshot step never runs', async (t)
   assert.doesNotMatch(stdout, /organize q:/);
   assert.equal(fetches(), 2);
   assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
+});
+
+test('m9: run.sh consolidate refuses a first argument starting with --step', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  for (const args of [['--step', 'scan'], ['--step=apply'], ['--steps']]) {
+    const r = f.run(...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /usage/);
+    assert.equal(r.stdout, '');
+  }
+  assert.equal(existsSync(f.state), false);
+});
+
+test('m3: denied tool calls are shown in the headline, the report and lastOutcome', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  const instruction = mergeInstruction();
+  instruction.p.result = { permission_denials: [{ tool: 'Write' }, { tool: 'Read' }] };
+  f.instruct(instruction);
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied, 3 change\(s\), USD 0\.25, stopped: completed, 2 denied tool call\(s\)$/m);
+  const text = readFileSync(join(f.repo, `_reports/${today()}-alpha-organize-p.md`), 'utf8');
+  assert.match(text, /^- Model: test-model; turns: 4; cost: USD 0\.25; stopped: completed; denials: 2$/m);
+  assert.equal(f.readState().projects.p.lastOutcome.denials, 2);
+});
+
+test('m1: an apply that fails after its first write is apply-interrupted, not changed meanwhile', { skip: asRoot && 'runs as root' }, (t) => {
+  const f = fixture(t);
+  duplicateProjectWithGlobal(f);
+  const globalDir = join(f.repo, 'global');
+  const instruction = mergeInstruction();
+  instruction.p.writes['global/g.md'] = note('g', 'General', 'Something general, edited.');
+  instruction.p.chmod = { [globalDir]: 0o555 };
+  f.instruct(instruction);
+  let r;
+  try {
+    r = f.run('organize', '--project', 'p');
+  } finally {
+    chmodSync(globalDir, 0o755);
+  }
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: apply interrupted, changes may have been applied, USD 0\.25, stopped: completed$/m);
+  assert.match(r.stdout, /EACCES/);
+  assert.doesNotMatch(r.stdout, /nothing applied/);
+  const p = f.readState().projects.p;
+  assert.equal(p.lastOutcome.outcome, 'apply-interrupted');
+  assert.equal(p.organizedDigest, undefined);
+});
+
+test('m10: the client\'s standard error of a failed model run is kept in the work folder only', (t) => {
+  const marker = 'STDERR-MARKER-2718 the client said this';
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct({ p: { silent: true, stderr: marker } });
+  let r = f.run('organize', '--keep');
+  assert.equal(r.status, 1);
+  const [call] = f.calls();
+  const log = join(call.cwd, 'model-stderr.log');
+  assert.equal(readFileSync(log, 'utf8'), marker);
+  assert.equal(statSync(log).mode & 0o777, 0o600);
+  const pattern = /STDERR-MARKER-2718/;
+  assert.doesNotMatch(r.stdout + r.stderr, pattern);
+  assert.doesNotMatch(readFileSync(f.stateFile(), 'utf8'), pattern);
+  assert.doesNotMatch(treeText(f.repo), pattern);
+  rmSync(f.workRoot(), { recursive: true, force: true });
+  r = f.run('organize', '--project', 'p');
+  assert.equal(r.status, 1);
+  assert.deepEqual(readdirSync(f.workRoot()), []);
+  assert.doesNotMatch(r.stdout + r.stderr, pattern);
 });

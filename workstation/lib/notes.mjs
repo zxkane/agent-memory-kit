@@ -42,10 +42,13 @@ export function indexRefs(indexText) {
   return refs;
 }
 
-// A retired note holds only `MOVED TO [[name]]` or `MOVED TO [[global:name]]`.
+// A retired note holds only `MOVED TO [[name]]` or `MOVED TO [[global:name]]`. A name written with
+// its file extension (`[[name.md]]`) names the same note: exactly one trailing `.md` is dropped.
 export function stubTarget(text) {
   const m = STUB_RE.exec(String(text).trim());
-  return m ? { folder: m[1] ? 'global' : 'same', name: m[2] } : null;
+  if (!m) return null;
+  const name = m[2].endsWith('.md') ? m[2].slice(0, -3) : m[2];
+  return { folder: m[1] ? 'global' : 'same', name };
 }
 
 export function indexStats(indexText) {

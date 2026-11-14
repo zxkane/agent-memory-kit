@@ -385,6 +385,48 @@ check 'invalid block still enables the sync timer' has_line "$calls" '--user ena
 set_consolidate none
 run_setup --no-enable
 
+# m11: each schedule is checked with `systemd-analyze calendar` when that tool is on the PATH.
+sa_accept="$tmp/sa-accept"
+sa_reject="$tmp/sa-reject"
+mkdir -p "$sa_accept" "$sa_reject"
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$sa_accept/systemd-analyze"
+printf '%s\n' '#!/bin/bash' '[[ "$1" == calendar && "$2" == *Saturday* ]] && exit 1' 'exit 0' > "$sa_reject/systemd-analyze"
+chmod +x "$sa_accept/systemd-analyze" "$sa_reject/systemd-analyze"
+set_consolidate "$both"
+rm -f "$udir"/agent-memory-extract.* "$udir"/agent-memory-organize.* "$calls"
+setup_path="$sa_accept:$bin:$PATH" run_setup --no-enable
+check 'accepted schedules are written' test -f "$udir/agent-memory-extract.timer" -a -f "$udir/agent-memory-organize.timer"
+cp "$udir/agent-memory-extract.timer" "$tmp/extract.timer.before"
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Saturday 3am","organize":"Sun *-*-* 04:30"}'
+rejected_line='the extract schedule "Saturday 3am" is not a valid systemd calendar expression (systemd-analyze calendar rejected it); the extract units were left as they are.'
+setup_path="$sa_reject:$bin:$PATH" run_setup --dry-run
+check 'rejected schedule dry run exits 0' test "$status" -eq 0
+check 'rejected schedule dry run names it' has_text "$out" "$rejected_line"
+check 'rejected schedule dry run would not touch the extract units' bash -c '! grep -qE "would (write|remove) .*agent-memory-extract" <<< "$1"' _ "$out"
+check 'rejected schedule dry run still writes the organize units' has_text "$out" "would write $udir/agent-memory-organize.service and agent-memory-organize.timer"
+rm -f "$calls"
+setup_path="$sa_reject:$bin:$PATH" run_setup
+check 'rejected schedule run exits 0' test "$status" -eq 0
+check 'rejected schedule run names it' has_text "$out" "$rejected_line"
+check 'rejected schedule keeps the extract timer as it was' cmp -s "$udir/agent-memory-extract.timer" "$tmp/extract.timer.before"
+check 'rejected schedule does not enable the extract timer' bash -c '! grep -q "enable --now agent-memory-extract.timer" "$1"' _ "$calls"
+check 'rejected schedule still enables the organize timer' has_line "$calls" '--user enable --now agent-memory-organize.timer'
+# Without systemd-analyze on the PATH, the schedule is written as before.
+no_sa="$tmp/no-systemd-analyze"
+mkdir -p "$no_sa"
+IFS=: read -ra path_dirs <<< "$bin:$PATH"
+for d in "${path_dirs[@]}"; do
+    for f in "$d"/*; do
+        n="${f##*/}"
+        [[ -f "$f" && -x "$f" && "$n" != systemd-analyze && ! -e "$no_sa/$n" ]] || continue
+        ln -s "$f" "$no_sa/$n"
+    done
+done
+setup_path="$no_sa" run_setup --no-enable
+check 'without systemd-analyze setup exits 0' test "$status" -eq 0
+check 'without systemd-analyze the schedule is written' has_line "$udir/agent-memory-extract.timer" 'OnCalendar=Saturday 3am'
+check 'without systemd-analyze nothing is said about it' bash -c '! grep -q "not a valid systemd calendar" <<< "$1"' _ "$out"
+
 # A failing daemon-reload after a removal under --no-enable does not abort setup.
 set_consolidate "$both"
 run_setup --no-enable
