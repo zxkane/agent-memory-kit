@@ -1480,10 +1480,15 @@ function globalNote(t, body) {
 const judge = (s, minRetention = 0.25) => evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention });
 const reduced = (r) => r.errors.filter((e) => GLOBAL_REDUCED.test(e)).map((e) => GLOBAL_REDUCED.exec(e).slice(1).join(' '));
 
+// A global note of fewer than 5 former terms may only be added to: its former body, with runs of
+// whitespace collapsed, must still appear word for word in its new body.
+const GLOBAL_TEXT = /^global\/([\w-]+)\.md: notes in the global folder are organized only by a run on the global scope \(an existing global note may be added to but not reduced in a project run: its former text no longer appears in it word for word\)$/;
+const textChanged = (r) => r.errors.filter((e) => GLOBAL_TEXT.test(e)).map((e) => GLOBAL_TEXT.exec(e)[1]);
+
 test('global loss: a 3-term global note rewritten to other words is rejected; with a sentence added it passes', (t) => {
   let s = globalNote(t, 'prefers terse answers');
   s.work('global', 'tone.md', 'likes brief replies\n');
-  for (const minRetention of [0.25, 0]) assert.deepEqual(reduced(judge(s, minRetention)), ['tone 3 3 0'], String(minRetention));
+  for (const minRetention of [0.25, 0]) assert.deepEqual(textChanged(judge(s, minRetention)), ['tone'], String(minRetention));
   s = globalNote(t, 'prefers terse answers');
   s.work('global', 'tone.md', 'prefers terse answers. Also likes examples in code blocks.\n');
   assert.deepEqual(judge(s).errors, []);
@@ -1509,9 +1514,19 @@ test('global loss: a 40-term note may lose two terms, not three', (t) => {
   assert.deepEqual(reduced(judge(s, 0)), ['tone 3 40 2']);
 });
 
-test('global loss: a global note with no former body terms is not judged by this rule', (t) => {
-  const s = globalNote(t, 'ok.');
-  s.work('global', 'tone.md', 'Prefers short answers.\n');
+test('global loss: a note whose words are all short or names is protected word for word', (t) => {
+  // "Use uv, not pip." has no term of four or more letters: a term rule could not protect it.
+  let s = globalNote(t, 'Use uv, not pip.');
+  s.work('global', 'tone.md', 'Use pip, not uv.\n');
+  for (const minRetention of [0.25, 0]) assert.deepEqual(textChanged(judge(s, minRetention)), ['tone'], String(minRetention));
+  s = globalNote(t, 'Use uv, not pip.');
+  s.work('global', 'tone.md', 'Use uv,   not pip.\nPin every version in the lock file.\n');
+  assert.deepEqual(judge(s, 0).errors, []);
+});
+
+test('global loss: repairing the frontmatter of a short global note passes', (t) => {
+  const s = globalNote(t, '---\nname: tone\n---\nUse uv, not pip.');
+  s.work('global', 'tone.md', '---\nname: tone\ndescription: Package tool to use\nmetadata:\n  type: feedback\n---\nUse uv, not pip.\n');
   assert.deepEqual(judge(s, 0).errors, []);
 });
 

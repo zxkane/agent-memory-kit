@@ -22,6 +22,11 @@ const GLOBAL_ONLY = 'notes in the global folder are organized only by a run on t
 // lose: none below 5 terms, one from 5 to 9, two from 10 on. A fixed small allowance, so that a note
 // cannot be shrunk step by step across runs, nor a short note replaced outright.
 const globalLossAllowed = (n) => Math.min(2, Math.floor(0.2 * n));
+// Below this many former terms (short words and names such as "uv" or "SQL" make no terms) an
+// existing global note changed in a project run may only be added to: its former body must still
+// appear word for word in its new body.
+const GLOBAL_WORDS_BELOW = 5;
+const collapseSpace = (str) => str.replace(/\s+/g, ' ').trim();
 const HASH_RE = /^[0-9a-f]{64}$/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -360,9 +365,10 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
   // note split across several notes is judged by all of them, while the words a project's notes
   // share count only in the note's own body or its named target: a run that writes other notes in
   // those words cannot lift a note whose own content was dropped.
-  // In a project run, an existing global note that is changed is judged on its own new body alone
-  // and may lose at most globalLossAllowed(n) of its n former terms, whatever minRetention: global/
-  // may be added to there, never reduced.
+  // In a project run, an existing global note that is changed is judged on its own new body alone,
+  // whatever minRetention: global/ may be added to there, never reduced. A note of fewer than
+  // GLOBAL_WORDS_BELOW former terms must keep its former body word for word (whitespace collapsed,
+  // frontmatter not compared); a longer one may lose at most globalLossAllowed(n) of its n terms.
   const termCache = new WeakMap();
   const termsOf = (buf) => {
     let set = termCache.get(buf);
@@ -408,7 +414,14 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     termsBefore += beforeTerms.size;
     termsKept += kept;
     const lost = beforeTerms.size - kept;
-    if (globalNote && lost > globalLossAllowed(beforeTerms.size)) {
+    if (globalNote && beforeTerms.size < GLOBAL_WORDS_BELOW) {
+      const was = collapseSpace(bodyOf(stripInvisible(text(beforeBuf))));
+      const now = collapseSpace(bodyOf(stripInvisible(text(work[c.label].get(c.file)))));
+      if (!now.includes(was)) {
+        errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: its former text no longer appears in it word for word)`);
+        continue;
+      }
+    } else if (globalNote && lost > globalLossAllowed(beforeTerms.size)) {
       errors.push(`${loc(c.label, c.file)}: ${GLOBAL_ONLY} (an existing global note may be added to but not reduced in a project run: lost ${lost} of its ${beforeTerms.size} distinct terms, at most ${globalLossAllowed(beforeTerms.size)} allowed)`);
       continue;
     }
