@@ -88,7 +88,7 @@ describe('infrastructure source', () => {
     );
     assert.match(
       src,
-      /id:"expire-index-snapshot-versions",status:"Enabled",filter:\{prefix:"index\/"\},noncurrentVersionExpiration:\{noncurrentDays:1\}/,
+      /id:"expire-index-snapshot-versions",status:"Enabled",filter:\{prefix:"index\/"\},noncurrentVersionExpiration:\{noncurrentDays:1,newerNoncurrentVersions:20\}/,
     );
     assert.equal((src.match(/noncurrentVersionExpiration/g) ?? []).length, 2);
   });

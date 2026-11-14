@@ -125,6 +125,27 @@ test('s3Store.get reads AccessDenied/403 as missing, NoSuchBucket as an error, a
   await assert.rejects(() => s3Store('b', put.client).put('k', 'x', null), /AccessDenied/);
 });
 
+test('s3Store.get: only an access denial or an unnamed 403 is missing; other 403s and 500s are errors', async () => {
+  const unnamed = stubClient(() => {
+    throw { $metadata: { httpStatusCode: 403 } };
+  });
+  assert.deepEqual(await s3Store('b', unnamed.client).get('k'), { status: 'missing' });
+  for (const name of ['SignatureDoesNotMatch', 'InvalidAccessKeyId', 'RequestTimeTooSkewed', 'AccountProblem']) {
+    const c = stubClient(() => {
+      throw awsError(name, 403);
+    });
+    await assert.rejects(() => s3Store('b', c.client).get('k'), new RegExp(name), name);
+  }
+  const get500 = stubClient(() => {
+    throw awsError('InternalError', 500);
+  });
+  await assert.rejects(() => s3Store('b', get500.client).get('k'), /InternalError/);
+  const put500 = stubClient(() => {
+    throw awsError('InternalError', 500);
+  });
+  await assert.rejects(() => s3Store('b', put500.client).put('k', 'x', null), /InternalError/);
+});
+
 test('s3Store.get rethrows other errors and rejects bodies over 8 MB', async () => {
   const nb = stubClient(() => {
     throw awsError('NoSuchBucket', 404);

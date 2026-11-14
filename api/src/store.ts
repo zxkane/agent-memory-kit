@@ -47,7 +47,10 @@ export function s3Store(bucket: string, client: S3Client = new S3Client({})): St
         // as data loss. NoSuchBucket is an error, so the name is checked before the status.
         const name = errorName(err);
         if (name === 'NoSuchBucket') throw err;
-        if (name === 'NoSuchKey' || name === 'AccessDenied' || status === 404 || status === 403) {
+        // A 403 counts only when it is an access denial or carries no error name; others, such as
+        // SignatureDoesNotMatch or RequestTimeTooSkewed, are real failures.
+        const unnamed = name === undefined || name === '' || name === 'UnknownError';
+        if (name === 'NoSuchKey' || name === 'AccessDenied' || status === 404 || (status === 403 && unnamed)) {
           return { status: 'missing' };
         }
         if (status === 304 || errorName(err) === 'NotModified') return { status: 'not-modified' };
