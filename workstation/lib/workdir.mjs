@@ -13,7 +13,7 @@ import { INDEX, NOTE_NAME_RE, indexRefs, indexStats, stubTarget } from './notes.
 import { scanText } from './secret-scan.mjs';
 
 const MAX_NOTE_BYTES = 100000;
-const RETENTION_MIN_TERMS = 200;
+const NOTE_MIN_TERMS = 40;
 const GLOBAL = 'global';
 const HASH_RE = /^[0-9a-f]{64}$/;
 
@@ -33,7 +33,8 @@ function loc(label, name) {
 
 // The bytes of a regular file, or null when the path is missing, is a symbolic link or is not a
 // regular file. The open itself refuses a symbolic link, so a swap between check and read is safe.
-function readRegular(path) {
+// With `info`, the file's permission bits are stored in `info.mode`, read from the open descriptor.
+function readRegular(path, info = null) {
   let fd;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -44,6 +45,7 @@ function readRegular(path) {
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) return null;
+    if (info) info.mode = st.mode & 0o777;
     const buf = Buffer.alloc(st.size);
     let off = 0;
     while (off < st.size) {
@@ -138,6 +140,13 @@ export function liveDiffers(pairs, snap, watched = []) {
   const diff = [];
   for (const { label, liveDir } of pairs) {
     const known = snap[label] ?? {};
+    let st = null;
+    try {
+      st = statSync(liveDir);
+    } catch (err) {
+      if (!isMissing(err)) throw err;
+    }
+    if (st && !st.isDirectory()) diff.push(`${label}/`);
     const { files: live, other } = scanDir(liveDir);
     for (const [name, buf] of live) {
       if (known[name] !== sha256(buf)) diff.push(`${label}/${name}`);
@@ -153,53 +162,65 @@ export function liveDiffers(pairs, snap, watched = []) {
   return diff;
 }
 
-// The distinct terms of a note: lower-cased runs of four or more letters, digits or underscores,
+// The distinct terms of a note: NFKC-normalised, lower-cased runs of four or more letters, combining
+// marks, digits or underscores,
 // plus, for Han script, every pair of adjacent characters (a lone character stands for itself).
 export function noteTokens(input) {
   const tokens = new Set();
-  const lower = String(input).toLowerCase();
+  const lower = String(input).normalize('NFKC').toLowerCase();
   for (const m of lower.matchAll(/\p{Script=Han}+/gu)) {
     const chars = Array.from(m[0]);
     if (chars.length === 1) tokens.add(chars[0]);
     for (let i = 0; i + 1 < chars.length; i++) tokens.add(chars[i] + chars[i + 1]);
   }
-  for (const m of lower.replace(/\p{Script=Han}/gu, ' ').matchAll(/[\p{L}\p{N}_]{4,}/gu)) tokens.add(m[0]);
+  for (const m of lower.replace(/\p{Script=Han}/gu, ' ').matchAll(/[\p{L}\p{M}\p{N}_]{4,}/gu)) tokens.add(m[0]);
   return tokens;
 }
 
-function folderTokens(maps) {
-  const all = new Set();
-  for (const files of maps) {
-    for (const [name, buf] of files) {
-      if (name === INDEX || isStub(buf)) continue;
-      for (const t of noteTokens(text(buf))) all.add(t);
-    }
-  }
-  return all;
+// The leading invisible format characters of a note (a byte order mark, a zero-width space).
+const stripInvisible = (str) => str.replace(/^\p{Cf}+/u, '');
+const MALFORMED_RE = /^moved\s+to\s*\[\s*\[/i;
+
+// The part of a note after a leading frontmatter block (the whole note when it has none).
+function bodyOf(content) {
+  const lines = content.split(/\r?\n/);
+  if (lines[0] !== '---') return content;
+  const end = lines.indexOf('---', 1);
+  return end === -1 ? content : lines.slice(end + 1).join('\n');
 }
 
-// Why a changed or new, non-stub file is not acceptable; null when it is.
-function contentProblem(name, buf) {
-  const body = text(buf);
-  const trimmed = body.trim();
-  if (/^moved\s+to\s*\[/i.test(trimmed.normalize('NFKC'))) return 'malformed retirement line';
-  if (name !== INDEX && trimmed === '') return 'a note may not be emptied; retire it instead';
+// Why a changed or new, non-stub file is not acceptable; null when it is. `beforeBuf` is the note's
+// text in the snapshot state, when it had one.
+function contentProblem(name, buf, beforeBuf) {
+  const content = stripInvisible(text(buf));
+  const trimmed = content.trim();
+  const body = bodyOf(content).trim();
+  if (MALFORMED_RE.test(trimmed.normalize('NFKC')) || MALFORMED_RE.test(body.normalize('NFKC')) ||
+      (body !== trimmed && stubTarget(body) !== null)) {
+    return 'malformed retirement line';
+  }
+  if (name !== INDEX) {
+    const hadBody = beforeBuf ? bodyOf(stripInvisible(text(beforeBuf))).trim() !== '' : false;
+    if (trimmed === '' || (body === '' && hadBody)) return 'a note may not be emptied; retire it instead';
+  }
   if (buf.length > MAX_NOTE_BYTES) return `note is larger than ${MAX_NOTE_BYTES} bytes`;
-  if (scanText(body).length > 0) return 'note contains text that looks like a credential';
+  if (scanText(text(buf)).length > 0) return 'note contains text that looks like a credential';
   if (scanText(name).length > 0) return 'file name looks like a credential';
   return null;
 }
 
 // Judges the work folders against the snapshot. "Before" is the live folder, which the snapshot
 // was taken from (`liveChanged` reports when it no longer is); "after" is the live folder with
-// the accepted changes applied. `minRetention` is the share of the distinct terms of all notes
-// that must remain (0 turns the check off).
-export function evaluate({ pairs, snap, allowRetire, minRetention = 0.8 }) {
+// the accepted changes applied. `minRetention` is the share of its distinct terms that each
+// retired or changed note (of 40 or more terms) must keep (0 turns the check off).
+export function evaluate({ pairs, snap, allowRetire, minRetention = 0.3 }) {
   const errors = [];
   const changes = [];
   const ignored = [];
   const stats = {};
   const work = {};
+  const live = {};
+  for (const { label, liveDir } of pairs) live[label] = scanDir(liveDir).files;
   for (const { label, workDir } of pairs) {
     const { files, other } = scanDir(workDir);
     work[label] = files;
@@ -244,19 +265,17 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.8 }) {
         }
         continue;
       }
-      const problem = contentProblem(name, buf);
+      const problem = contentProblem(name, buf, live[label].get(name));
       if (problem) errors.push(`${where}: ${problem}`);
       else changes.push({ label, file: name, kind: isNew ? 'add' : 'change', hash });
     }
   }
 
-  const beforeMaps = [];
-  const afterMaps = [];
-  for (const { label, liveDir } of pairs) {
-    const before = scanDir(liveDir).files;
+  const afterOf = {};
+  for (const { label } of pairs) {
+    const before = live[label];
     const after = new Map(before);
-    beforeMaps.push(before);
-    afterMaps.push(after);
+    afterOf[label] = after;
     let retiredBytes = 0;
     for (const c of changes) {
       if (c.label !== label) continue;
@@ -287,15 +306,40 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.8 }) {
       errors.push(`${label}/${INDEX}: the index may not be emptied while notes remain`);
     }
   }
-  const termsBefore = folderTokens(beforeMaps);
-  const afterTerms = folderTokens(afterMaps);
-  let termsKept = 0;
-  for (const t of termsBefore) if (afterTerms.has(t)) termsKept += 1;
-  const share = termsBefore.size === 0 ? 1 : termsKept / termsBefore.size;
-  stats.retention = { termsBefore: termsBefore.size, termsKept, share };
-  if (minRetention > 0 && termsBefore.size >= RETENTION_MIN_TERMS && share < minRetention) {
-    errors.push(`the run would drop too much of the notes' content (kept ${Math.floor(share * 100)}% of distinct terms, at least ${Math.round(minRetention * 100)}% required)`);
+  // Each retired or changed note is judged on its own: how many of its distinct terms are still
+  // somewhere they belong. A retired note must find them in its target; a changed note, in itself
+  // or in a note the run adds or changes.
+  const written = new Set();
+  for (const c of changes) {
+    if (c.kind !== 'retire' && c.file !== INDEX) for (const t of noteTokens(text(work[c.label].get(c.file)))) written.add(t);
   }
+  let termsBefore = 0;
+  let termsKept = 0;
+  let checked = 0;
+  let lowest = null;
+  for (const c of changes) {
+    if (c.file === INDEX || c.kind === 'add') continue;
+    const beforeBuf = live[c.label].get(c.file);
+    if (!beforeBuf) continue;
+    const beforeTerms = noteTokens(text(beforeBuf));
+    let afterTerms = written;
+    if (c.kind === 'retire') {
+      const targetBuf = afterOf[c.target.label]?.get(c.target.file);
+      afterTerms = targetBuf ? noteTokens(text(targetBuf)) : new Set();
+    }
+    let kept = 0;
+    for (const t of beforeTerms) if (afterTerms.has(t)) kept += 1;
+    termsBefore += beforeTerms.size;
+    termsKept += kept;
+    if (beforeTerms.size < NOTE_MIN_TERMS) continue;
+    const noteShare = kept / beforeTerms.size;
+    checked += 1;
+    if (lowest === null || noteShare < lowest) lowest = noteShare;
+    if (minRetention > 0 && noteShare < minRetention) {
+      errors.push(`${loc(c.label, c.file)}: most of this note's content is missing after the run (kept ${Math.floor(noteShare * 100)}% of its distinct terms, at least ${Math.round(minRetention * 100)}% required)`);
+    }
+  }
+  stats.retention = { termsBefore, termsKept, share: termsBefore === 0 ? 1 : termsKept / termsBefore, checked, lowest };
   const watched = changes.filter((c) => c.kind === 'add').map((c) => `${c.label}/${c.file}`);
   const liveChanged = liveDiffers(pairs, snap, watched);
   return { ok: errors.length === 0 && liveChanged.length === 0, errors, changes, ignored, stats, liveChanged };
@@ -328,9 +372,10 @@ export function apply({ pairs, changes, snap }) {
     if (!pair) fail(label, file, 'unknown folder');
     return pair;
   };
-  const liveHash = (pair, file) => {
-    const buf = readRegular(join(pair.liveDir, file));
-    return buf ? sha256(buf) : null;
+  const liveFile = (pair, file) => {
+    const info = {};
+    const buf = readRegular(join(pair.liveDir, file), info);
+    return buf ? { hash: sha256(buf), mode: info.mode } : null;
   };
   const seen = new Set();
   const writes = [];
@@ -363,8 +408,9 @@ export function apply({ pairs, changes, snap }) {
       if (exists) fail(c.label, c.file, 'a live file appeared since the snapshot');
     } else if (c.kind === 'change' || c.kind === 'retire') {
       if (known === undefined) fail(c.label, c.file, 'file is not in the snapshot');
-      if (liveHash(pair, c.file) !== known) fail(c.label, c.file, 'live file changed since the snapshot');
-      mode = lstatSync(join(pair.liveDir, c.file)).mode & 0o777;
+      const current = liveFile(pair, c.file);
+      if (current?.hash !== known) fail(c.label, c.file, 'live file changed since the snapshot');
+      mode = current.mode;
     } else {
       fail(c.label, c.file, 'unknown change kind');
     }

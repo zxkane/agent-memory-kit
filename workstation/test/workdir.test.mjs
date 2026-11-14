@@ -661,7 +661,6 @@ test('snapshot refuses a work folder that already holds files', (t) => {
 // ---- round 2 ----
 
 const terms = (prefix, from, to) => Array.from({ length: to - from }, (_, i) => `${prefix}${String(from + i).padStart(4, '0')}`).join(' ');
-const RETENTION_ERROR = /^the run would drop too much of the notes' content \(kept \d+% of distinct terms, at least 80% required\)$/;
 
 test('noteTokens: English, identifiers, short words, Han, mixed', () => {
   assert.deepEqual([...noteTokens('The Quick brown fox, jumps!')].sort(), ['brown', 'jumps', 'quick']);
@@ -671,87 +670,6 @@ test('noteTokens: English, identifiers, short words, Han, mixed', () => {
   assert.deepEqual([...noteTokens('的')], ['的']);
   assert.deepEqual([...noteTokens('deploy知识库 now')].sort(), ['deploy', '知识', '识库'].sort());
   assert.deepEqual([...noteTokens('Straße ÅNGSTRÖM')].sort(), ['straße', 'ångström']);
-});
-
-test('rule 7: exact duplicates retired keep every term', (t) => {
-  const body = terms('dupl', 0, 1200).slice(0, 10000);
-  const s = setup(t, {
-    notes: { 'MEMORY.md': '- [A](a1.md) — a\n- [B](a2.md) — b\n- [C](a3.md) — c\n', 'a1.md': body, 'a2.md': body, 'a3.md': body },
-  });
-  s.work('notes', 'a2.md', 'MOVED TO [[a1]]\n');
-  s.work('notes', 'a3.md', 'MOVED TO [[a1]]\n');
-  s.work('notes', 'MEMORY.md', '- [A](a1.md) — a\n');
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.deepEqual(r.errors, []);
-  assert.equal(r.stats.retention.share, 1);
-  assert.ok(r.stats.retention.termsBefore >= 200);
-  assert.equal(r.stats.retention.termsKept, r.stats.retention.termsBefore);
-  assert.equal(r.stats.notes.retiredBytes, 20000);
-});
-
-test('rule 7: moving most of a folder into a new global note passes', (t) => {
-  const notes = { 'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n- [C](c.md) — c\n' };
-  for (const [name, from] of [['a.md', 0], ['b.md', 1200], ['c.md', 2400]]) notes[name] = terms('proj', from, from + 1200).slice(0, 10000);
-  const s = setup(t, { notes, global: { 'MEMORY.md': '- [G](g.md) — g\n', 'g.md': 'global note\n' } });
-  s.work('global', 'moved.md', `${s.readLive('notes', 'b.md')}\n${s.readLive('notes', 'c.md')}`);
-  s.work('global', 'MEMORY.md', '- [G](g.md) — g\n- [M](moved.md) — m\n');
-  s.work('notes', 'b.md', 'MOVED TO [[global:moved]]\n');
-  s.work('notes', 'c.md', 'MOVED TO [[global:moved]]\n');
-  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.deepEqual(r.errors, []);
-  assert.equal(r.stats.retention.share, 1);
-  assert.equal(r.stats.notes.retiredBytes, 20000);
-});
-
-function tenNotes(t) {
-  const notes = { 'MEMORY.md': Array.from({ length: 10 }, (_, i) => `- [N${i}](n${i}.md) — n${i}\n`).join('') };
-  for (let i = 0; i < 10; i++) notes[`n${i}.md`] = `${terms(`note${i}x`, 0, 30)}\n`;
-  return setup(t, { notes });
-}
-
-function summarise(s) {
-  for (let i = 1; i < 10; i++) s.work('notes', `n${i}.md`, 'MOVED TO [[n0]]\n');
-  s.work('notes', 'n0.md', `${terms('note0x', 0, 10)}\n`);
-  s.work('notes', 'MEMORY.md', '- [N0](n0.md) — n0\n');
-}
-
-test('rule 7: ten distinct notes rewritten into a short summary are rejected', (t) => {
-  const s = tenNotes(t);
-  summarise(s);
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.equal(r.ok, false);
-  assert.equal(r.errors.length, 1);
-  assert.match(r.errors[0], RETENTION_ERROR);
-  assert.deepEqual(r.stats.retention, { termsBefore: 300, termsKept: 10, share: 10 / 300 });
-  assert.match(r.errors[0], /kept 3% /);
-});
-
-test('rule 7: minRetention 0 turns the rule off', (t) => {
-  const s = tenNotes(t);
-  summarise(s);
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention: 0 });
-  assert.deepEqual(r.errors, []);
-  assert.equal(r.stats.retention.termsKept, 10);
-});
-
-test('rule 7: a small folder (under 200 terms) may be rewritten heavily', (t) => {
-  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('smal', 0, 150)}\n` } });
-  s.work('notes', 'a.md', 'only this remains\n');
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.deepEqual(r.errors, []);
-  assert.equal(r.stats.retention.termsBefore, 150);
-});
-
-test('rule 7: padding with an unrelated filler note does not hide a gutted note', (t) => {
-  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('real', 0, 300)}\n` } });
-  s.work('notes', 'a.md', 'short\n');
-  s.work('notes', 'filler.md', `${terms('fill', 0, 500)}\n`);
-  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n- [F](filler.md) — f\n');
-  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.equal(r.ok, false);
-  assert.match(r.errors[0], RETENTION_ERROR);
-  assert.equal(r.stats.retention.termsKept, 0);
 });
 
 test('rule 7: stubs count on neither side', (t) => {
@@ -848,4 +766,176 @@ test('N2: apply refuses a retire change whose target is not the one the stub nam
   const honest = [change(s, 'notes', 'b.md', 'retire', { target: { label: 'notes', file: 'a.md' } })];
   apply({ pairs: s.pairs, changes: honest, snap: s.snap });
   assert.equal(existsSync(s.live('notes', 'b.md')), false);
+});
+
+// ---- round 3 ----
+
+const MISSING = /^notes\/(n\d)\.md: most of this note's content is missing after the run \(kept (\d+)% of its distinct terms, at least 30% required\)$/;
+
+// Ten notes of 60 distinct terms each, every one with terms of its own.
+function tenNotes(t) {
+  const notes = { 'MEMORY.md': Array.from({ length: 10 }, (_, i) => `- [N${i}](n${i}.md) — n${i}\n`).join('') };
+  for (let i = 0; i < 10; i++) notes[`n${i}.md`] = `${terms(`note${i}x`, 0, 60)}\n`;
+  return setup(t, { notes });
+}
+
+const indexWithout = (...gone) => Array.from({ length: 10 }, (_, i) => i).filter((i) => !gone.includes(i))
+  .map((i) => `- [N${i}](n${i}.md) — n${i}\n`).join('');
+
+test('noteTokens: NFKC and a separate combining accent give one term', () => {
+  assert.deepEqual([...noteTokens('naïve café')].sort(), ['café', 'naïve']);
+  assert.deepEqual(noteTokens('naïve'), noteTokens('naïve'));
+});
+
+test('rule 7: a note retired into an unrelated note is reported by name', (t) => {
+  const s = tenNotes(t);
+  s.work('notes', 'n3.md', 'MOVED TO [[n7]]\n');
+  s.work('notes', 'MEMORY.md', indexWithout(3));
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], MISSING);
+  assert.equal(r.errors[0].startsWith('notes/n3.md: '), true);
+  assert.deepEqual(r.stats.retention, { termsBefore: 60, termsKept: 0, share: 0, checked: 1, lowest: 0 });
+});
+
+test('rule 7: the same retirement into a target that holds its content passes (share 1)', (t) => {
+  const s = tenNotes(t);
+  s.work('notes', 'n3.md', 'MOVED TO [[n7]]\n');
+  s.work('notes', 'n7.md', `${terms('note7x', 0, 60)} ${terms('note3x', 0, 60)}\n`);
+  s.work('notes', 'MEMORY.md', indexWithout(3));
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.stats.retention, { termsBefore: 120, termsKept: 120, share: 1, checked: 2, lowest: 1 });
+});
+
+const DEPLOY = 'The staging deployment runs on cluster kestrel_stage in region eu-west-1. Release trains leave every Tuesday '
+  + 'through pipeline build_and_ship. Rollbacks use the script rollback_release.sh with the flag --previous. '
+  + 'The artifact bucket is acme_artifacts_stage and the retention window is 365 days. Pager rotation lives in '
+  + 'schedule oncall_platform and escalates to the lead engineer Marguerite Okafor. Always announce releases beforehand, watch dashboards afterwards, '
+  + 'and write a short summary for colleagues.\n';
+const BILLING = 'Invoices are produced by the job invoice_batch_nightly against database ledger_primary on port 5433. '
+  + 'Customers in tier enterprise_plus receive net60 terms, everybody else net30. Refund approvals above 2500 euros '
+  + 'need a second reviewer from the group finance_ops, tracked in queue refunds_pending by Tobias Lindqvist. Month closing happens quietly, so remember reconciling '
+  + 'statements before reports leave the building.\n';
+const SEARCH = 'The search service reads index catalog_v7 from cluster opensearch_eu using the alias catalog_live. '
+  + 'Reindexing runs through the task reindex_catalog with batch size 2000 and finishes in roughly forty minutes. '
+  + 'Synonym lists are stored in repository synonyms_repo, maintained by Priya Raghunathan. Relevance complaints usually come from stale synonyms, therefore check those '
+  + 'before touching ranking weights.\n';
+const MERGED = 'Operations facts. Deploys: cluster kestrel_stage, eu-west-1, pipeline build_and_ship, tuesday trains, '
+  + 'script rollback_release.sh (--previous), bucket acme_artifacts_stage kept 365 days, schedule oncall_platform, '
+  + 'contact Marguerite Okafor. Billing: job invoice_batch_nightly, database ledger_primary port 5433, tier '
+  + 'enterprise_plus gets net60 else net30, refunds over 2500 go to finance_ops via refunds_pending, owner Tobias '
+  + 'Lindqvist. Search: index catalog_v7 on opensearch_eu, alias catalog_live, task reindex_catalog (batch 2000), '
+  + 'synonyms in synonyms_repo, owner Priya Raghunathan.\n';
+
+test('rule 7: three notes merged into a topic note that keeps their facts, reworded, pass at the default', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [D](deploy.md) — d\n- [B](billing.md) — b\n- [S](search.md) — s\n', 'deploy.md': DEPLOY, 'billing.md': BILLING, 'search.md': SEARCH } });
+  s.work('notes', 'ops.md', MERGED);
+  for (const n of ['deploy', 'billing', 'search']) s.work('notes', `${n}.md`, 'MOVED TO [[ops]]\n');
+  s.work('notes', 'MEMORY.md', '- [O](ops.md) — o\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.checked, 3);
+  assert.ok(r.stats.retention.lowest >= 0.3 && r.stats.retention.lowest < 1, String(r.stats.retention.lowest));
+});
+
+test('rule 7: ten notes retired into one short summary give an error for each note', (t) => {
+  const s = tenNotes(t);
+  for (let i = 1; i < 10; i++) s.work('notes', `n${i}.md`, 'MOVED TO [[n0]]\n');
+  s.work('notes', 'n0.md', `${terms('note0x', 0, 10)}\n`);
+  s.work('notes', 'MEMORY.md', indexWithout(1, 2, 3, 4, 5, 6, 7, 8, 9));
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.errors.length, 10);
+  for (const e of r.errors) assert.match(e, MISSING);
+  assert.deepEqual(r.errors.map((e) => MISSING.exec(e)[1]).sort(), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9']);
+  assert.equal(r.stats.retention.checked, 10);
+  assert.equal(r.stats.retention.lowest, 0);
+  assert.equal(r.stats.retention.termsKept, 10);
+  assert.equal(r.stats.retention.termsBefore, 600);
+  const off = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention: 0 });
+  assert.deepEqual(off.errors, []);
+  assert.equal(off.ok, true);
+});
+
+test('rule 7: a note tightened by dropping every third word passes (share 40/60)', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('tigh', 0, 60)}\n` } });
+  s.work('notes', 'a.md', `${terms('tigh', 0, 60).split(' ').filter((_, i) => i % 3 !== 2).join(' ')}\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.stats.retention, { termsBefore: 60, termsKept: 40, share: 40 / 60, checked: 1, lowest: 40 / 60 });
+});
+
+test('rule 7: half of a note moved into a new note written in the same run passes (share 1)', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('half', 0, 60)}\n` } });
+  s.work('notes', 'a.md', `${terms('half', 0, 30)}\n`);
+  s.work('notes', 'b.md', `${terms('half', 30, 60)}\n`);
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n- [B](b.md) — b\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.share, 1);
+});
+
+test('rule 7: a short note (under 40 terms) gutted is not judged', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('shrt', 0, 20)}\n` } });
+  s.work('notes', 'a.md', 'something else entirely\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.stats.retention, { termsBefore: 20, termsKept: 0, share: 0, checked: 0, lowest: null });
+});
+
+test('rule 7: padding with an unrelated filler note does not hide a gutted note', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('real', 0, 60)}\n` } });
+  s.work('notes', 'a.md', 'short\n');
+  s.work('notes', 'filler.md', `${terms('fill', 0, 500)}\n`);
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n- [F](filler.md) — f\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], /^notes\/a\.md: most of this note's content is missing after the run \(kept 0% /);
+});
+
+test('rule 7: no change leaves stats.retention neutral', (t) => {
+  const s = setup(t, { notes: BASE_NOTES });
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.stats.retention, { termsBefore: 0, termsKept: 0, share: 1, checked: 0, lowest: null });
+});
+
+test('rule 6: a stub behind frontmatter, behind a zero-width space, or a note cut to its frontmatter is an error', (t) => {
+  const withFront = '---\nname: a\ndescription: x\n---\nnote a\n';
+  const cases = [
+    ['---\nname: b\n---\nMOVED TO [[a]]\n', 'b.md', 'malformed retirement line'],
+    ['​MOVED TO [[a]]\n', 'b.md', 'malformed retirement line'],
+    ['﻿​---\nname: b\n---\nMoved to [[a]]\n', 'b.md', 'malformed retirement line'],
+    ['---\nname: a\ndescription: x\n---\n', 'a.md', 'a note may not be emptied; retire it instead'],
+  ];
+  for (const [content, file, problem] of cases) {
+    const s = setup(t, { notes: { ...BASE_NOTES, 'a.md': withFront } });
+    s.work('notes', file, content);
+    const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+    assert.deepEqual(r.errors, [`notes/${file}: ${problem}`], JSON.stringify(content));
+  }
+});
+
+test('rule 6: prose that begins "Moved to [staging](url)" is accepted', (t) => {
+  const s = setup(t, { notes: BASE_NOTES });
+  s.work('notes', 'a.md', 'Moved to [staging](https://example.com) last week.\n');
+  assert.deepEqual(evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true }).errors, []);
+});
+
+test('rule 6: a note that already had only frontmatter may be changed to other frontmatter', (t) => {
+  const s = setup(t, { notes: { ...BASE_NOTES, 'a.md': '---\nname: a\n---\n' } });
+  s.work('notes', 'a.md', '---\nname: a\ndescription: y\n---\n');
+  assert.deepEqual(evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true }).errors, []);
+});
+
+test('live folder missing at snapshot time but now a plain file is reported by liveDiffers', (t) => {
+  const s = setup(t, { notes: {} });
+  rmSyncSync(s.pairs[0].liveDir, { recursive: true });
+  writeFileSync(s.pairs[0].liveDir, 'in the way');
+  assert.deepEqual(liveDiffers(s.pairs, s.snap), ['notes/']);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.liveChanged, ['notes/']);
 });
