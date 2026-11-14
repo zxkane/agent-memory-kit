@@ -146,7 +146,8 @@ export async function ssmGetParameter({ name, region, credentials, fetchImpl = f
 
 const SESSION_NAME_RE = /^[\w+=,.@-]{2,64}$/;
 const KEY_ID_RE = /^[A-Za-z0-9]{1,128}$/;
-const SECRET_RE = /^[A-Za-z0-9+/=_.-]{1,2048}$/;
+// AWS publishes no maximum size for a session token, so the cap is generous.
+const SECRET_RE = /^[A-Za-z0-9+/=_.-]{1,16384}$/;
 const EXPIRATION_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
 
 // The text of the first <name> element of an XML answer, or null.

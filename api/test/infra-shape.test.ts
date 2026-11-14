@@ -135,6 +135,28 @@ describe('infrastructure source', () => {
     assert.doesNotMatch(src, /managedPolicyArns|aws\.iam\.RolePolicyAttachment/);
   });
 
+  it('lists the canary parameters exactly as the canary reads them, and not the hub client', () => {
+    const infra = read('infra/workstation.ts').match(/canaryParameterArns\s*=\s*\[([^\]]*)\]/);
+    assert.ok(infra, 'parameter list in workstation.ts');
+    const canary = new URL('../workstation/canary.mjs', root);
+    const canaryList = readFileSync(canary, 'utf8').match(/const PARAMETERS\s*=\s*\[([^\]]*)\]/);
+    assert.ok(canaryList, 'PARAMETERS in canary.mjs');
+    const keys = (list: string): string[] => [...list.matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1] as string);
+    const fromInfra = keys(infra[1] as string);
+    const fromCanary = keys(canaryList[1] as string);
+    assert.equal(fromInfra.length, 4);
+    assert.deepEqual([...fromInfra].sort(), [...fromCanary].sort());
+    for (const key of [...fromInfra, ...fromCanary]) assert.ok(!key.includes('hub'), key);
+  });
+
+  it('uses the same role ARN pattern in the policies and in the workstation jobs', () => {
+    const pattern = /ROLE_ARN_RE\s*=\s*(\/.*\/)\s*;/;
+    const inPolicies = read('infra/policies.ts').match(pattern);
+    const inJobs = readFileSync(new URL('../workstation/lib/aws-names.mjs', root), 'utf8').match(pattern);
+    assert.ok(inPolicies && inJobs, 'both patterns found');
+    assert.equal(inPolicies[1], inJobs[1]);
+  });
+
   it('keeps the workstation role variable out of the storage program and loads workstation.ts', () => {
     assert.doesNotMatch(read('infra/storage.ts'), /WORKSTATION_ROLE_ARNS/);
     assert.match(read('sst.config.ts'), /import\("\.\/infra\/workstation\.ts"\)/);

@@ -395,3 +395,16 @@ test('assumeRole takes the values from the first Credentials element only', asyn
     { message: 'sts failed: 200 BadAnswer' },
   );
 });
+
+test('assumeRole: a session token of 5000 characters is accepted, one of 16385 is BadAnswer', async () => {
+  const answer = (token) => stsXml(`<AccessKeyId>ROLEKEYID</AccessKeyId><SecretAccessKey>role-signing-value</SecretAccessKey><SessionToken>${token}</SessionToken><Expiration>2026-01-02T03:19:05Z</Expiration>`);
+  const longToken = 'a'.repeat(5000);
+  const ok = await assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(answer(longToken), { status: 200 }) });
+  assert.equal(ok.sessionToken, longToken);
+  const edge = await assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(answer('a'.repeat(16384)), { status: 200 }) });
+  assert.equal(edge.sessionToken.length, 16384);
+  await assert.rejects(
+    assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(answer('a'.repeat(16385)), { status: 200 }) }),
+    { message: 'sts failed: 200 BadAnswer' },
+  );
+});

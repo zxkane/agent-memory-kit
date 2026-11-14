@@ -487,11 +487,22 @@ test('roleArn: a failed exchange fails every step that needs S3 and no S3 client
   assert.equal(pull.calls.credentials, 0);
 });
 
+test('roleArn: with down false, a failed exchange fails up, the pull still runs without S3, and no S3 client is built', async () => {
+  const { calls, deps } = roleFakes({ assumeRole: async () => { throw new AwsError('sts', 403, 'AccessDenied'); } });
+  const r = await run(cfg(bridgeBlock({ down: false, agentsRepoDir: '/agents', roleArn: ROLE })), deps);
+  assert.deepEqual(r.up, { ok: false, status: null, error: 'sts failed: 403 AccessDenied', at: AT });
+  assert.equal(calls.down.length, 1);
+  assert.equal(calls.down[0].s3, null);
+  assert.equal(calls.createS3.length, 0);
+});
+
 test('roleArn: an error of the exchange that is not an AwsError never reaches the record', async () => {
   const { calls, deps } = roleFakes({ assumeRole: async () => { throw new Error('SECRET-IN-ERROR'); } });
   const r = await run(cfg(bridgeBlock({ down: true, agentsRepoDir: '/agents', roleArn: ROLE })), deps);
   assert.equal(r.up.ok, false);
   assert.equal(r.down.ok, false);
+  assert.equal(r.up.error, 'credentials failed: 0 Unavailable');
+  assert.equal(r.down.error, 'credentials failed: 0 Unavailable');
   assert.ok(!JSON.stringify(r).includes('SECRET'));
   assert.equal(calls.createS3.length, 0);
 });
