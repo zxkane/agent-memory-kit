@@ -283,12 +283,13 @@ test('tool context: non-ASCII lines cost five times as much', (t) => {
 });
 
 test('tool context: custom budget', (t) => {
-  const { tool, writeProject, writeGlobal } = toolFixture(t);
+  const { repo, tool, writeProject, writeGlobal } = toolFixture(t);
   writeProject(bulk(400, 'x'.repeat(58)));
   writeGlobal(bulk(400, 'x'.repeat(58)));
   const out = buildToolContext({ ...tool, budget: 1100 });
   assert.ok(textCost(out) <= 1100);
-  assert.match(out, /\[truncated/);
+  assert.ok(out.includes(`[truncated; full index: ${repo}/projects/p/MEMORY.md]\n`));
+  assert.ok(out.includes(`[truncated; full index: ${repo}/global/MEMORY.md]\n`));
 });
 
 test('tool context: fixed text over budget', (t) => {
@@ -299,6 +300,27 @@ test('tool context: fixed text over budget', (t) => {
   const out = buildToolContext({ ...tool, budget: 50 });
   assert.ok(textCost(out) <= 50);
   assert.equal(out.length, 50);
-  assert.ok(full.startsWith(out));
-  assert.ok(out.startsWith(`Shared memory is on. Notes under ${repo}`.slice(0, 50)));
+  assert.ok(out.endsWith('\n'));
+  assert.ok(full.startsWith(out.slice(0, -1)));
+  assert.ok(out.startsWith(`Shared memory is on. Notes under ${repo}`.slice(0, 49)));
+});
+
+test('tool context: the whole output fits any budget and ends in a newline', (t) => {
+  const { base, cfg, tmp, writeGlobal } = toolFixture(t);
+  writeGlobal(bulk(50, '记忆😀 note'));
+  const odd = { ...base, config: { ...cfg, repoDir: join(tmp, '😀记忆😀', 'clone') } };
+  const cases = [
+    { ...odd, project: 'p' },
+    { ...odd, project: null, reason: 'mismatch', expected: '😀'.repeat(20) },
+    { ...odd, repoOk: false },
+  ];
+  for (const args of cases) {
+    for (let budget = 1; budget <= 300; budget++) {
+      const out = buildToolContext({ ...args, budget });
+      assert.ok(textCost(out) <= budget, `budget ${budget}: cost ${textCost(out)}`);
+      assert.ok(out.isWellFormed(), `budget ${budget}: lone surrogate`);
+      assert.ok(out.endsWith('\n'), `budget ${budget}: no final newline`);
+    }
+  }
+  assert.equal(buildToolContext({ ...odd, project: 'p', budget: 0 }), '');
 });

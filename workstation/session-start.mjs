@@ -76,13 +76,14 @@ function toolContext(config, input) {
       expected = bound.expected ?? null;
     }
   }
-  const text = buildToolContext({ config, status: readStatus(config), project, repoOk, reason, expected });
-  return text.endsWith('\n') ? text : `${text}\n`;
+  return buildToolContext({ config, status: readStatus(config), project, repoOk, reason, expected });
 }
 
-// Parsed stdin JSON, or undefined when stdin is missing, empty or not JSON.
+// Parsed stdin JSON, or undefined when stdin is a terminal (never waited for), missing,
+// empty or not JSON.
 function readInput() {
   try {
+    if (process.stdin.isTTY) return undefined;
     return JSON.parse(readFileSync(0, 'utf8'));
   } catch {
     return undefined;

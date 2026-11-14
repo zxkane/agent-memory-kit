@@ -97,12 +97,32 @@ export function buildSessionContext({
 // Budget for Codex and Kiro hook output, measured by textCost.
 export const TOOL_BUDGET = 7200;
 
-// Rough token cost: 1 per ASCII code unit (three per token), 5 per other code unit.
+// Rough token cost of one UTF-16 code unit: 1 for ASCII (three per token), 5 for any other.
+const unitCost = (code) => (code <= 0x7f ? 1 : 5);
+
 export function textCost(text) {
   let cost = 0;
-  for (let i = 0; i < text.length; i++) cost += text.charCodeAt(i) <= 0x7f ? 1 : 5;
+  for (let i = 0; i < text.length; i++) cost += unitCost(text.charCodeAt(i));
   return cost;
 }
+
+// The longest prefix of `text` that, with a final newline, costs at most `budget`. It never
+// ends between the two halves of a surrogate pair.
+function cutToBudget(text, budget) {
+  if (budget < 1) return '';
+  let cost = 0;
+  let end = 0;
+  while (end < text.length && cost + unitCost(text.charCodeAt(end)) <= budget - 1) {
+    cost += unitCost(text.charCodeAt(end));
+    end++;
+  }
+  const last = text.charCodeAt(end - 1);
+  if (end > 0 && last >= 0xd800 && last <= 0xdbff) end--;
+  const cut = text.slice(0, end);
+  return cut.endsWith('\n') ? cut : `${cut}\n`;
+}
+
+const withinBudget = (text, budget) => (textCost(text) <= budget ? text : cutToBudget(text, budget));
 
 function readLines(path) {
   try {
@@ -137,13 +157,14 @@ function fitIndex(lines, path, allowance) {
   return [...kept, footer];
 }
 
-// The text a Codex or Kiro session sees at start. Its textCost never exceeds `budget`.
+// The text a Codex or Kiro session sees at start, ending in a newline. Its textCost never
+// exceeds `budget`.
 // `project`: the bound project name, or null; `reason` says why it is null.
 export function buildToolContext({
   config, status, project, repoOk, reason = null, expected = null, now = new Date(), budget = TOOL_BUDGET,
 }) {
   const { repoDir } = config;
-  if (!repoOk) return unusableCloneWarning(repoDir);
+  if (!repoOk) return withinBudget(unusableCloneWarning(repoDir), budget);
 
   const globalPath = `${repoDir}/global/MEMORY.md`;
   const projectPath = project === null ? null : `${repoDir}/projects/${project}/MEMORY.md`;
@@ -166,15 +187,7 @@ export function buildToolContext({
   for (const s of sections) fixedParts.push(`${s.title}\n`, ...(s.lines.length === 0 ? ['(empty)\n'] : []));
   const fixed = fixedParts.join('');
   const left = budget - textCost(fixed);
-  if (left < 0) {
-    let cost = 0;
-    let end = 0;
-    while (end < fixed.length && cost + (fixed.charCodeAt(end) <= 0x7f ? 1 : 5) <= budget) {
-      cost += fixed.charCodeAt(end) <= 0x7f ? 1 : 5;
-      end++;
-    }
-    return fixed.slice(0, end);
-  }
+  if (left < 0) return cutToBudget(fixed, budget);
 
   const fullCost = (s) => s.lines.reduce((sum, l) => sum + textCost(l) + 1, 0);
   const share = Math.floor(left / 2);

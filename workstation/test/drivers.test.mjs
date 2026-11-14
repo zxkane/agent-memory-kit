@@ -4,7 +4,10 @@ import { spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadConfig } from '../lib/config.mjs';
+import { TOOL_BUDGET, buildToolContext, textCost } from '../lib/context.mjs';
 import { memoryLinkPath } from '../lib/project.mjs';
+import { readStatus } from '../lib/sync-engine.mjs';
 import { isolatedEnv, isolateGit, makeRemoteAndClones, sh, tempDir } from './helpers.mjs';
 
 isolateGit();
@@ -393,6 +396,79 @@ test('session-start codex on a machine that is not enabled', (t) => {
   const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['codex']);
   assert.equal(r.status, 0);
   assert.equal(r.stdout, '');
+  assert.equal(existsSync(f.state), false);
+  assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+});
+
+test('session-start codex in a repository whose directory name is not a usable project name', (t) => {
+  const f = fixture(t);
+  const odd = join(f.tmp, 'odd name');
+  mkdirSync(odd);
+  sh(odd, 'git', ['init', '-q']);
+  sh(odd, 'git', ['remote', 'add', 'origin', 'https://example.com/owner/odd-name']);
+  const r = run('session-start.mjs', { cwd: odd }, f.env, ['codex']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /\nThis repository's directory name cannot be used as a project name, so it has no project notes\.\n/);
+  assert.doesNotMatch(r.stdout, /Project index \(/);
+  assert.equal(existsSync(join(f.repo, 'projects')), false);
+  assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+});
+
+for (const [label, input] of [['stdin that is not JSON', 'not json'], ['JSON without cwd', '{"session_id": "x"}']]) {
+  test(`session-start codex with ${label} uses the process directory and logs nothing`, (t) => {
+    const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+    const r = spawnSync(process.execPath, [join(PKG, 'session-start.mjs'), 'codex'], { input, env: f.env, cwd: f.worktree, encoding: 'utf8' });
+    assertToolText(r, f);
+    assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+  });
+}
+
+test('session-start codex writes exactly the text buildToolContext returns, within the budget', (t) => {
+  const f = fixture(t);
+  const r = run('session-start.mjs', { cwd: f.tmp }, f.env, ['codex']);
+  const config = loadConfig(f.env);
+  const expected = buildToolContext({ config, status: readStatus(config), project: null, repoOk: true, reason: 'not-a-repository' });
+  assert.equal(r.stdout, expected);
+  assert.ok(expected.endsWith('\n') && !expected.endsWith('\n\n'));
+  assert.ok(textCost(r.stdout) <= TOOL_BUDGET);
+});
+
+// stdin is a terminal: the driver must not wait for input. `script` gives the child a pseudo-terminal.
+const hasScript = spawnSync('script', ['--version'], { encoding: 'utf8' }).status === 0;
+// Its stdin stays open and silent, so a driver that read the terminal would wait until killed.
+function runOnTerminal(f, tool) {
+  const cmd = `"${process.execPath}" "${join(PKG, 'session-start.mjs')}" ${tool}`;
+  return new Promise((resolve) => {
+    const child = spawn('script', ['-qec', cmd, '/dev/null'], { env: f.env, cwd: f.worktree, stdio: ['pipe', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    child.on('close', (status, signal) => {
+      clearTimeout(timer);
+      resolve({ status, signal, stdout });
+    });
+  });
+}
+
+test('session-start codex does not read a terminal', { skip: !hasScript && 'script is not available' }, async (t) => {
+  const f = fixture(t, { origin: 'https://example.com/a/example-repo' });
+  const r = await runOnTerminal(f, 'codex');
+  assert.equal(r.signal, null);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /Shared memory is on\./);
+  assert.match(r.stdout, /Project index \(/);
+  assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
+});
+
+test('session-start claude on a terminal logs the input error and prints nothing', { skip: !hasScript && 'script is not available' }, async (t) => {
+  const f = fixture(t);
+  const r = await runOnTerminal(f, 'claude');
+  assert.equal(r.signal, null);
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout.trim(), '');
+  const lines = errorLines(f.state);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /hook input is not valid JSON/);
 });
 
 test('session-start with an unknown tool', (t) => {
