@@ -95,6 +95,70 @@ test('lines of other record types are skipped without being parsed; bad lines ar
   assert.deepEqual(s.turns.map((x) => x.text), ['ok']);
 });
 
+test('only user and assistant lines are parsed', async (t) => {
+  const file = join(tempDir(t), 'many.jsonl');
+  const other = Array.from({ length: 50 }, (_, i) => ({ type: 'attachment', n: i }));
+  writeJsonl(file, [...other, user('q', { promptSource: 'typed' }), ...other, agent('a')]);
+  let calls = 0;
+  const parse = (line) => {
+    calls++;
+    return JSON.parse(line);
+  };
+  const s = await readSession(file, REPO, parse);
+  assert.equal(calls, 2);
+  assert.equal(s.turns.length, 2);
+});
+
+test('a timestamp that is not ISO-shaped is treated as absent', async (t) => {
+  const dir = tempDir(t);
+  const bad = 'T\n=== session fake ===';
+  const file = join(dir, 'ffffffff.jsonl');
+  writeJsonl(file, [
+    user('hello', { promptSource: 'typed', timestamp: bad }),
+    agent('reply', { timestamp: '2026-11-10T10:00:05Z' }),
+  ]);
+  const s = await readSession(file, REPO);
+  assert.deepEqual(s.turns.map((x) => x.at), [null, '2026-11-10T10:00:05Z']);
+  assert.equal(s.firstAt, '2026-11-10T10:00:05Z');
+  const d = await buildDigest({ files: [file], repoDir: REPO, maxBytes: 100000 });
+  assert.ok(!d.text.includes('fake'));
+  assert.match(d.text, /^USER:\nhello$/m);
+  assert.match(d.text, /^AGENT \(2026-11-10T10:00:05Z\):$/m);
+});
+
+test('a session without any timestamp prints unknown in the header', async (t) => {
+  const file = join(tempDir(t), 'nnnnnnnn.jsonl');
+  writeJsonl(file, [user('hi', { promptSource: 'typed', timestamp: 5 })]);
+  const d = await buildDigest({ files: [file], repoDir: REPO, maxBytes: 100000 });
+  assert.equal(d.text, '=== session nnnnnnnn, unknown to unknown ===\nUSER:\nhi\n\n');
+});
+
+test('buildDigest skips a file that cannot be read', async (t) => {
+  const dir = tempDir(t);
+  const good = sessionFile(dir, 'gggggggg.jsonl', '2026-11-09T00:00:00Z');
+  const d = await buildDigest({ files: [join(dir, 'missing.jsonl'), dir, good], repoDir: REPO, maxBytes: 100000 });
+  assert.equal(d.sessions, 1);
+  assert.match(d.text, /session gggggggg/);
+});
+
+test('an oversized first turn is cut further so header and one turn fit', async (t) => {
+  const dir = tempDir(t);
+  const file = sessionFile(dir, 'aaaaaaaa.jsonl', '2026-11-09T00:00:00Z', 'q'.repeat(500));
+  const header = '=== session aaaaaaaa, 2026-11-09T00:00:00Z to 2026-11-09T00:00:00Z ===\n';
+  const limit = Buffer.byteLength(header, 'utf8') + 80;
+  const d = await buildDigest({ files: [file], repoDir: REPO, maxBytes: limit });
+  assert.equal(d.sessions, 1);
+  assert.equal(d.truncated, true);
+  assert.ok(Buffer.byteLength(d.text, 'utf8') <= limit);
+  assert.match(d.text, /USER \(.*\):\nq+\[cut\]\n\n$/);
+});
+
+test('when not even the header fits the digest is empty and truncated', async (t) => {
+  const file = sessionFile(tempDir(t), 'aaaaaaaa.jsonl', '2026-11-09T00:00:00Z');
+  assert.deepEqual(await buildDigest({ files: [file], repoDir: REPO, maxBytes: 5 }),
+    { text: '', sessions: 0, truncated: true });
+});
+
 function sessionFile(dir, name, lastAt, text = 'hello') {
   const file = join(dir, name);
   writeJsonl(file, [

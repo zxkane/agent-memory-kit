@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline';
 import { scanText } from './secret-scan.mjs';
 
 const REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+const ISO_RE = /^\d{4}-\d\d-\d\dT[\d:.]+Z?$/;
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit']);
 const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
 const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
@@ -55,7 +56,8 @@ function writesMemory(content, repoDir) {
 }
 
 // Streams one transcript file (JSON Lines) and keeps what the person and the agent said.
-export async function readSession(file, repoDir) {
+// `parse` is a seam for tests that count how many lines are parsed.
+export async function readSession(file, repoDir, parse = JSON.parse) {
   const out = { interactive: false, wroteMemory: false, firstAt: null, lastAt: null, turns: [] };
   let typed = false;
   let anyPromptSource = false;
@@ -66,12 +68,12 @@ export async function readSession(file, repoDir) {
     if (!line.includes('"type":"user"') && !line.includes('"type":"assistant"')) continue;
     let rec;
     try {
-      rec = JSON.parse(line);
+      rec = parse(line);
     } catch {
       continue;
     }
     if (rec === null || typeof rec !== 'object' || (rec.type !== 'user' && rec.type !== 'assistant')) continue;
-    const at = typeof rec.timestamp === 'string' ? rec.timestamp : null;
+    const at = typeof rec.timestamp === 'string' && ISO_RE.test(rec.timestamp) ? rec.timestamp : null;
     if (at) {
       if (out.firstAt === null || at < out.firstAt) out.firstAt = at;
       if (out.lastAt === null || at > out.lastAt) out.lastAt = at;
@@ -124,16 +126,36 @@ function cut(text, limit) {
 const bytes = (s) => Buffer.byteLength(s, 'utf8');
 
 function sessionBlocks(file, session, perTurnChars) {
-  const header = `=== session ${basename(file).slice(0, 8)}, ${session.firstAt} to ${session.lastAt} ===\n`;
-  const turns = session.turns.map((turn) =>
-    `${turn.role === 'user' ? 'USER' : 'AGENT'} (${turn.at}):\n${cut(redact(turn.text), perTurnChars)}\n\n`);
+  const name = basename(file).slice(0, 8).replace(/[\u0000-\u001f\u007f]/g, '?');
+  const header = `=== session ${name}, ${session.firstAt ?? 'unknown'} to ${session.lastAt ?? 'unknown'} ===\n`;
+  const turns = session.turns.map((turn) => ({
+    label: `${turn.role === 'user' ? 'USER' : 'AGENT'}${turn.at ? ` (${turn.at})` : ''}:\n`,
+    body: cut(redact(turn.text), perTurnChars),
+  }));
   return { header, turns };
+}
+
+// The longest start of `text` that fits `limit` bytes, never splitting a character.
+function fitBytes(text, limit) {
+  let out = '';
+  let used = 0;
+  for (const ch of text) {
+    used += bytes(ch);
+    if (used > limit) break;
+    out += ch;
+  }
+  return out;
 }
 
 export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 2000 }) {
   const sessions = [];
   for (const file of files) {
-    const session = await readSession(file, repoDir);
+    let session;
+    try {
+      session = await readSession(file, repoDir);
+    } catch {
+      continue; // Missing, unreadable or not a file: the other sessions are still used.
+    }
     if ((session.interactive || session.wroteMemory) && session.turns.length > 0) sessions.push({ file, session });
   }
   sessions.sort((a, b) => (b.session.lastAt ?? '').localeCompare(a.session.lastAt ?? ''));
@@ -143,7 +165,8 @@ export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 200
   let truncated = false;
   for (const { file, session } of sessions) {
     const { header, turns } = sessionBlocks(file, session, perTurnChars);
-    const whole = header + turns.join('');
+    const blocks = turns.map((t) => `${t.label}${t.body}\n\n`);
+    const whole = header + blocks.join('');
     if (used + bytes(whole) <= maxBytes) {
       text += whole;
       used += bytes(whole);
@@ -152,11 +175,17 @@ export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 200
     }
     truncated = true;
     if (count === 0) {
-      // The first session alone is too large: keep the turns that fit whole.
+      // The first session alone is too large. Keep the turns that fit whole. When not even the
+      // first turn fits, cut that turn further so the header and one turn fit. Only when the
+      // header line alone does not fit is the digest empty (truncated, with no sessions).
       let part = header;
-      for (const turn of turns) {
-        if (bytes(part) + bytes(turn) > maxBytes) break;
-        part += turn;
+      for (const block of blocks) {
+        if (bytes(part) + bytes(block) > maxBytes) break;
+        part += block;
+      }
+      if (part === header) {
+        const room = maxBytes - bytes(header) - bytes(turns[0].label) - bytes('[cut]\n\n');
+        if (room > 0) part = `${header}${turns[0].label}${fitBytes(turns[0].body, room)}[cut]\n\n`;
       }
       if (part !== header) {
         text = part;

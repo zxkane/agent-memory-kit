@@ -3,6 +3,7 @@ import { isAbsolute, join } from 'node:path';
 
 const HOST_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 
+const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 const CALENDAR_RE = /^[A-Za-z0-9 *:,./~-]{1,80}$/;
 
@@ -20,12 +21,12 @@ function calendar(value) {
 function parseConsolidate(block) {
   if (block === undefined || block === null || typeof block !== 'object' || Array.isArray(block)) return null;
   const { command, model } = block;
-  if (typeof command !== 'string' || !isAbsolute(command)) return null;
+  if (typeof command !== 'string' || !isAbsolute(command) || CONTROL_RE.test(command)) return null;
   if (typeof model !== 'string' || !/^\S+$/.test(model)) return null;
   const env = block.env ?? {};
   if (env === null || typeof env !== 'object' || Array.isArray(env)) return null;
   for (const [k, v] of Object.entries(env)) {
-    if (!ENV_NAME_RE.test(k) || typeof v !== 'string') return null;
+    if (!ENV_NAME_RE.test(k) || typeof v !== 'string' || CONTROL_RE.test(v)) return null;
   }
   const extract = calendar(block.extract);
   const organize = calendar(block.organize);

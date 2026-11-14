@@ -99,6 +99,11 @@ test('an invalid consolidate block gives null without disabling the config', (t)
   for (const bad of [
     { ...ok, command: 'rel/m' },
     { ...ok, command: undefined },
+    { ...ok, command: '/bin/m\nx' },
+    { ...ok, command: '/bin/m\u0000x' },
+    { ...ok, command: '/bin/m\u007fx' },
+    { ...ok, env: { FOO: 'a\nb' } },
+    { ...ok, env: { FOO: 'a\u0000b' } },
     { ...ok, model: '' },
     { ...ok, model: 'a b' },
     { ...ok, env: { lower: 'x' } },
