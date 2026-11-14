@@ -1,11 +1,6 @@
 /// <reference path="../.sst/platform/config.d.ts" />
 import { bucketPolicy } from "./policies.ts";
 
-const workstationRoleArns = (process.env.AGENT_MEMORY_WORKSTATION_ROLE_ARNS ?? "")
-  .split(",")
-  .map((arn) => arn.trim())
-  .filter((arn) => arn.length > 0);
-
 // Non-prod stages are torn down with their contents; prod is never force-emptied.
 export const bucket = new aws.s3.Bucket("MemoryBucket", {
   forceDestroy: $app.stage !== "prod",
@@ -60,7 +55,7 @@ new aws.s3.BucketPolicy(
   "MemoryBucketPolicy",
   {
     bucket: bucket.bucket,
-    policy: bucket.arn.apply((arn) => JSON.stringify(bucketPolicy(arn, workstationRoleArns))),
+    policy: bucket.arn.apply((arn) => JSON.stringify(bucketPolicy(arn))),
   },
   { dependsOn: [publicAccess] },
 );

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AwsError, imdsCredentials, signRequest, ssmGetParameter } from '../lib/aws.mjs';
+import { AwsError, assumeRole, imdsCredentials, signRequest, ssmGetParameter } from '../lib/aws.mjs';
 
 const creds = { accessKeyId: 'EXAMPLEKEYID', secretAccessKey: 'example-signing-value' };
 const credsToken = { ...creds, sessionToken: 'example-session-value' };
@@ -247,4 +247,164 @@ test('ssmGetParameter ends within timeoutMs as a TimeLimit', async () => {
     signal.addEventListener('abort', () => reject(signal.reason));
   });
   await assert.rejects(ssmGetParameter({ ...SSM_OPTS, fetchImpl, timeoutMs: 30 }), { message: 'ssm failed: 0 TimeLimit' });
+});
+
+// ---- assumeRole ----
+
+const ROLE = 'arn:aws:iam::123456789012:role/example-bridge';
+const STS_OPTS = {
+  roleArn: ROLE, sessionName: 'agent-memory-bridge', region: 'ap-northeast-1', credentials: credsToken, now: () => T2,
+};
+const STS_BODY = 'Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fexample-bridge'
+  + '&RoleSessionName=agent-memory-bridge&DurationSeconds=900';
+const STS_AUTH = 'AWS4-HMAC-SHA256 Credential=EXAMPLEKEYID/20260102/ap-northeast-1/sts/aws4_request, '
+  + 'SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, '
+  + 'Signature=e35de9984206358a00de67476fd83f30e4de00fa42b1ea2d78acd378087dac0f';
+const stsXml = (credentials = '<AccessKeyId>ROLEKEYID</AccessKeyId><SecretAccessKey>role-signing-value</SecretAccessKey><SessionToken>role-session-value</SessionToken><Expiration>2026-01-02T03:19:05Z</Expiration>') => `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials>${credentials}</Credentials></AssumeRoleResult></AssumeRoleResponse>`;
+const stsErrorXml = (code, message) => `<ErrorResponse><Error><Type>Sender</Type><Code>${code}</Code><Message>${message}</Message></Error></ErrorResponse>`;
+
+test('assumeRole sends the signed request of the signature vector and returns the credentials', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(stsXml(), { status: 200 });
+  };
+  const out = await assumeRole({ ...STS_OPTS, fetchImpl });
+  assert.deepEqual(out, {
+    accessKeyId: 'ROLEKEYID', secretAccessKey: 'role-signing-value', sessionToken: 'role-session-value', expiration: '2026-01-02T03:19:05Z',
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://sts.ap-northeast-1.amazonaws.com/');
+  assert.equal(calls[0].init.method, 'POST');
+  assert.equal(calls[0].init.body, STS_BODY);
+  assert.equal(calls[0].init.redirect, 'manual');
+  assert.equal(calls[0].init.headers.authorization, STS_AUTH);
+  assert.equal(calls[0].init.headers['content-type'], 'application/x-www-form-urlencoded; charset=utf-8');
+  assert.equal(calls[0].init.headers.host, undefined);
+});
+
+test('assumeRole: a longer duration is sent', async () => {
+  let body;
+  const fetchImpl = async (url, init) => { body = init.body; return new Response(stsXml(), { status: 200 }); };
+  await assumeRole({ ...STS_OPTS, durationSeconds: 3600, fetchImpl });
+  assert.ok(body.endsWith('&DurationSeconds=3600'));
+});
+
+test('assumeRole rejects each invalid input before any request', async () => {
+  const fetchImpl = async () => assert.fail('no request');
+  const bad = [
+    { roleArn: 'arn:aws:iam::12345:role/x' }, { roleArn: 'arn:aws:iam::123456789012:user/x' }, { roleArn: 'arn:aws:iam::123456789012:role/' },
+    { roleArn: `${ROLE}\n` }, { roleArn: `${ROLE} x` }, { roleArn: 5 }, { roleArn: undefined },
+    { sessionName: 'a' }, { sessionName: 'a'.repeat(65) }, { sessionName: 'a b' }, { sessionName: 'a&b=c' }, { sessionName: undefined },
+    { durationSeconds: 899 }, { durationSeconds: 3601 }, { durationSeconds: 900.5 }, { durationSeconds: '900' }, { durationSeconds: NaN },
+    { region: 'nowhere' }, { region: 'a.b' }, { credentials: undefined }, { credentials: { accessKeyId: 'X' } },
+  ];
+  for (const over of bad) {
+    await assert.rejects(assumeRole({ ...STS_OPTS, ...over, fetchImpl }), { message: 'sts failed: 0 InvalidRequest' }, JSON.stringify(over));
+  }
+});
+
+test('assumeRole accepts paths and the other partitions in a role ARN', async () => {
+  const fetchImpl = async () => new Response(stsXml(), { status: 200 });
+  for (const roleArn of ['arn:aws:iam::123456789012:role/a/b/example-role', 'arn:aws-cn:iam::123456789012:role/x', 'arn:aws-us-gov:iam::123456789012:role/x+=,.@-_y']) {
+    await assumeRole({ ...STS_OPTS, roleArn, fetchImpl });
+  }
+});
+
+test('assumeRole reports the status and the code of an error answer and never its text', async () => {
+  const fetchImpl = async () => new Response(stsErrorXml('AccessDenied', 'User: SECRET-IN-BODY is not authorized'), { status: 403 });
+  await assert.rejects(assumeRole({ ...STS_OPTS, fetchImpl }), (err) => {
+    assert.equal(err.message, 'sts failed: 403 AccessDenied');
+    assert.ok(err instanceof AwsError);
+    assert.ok(!JSON.stringify(err).includes('SECRET'));
+    assert.ok(!String(err.stack).includes('SECRET'));
+    return true;
+  });
+});
+
+test('assumeRole: an error answer without a usable code is Unknown, a hostile code too', async () => {
+  for (const text of ['not xml', '', stsErrorXml('a b SECRET-IN-BODY', 'x'), stsErrorXml('x'.repeat(100), 'x'), '<Code></Code>']) {
+    const fetchImpl = async () => new Response(text, { status: 500 });
+    await assert.rejects(assumeRole({ ...STS_OPTS, fetchImpl }), { message: 'sts failed: 500 Unknown' });
+  }
+});
+
+test('assumeRole never follows a redirect', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(init.redirect);
+    return new Response(null, { status: 307, headers: { location: 'https://evil.example.net/x' } });
+  };
+  await assert.rejects(assumeRole({ ...STS_OPTS, fetchImpl }), (err) => {
+    assert.equal(err.message, 'sts failed: 307 Redirect');
+    assert.ok(!JSON.stringify(err).includes('evil'));
+    return true;
+  });
+  assert.deepEqual(calls, ['manual']);
+});
+
+test('assumeRole turns a network error into status 0 without the fetch message', async () => {
+  const fetchImpl = async () => { throw new Error('connect ECONNREFUSED https://sts.example.com/'); };
+  await assert.rejects(assumeRole({ ...STS_OPTS, fetchImpl }), { message: 'sts failed: 0 Network' });
+});
+
+const hangs = (url, { signal }) => new Promise((resolve, reject) => {
+  if (signal.aborted) reject(signal.reason);
+  signal.addEventListener('abort', () => reject(signal.reason));
+});
+
+test('assumeRole ends within timeoutMs as a TimeLimit', async () => {
+  await assert.rejects(assumeRole({ ...STS_OPTS, fetchImpl: hangs, timeoutMs: 30 }), { message: 'sts failed: 0 TimeLimit' });
+});
+
+test('assumeRole ends when the given signal is aborted', async () => {
+  const controller = new AbortController();
+  const pending = assumeRole({ ...STS_OPTS, fetchImpl: hangs, signal: controller.signal });
+  setTimeout(() => controller.abort(), 20);
+  await assert.rejects(pending, { message: 'sts failed: 0 TimeLimit' });
+  const done = new AbortController();
+  done.abort();
+  await assert.rejects(assumeRole({ ...STS_OPTS, fetchImpl: hangs, signal: done.signal }), { message: 'sts failed: 0 TimeLimit' });
+});
+
+test('assumeRole: a 200 answer without the three values is BadAnswer', async () => {
+  const parts = {
+    id: '<AccessKeyId>ROLEKEYID</AccessKeyId>', secret: '<SecretAccessKey>role-signing-value</SecretAccessKey>',
+    token: '<SessionToken>role-session-value</SessionToken>', expiration: '<Expiration>2026-01-02T03:19:05Z</Expiration>',
+  };
+  const without = (name) => Object.entries(parts).filter(([k]) => k !== name).map(([, v]) => v).join('');
+  const texts = ['', 'not xml', '<AssumeRoleResponse/>', stsXml(''), ...Object.keys(parts).map((k) => stsXml(without(k))),
+    stsXml('<AccessKeyId></AccessKeyId><SecretAccessKey>x</SecretAccessKey><SessionToken>y</SessionToken><Expiration>2026-01-02T03:19:05Z</Expiration>'),
+    stsXml(Object.values(parts).join('').replace('ROLEKEYID', 'bad key id')),
+    stsXml(Object.values(parts).join('').replace('2026-01-02T03:19:05Z', 'tomorrow'))];
+  for (const text of texts) {
+    const fetchImpl = async () => new Response(text, { status: 200 });
+    await assert.rejects(assumeRole({ ...STS_OPTS, fetchImpl }), { message: 'sts failed: 200 BadAnswer' }, text.slice(0, 80));
+  }
+});
+
+test('assumeRole takes the values from the first Credentials element only', async () => {
+  const first = '<AccessKeyId>FIRSTKEYID</AccessKeyId><SecretAccessKey>first-signing-value</SecretAccessKey><SessionToken>first-session-value</SessionToken><Expiration>2026-01-02T03:19:05Z</Expiration>';
+  const second = '<AccessKeyId>SECONDKEYID</AccessKeyId><SecretAccessKey>second-signing-value</SecretAccessKey><SessionToken>second-session-value</SessionToken><Expiration>2026-01-02T03:19:05Z</Expiration>';
+  const two = (a, b) => `<R><Credentials>${a}</Credentials><Credentials>${b}</Credentials></R>`;
+  let out = await assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(two(first, second), { status: 200 }) });
+  assert.equal(out.accessKeyId, 'FIRSTKEYID');
+  // Values missing from the first element are not completed from the second.
+  await assert.rejects(
+    assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(two('<AccessKeyId>FIRSTKEYID</AccessKeyId>', second), { status: 200 }) }),
+    { message: 'sts failed: 200 BadAnswer' },
+  );
+});
+
+test('assumeRole: a session token of 5000 characters is accepted, one of 16385 is BadAnswer', async () => {
+  const answer = (token) => stsXml(`<AccessKeyId>ROLEKEYID</AccessKeyId><SecretAccessKey>role-signing-value</SecretAccessKey><SessionToken>${token}</SessionToken><Expiration>2026-01-02T03:19:05Z</Expiration>`);
+  const longToken = 'a'.repeat(5000);
+  const ok = await assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(answer(longToken), { status: 200 }) });
+  assert.equal(ok.sessionToken, longToken);
+  const edge = await assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(answer('a'.repeat(16384)), { status: 200 }) });
+  assert.equal(edge.sessionToken.length, 16384);
+  await assert.rejects(
+    assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(answer('a'.repeat(16385)), { status: 200 }) }),
+    { message: 'sts failed: 200 BadAnswer' },
+  );
 });

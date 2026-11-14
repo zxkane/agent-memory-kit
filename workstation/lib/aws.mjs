@@ -1,4 +1,5 @@
 import { createHash, createHmac } from 'node:crypto';
+import { REGION_RE, ROLE_ARN_RE } from './aws-names.mjs';
 
 // Errors carry the operation, the HTTP status and the AWS error code, nothing else: a response
 // body, a header or a URL never reaches a message.
@@ -13,7 +14,6 @@ export class AwsError extends Error {
 }
 
 const PATH_RE = /^\/[A-Za-z0-9._~/_-]*$/;
-const REGION_RE = /^[a-z]{2}(-[a-z]+)+-\d$/;
 const CODE_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 
 // An error code taken from a response is only reported when it looks like a code, so that a
@@ -142,4 +142,60 @@ export async function ssmGetParameter({ name, region, credentials, fetchImpl = f
   const value = doc?.Parameter?.Value;
   if (typeof value !== 'string') throw new AwsError('ssm', status, 'BadResponse');
   return value;
+}
+
+const SESSION_NAME_RE = /^[\w+=,.@-]{2,64}$/;
+const KEY_ID_RE = /^[A-Za-z0-9]{1,128}$/;
+// AWS publishes no maximum size for a session token, so the cap is generous.
+const SECRET_RE = /^[A-Za-z0-9+/=_.-]{1,16384}$/;
+const EXPIRATION_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
+
+// The text of the first <name> element of an XML answer, or null.
+const xmlValue = (xml, name) => new RegExp(`<${name}>([^<]*)</${name}>`).exec(xml)?.[1] ?? null;
+
+// Exchanges credentials for the short-lived credentials of a role (STS AssumeRole). The answer is
+// read from its first <Credentials> element only; nothing of an answer but an error code reaches
+// an error. No retry: a failed exchange is the caller's failure.
+export async function assumeRole({
+  roleArn, sessionName, region, credentials, durationSeconds = 900, fetchImpl = fetch, now = () => new Date(), timeoutMs = 10000, signal,
+}) {
+  const valid = typeof roleArn === 'string' && ROLE_ARN_RE.test(roleArn)
+    && typeof sessionName === 'string' && SESSION_NAME_RE.test(sessionName)
+    && Number.isInteger(durationSeconds) && durationSeconds >= 900 && durationSeconds <= 3600
+    && typeof region === 'string' && REGION_RE.test(region)
+    && typeof credentials?.accessKeyId === 'string' && typeof credentials?.secretAccessKey === 'string';
+  if (!valid) throw new AwsError('sts', 0, 'InvalidRequest');
+  const host = `sts.${region}.amazonaws.com`;
+  const body = [
+    ['Action', 'AssumeRole'], ['Version', '2011-06-15'], ['RoleArn', roleArn], ['RoleSessionName', sessionName],
+    ['DurationSeconds', String(durationSeconds)],
+  ].map(([k, v]) => `${k}=${encodeRfc3986(v)}`).join('&');
+  const headers = signRequest({
+    method: 'POST', host, path: '/', service: 'sts', region, credentials, now: now(), body,
+    headers: { 'content-type': 'application/x-www-form-urlencoded; charset=utf-8' },
+  });
+  delete headers.host; // set from the URL by fetch
+  const limit = AbortSignal.timeout(timeoutMs);
+  let status;
+  let text;
+  try {
+    const res = await fetchImpl(`https://${host}/`, {
+      method: 'POST', headers, body, redirect: 'manual', signal: signal ? AbortSignal.any([limit, signal]) : limit,
+    });
+    status = res.status;
+    text = await res.text();
+  } catch (err) {
+    throw networkError('sts', err);
+  }
+  if (status >= 300 && status < 400) throw new AwsError('sts', status, 'Redirect');
+  if (status < 200 || status >= 300) throw new AwsError('sts', status, safeCode(xmlValue(text, 'Code')));
+  const element = /<Credentials>([\s\S]*?)<\/Credentials>/.exec(text)?.[1] ?? '';
+  const accessKeyId = xmlValue(element, 'AccessKeyId');
+  const secretAccessKey = xmlValue(element, 'SecretAccessKey');
+  const sessionToken = xmlValue(element, 'SessionToken');
+  const expiration = xmlValue(element, 'Expiration');
+  const good = KEY_ID_RE.test(accessKeyId ?? '') && SECRET_RE.test(secretAccessKey ?? '') && SECRET_RE.test(sessionToken ?? '')
+    && EXPIRATION_RE.test(expiration ?? '') && !Number.isNaN(Date.parse(expiration));
+  if (!good) throw new AwsError('sts', status, 'BadAnswer');
+  return { accessKeyId, secretAccessKey, sessionToken, expiration };
 }

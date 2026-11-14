@@ -415,3 +415,77 @@ test('an earlier lastSuccess in the future is not carried either', async (t) => 
   await runCanary({ config: s.config, deps: { ...s.deps, runChecks: fixedChecks([fail('1. x')]) }, now: NOW });
   assert.equal(s.file().lastSuccess, null);
 });
+
+// ---- roleArn: the dedicated role ----
+
+const ROLE = 'arn:aws:iam::123456789012:role/example-canary';
+const ROLE_CREDS = { accessKeyId: 'ROLEKEYID', secretAccessKey: 'role-signing-value', sessionToken: 'role-session-value', expiration: '2026-11-14T10:15:00Z' };
+
+function withRole(t, over = {}) {
+  const s = setup(t);
+  s.config.canary.roleArn = ROLE;
+  const exchanges = [];
+  const keyIds = [];
+  const inner = s.deps.fetchImpl;
+  s.deps.fetchImpl = async (input, init) => {
+    if (String(input).startsWith('https://ssm.')) keyIds.push(/Credential=([^/]+)\//.exec(new Headers(init.headers).get('authorization'))?.[1]);
+    return inner(input, init);
+  };
+  s.deps.assumeRole = async (args) => {
+    exchanges.push(args);
+    return ROLE_CREDS;
+  };
+  Object.assign(s.deps, over);
+  return { s, exchanges, keyIds };
+}
+
+test('roleArn: the parameters are read with the exchanged credentials only', async (t) => {
+  const { s, exchanges, keyIds } = withRole(t);
+  const result = await runCanary({ config: s.config, deps: { ...s.deps, runChecks: fixedChecks(PASSING) }, now: NOW });
+  assert.equal(result.ok, true);
+  assert.equal(exchanges.length, 1);
+  assert.equal(exchanges[0].roleArn, ROLE);
+  assert.equal(exchanges[0].sessionName, 'agent-memory-canary');
+  assert.equal(exchanges[0].region, 'ap-northeast-1');
+  assert.equal(exchanges[0].credentials.accessKeyId, 'AKIAEXAMPLE');
+  assert.equal(typeof exchanges[0].fetchImpl, 'function');
+  assert.deepEqual(keyIds, ['ROLEKEYID', 'ROLEKEYID', 'ROLEKEYID', 'ROLEKEYID']);
+});
+
+test('roleArn: a failed exchange is the run error, no parameter is read and no check runs', async (t) => {
+  const { s, keyIds } = withRole(t, { assumeRole: async () => { throw new AwsError('sts', 403, 'AccessDenied'); } });
+  let ran = false;
+  const result = await runCanary({ config: s.config, deps: { ...s.deps, runChecks: async () => { ran = true; return PASSING; } }, now: NOW });
+  assert.deepEqual(result, { ok: false, failed: [], error: 'sts failed: 403 AccessDenied' });
+  assert.equal(s.file().error, 'sts failed: 403 AccessDenied');
+  assert.match(s.printed.join(''), /^canary failed: sts failed: 403 AccessDenied\n$/);
+  assert.deepEqual([ran, keyIds.length], [false, 0]);
+});
+
+test('roleArn: an error of the exchange that is not an AwsError is "canary failed" and never printed', async (t) => {
+  const { s, keyIds } = withRole(t, { assumeRole: async () => { throw new Error('SECRET-IN-ERROR'); } });
+  const result = await runCanary({ config: s.config, deps: s.deps, now: NOW });
+  assert.equal(result.error, 'canary failed');
+  assert.ok(!s.everything().includes('SECRET'));
+  assert.equal(keyIds.length, 0);
+});
+
+test('roleArn: an exchange that hangs ends at the time limit, with the run fetch given to it', async (t) => {
+  const { s, keyIds } = withRole(t, {
+    assumeRole: ({ fetchImpl }) => fetchImpl('https://sts.ap-northeast-1.amazonaws.com/', { method: 'POST' }),
+  });
+  s.deps.fetchImpl = (_input, init) => new Promise((_, reject) => {
+    init.signal.addEventListener('abort', () => reject(Object.assign(new Error('x'), { name: 'AbortError' })));
+  });
+  const result = await runCanary({ config: s.config, deps: s.deps, now: NOW, limitMs: 100 });
+  assert.deepEqual(result, { ok: false, failed: [], error: 'time limit' });
+  assert.equal(keyIds.length, 0);
+});
+
+test('no roleArn: the instance credentials are used and nothing is exchanged', async (t) => {
+  const { s, exchanges, keyIds } = withRole(t);
+  s.config.canary.roleArn = null;
+  await runCanary({ config: s.config, deps: { ...s.deps, runChecks: fixedChecks(PASSING) }, now: NOW });
+  assert.equal(exchanges.length, 0);
+  assert.deepEqual(keyIds, ['AKIAEXAMPLE', 'AKIAEXAMPLE', 'AKIAEXAMPLE', 'AKIAEXAMPLE']);
+});

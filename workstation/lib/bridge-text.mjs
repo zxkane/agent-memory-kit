@@ -16,7 +16,7 @@ export const OWN_ERROR_TEXTS = [
 export const ISO_TIME_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,3})?Z$/;
 // The operations an AwsError of this kit names (a test compares the list with the source). An error
 // text read back from a file is accepted only with one of these, never with a pattern for "a word".
-export const AWS_OPERATIONS = ['credentials', 'sign', 'ssm', 's3', 'get', 'put', 'del', 'list', 'bridge-up', 'bridge-down'];
+export const AWS_OPERATIONS = ['credentials', 'sign', 'ssm', 'sts', 's3', 'get', 'put', 'del', 'list', 'bridge-up', 'bridge-down'];
 // An AwsError message: `<operation> failed: <HTTP status> <code>`.
 export const AWS_ERROR_RE = new RegExp(`^(${AWS_OPERATIONS.join('|')}) failed: \\d{1,3} [A-Za-z0-9]{1,40}$`);
 
