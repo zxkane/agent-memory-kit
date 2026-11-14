@@ -6,8 +6,8 @@
 # --init writes ~/.config/agent-memory/config.json (first run only).
 # --dry-run prints what would happen and changes nothing.
 # --no-enable writes the systemd units but does not enable the timer.
-# --no-hooks does everything else but does not register the Claude Code hooks
-#   (and removes the kit's own entries if present).
+# --no-hooks does everything else but does not register the Claude Code, Codex and
+#   Kiro hooks (and removes the kit's own entries if present).
 set -euo pipefail
 
 die() {
@@ -131,7 +131,8 @@ else
     clone_needed=1
 fi
 
-# 5. Checks that change nothing: the settings file the hooks go into, and the notes repository.
+# 5. Checks that change nothing: the settings file the hooks go into, the hook files that
+# install.mjs would have to read, and the notes repository.
 if [[ -e "$settings_file" ]]; then
     node -e '
         let value;
@@ -142,6 +143,11 @@ if [[ -e "$settings_file" ]]; then
         }
         if (value === null || typeof value !== "object" || Array.isArray(value)) process.exit(3);
     ' "$settings_file" || die "$settings_file is not valid JSON holding an object; fix it and run setup.sh again."
+fi
+install_flags=()
+[[ $hooks -eq 1 ]] || install_flags=(--no-hooks)
+if ! check_msg="$(node "$kit_dir/workstation/install.mjs" --check ${install_flags[@]+"${install_flags[@]}"} 2>&1)"; then
+    die "$check_msg"
 fi
 if [[ $init -eq 1 || $clone_needed -eq 1 ]]; then
     GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$repo_url" main > /dev/null \
@@ -156,6 +162,7 @@ if [[ $dry_run -eq 1 ]]; then
     else
         printf 'would run node %s/workstation/install.mjs --no-hooks (no hooks in %s)\n' "$kit_dir" "$settings_file"
     fi
+    node "$kit_dir/workstation/install.mjs" --plan ${install_flags[@]+"${install_flags[@]}"}
     printf 'would write %s/agent-memory-sync.service and agent-memory-sync.timer\n' "$unit_dir"
     if [[ $enable -eq 1 ]]; then
         printf '%s\n' 'would run systemctl --user daemon-reload and enable --now agent-memory-sync.timer'

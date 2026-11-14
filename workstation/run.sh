@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launcher: run.sh session-start | pre-write | sync | migrate
+# Launcher: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mode="${1:-}"
@@ -17,9 +17,13 @@ take_sync_lock() {
     exec 9> "$lock_dir/sync.lock"
 }
 case "$mode" in
-    session-start | pre-write)
+    session-start)
         [[ -n "$node_path" && -x "$node_path" ]] || exit 0
-        exec "$node_path" "$root/$mode.mjs"
+        exec "$node_path" "$root/session-start.mjs" "${@:2}"
+        ;;
+    pre-write)
+        [[ -n "$node_path" && -x "$node_path" ]] || exit 0
+        exec "$node_path" "$root/pre-write.mjs"
         ;;
     sync)
         if [[ -z "$node_path" || ! -x "$node_path" ]]; then
@@ -48,7 +52,7 @@ case "$mode" in
         exec "$node_path" "$root/migrate.mjs" "${@:2}"
         ;;
     *)
-        printf '%s\n' 'usage: run.sh session-start | pre-write | sync | migrate' >&2
+        printf '%s\n' 'usage: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate' >&2
         exit 2
         ;;
 esac
