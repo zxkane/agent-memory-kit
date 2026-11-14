@@ -80,7 +80,7 @@ export function createSnapshots(store: Store): { load(): Promise<Note[]> } {
   };
 }
 
-export function upsertNote(snapshotText: string | null, note: Note): string {
+function readSnapshot(snapshotText: string | null): { doc: Record<string, unknown>; notes: Note[] } {
   let doc: Record<string, unknown> = { version: 1, notes: [] };
   let notes: Note[] = [];
   if (snapshotText !== null) {
@@ -99,6 +99,15 @@ export function upsertNote(snapshotText: string | null, note: Note): string {
       // unreadable input starts a new snapshot
     }
   }
+  return { doc, notes };
+}
+
+export function listNotes(snapshotText: string | null): Note[] {
+  return readSnapshot(snapshotText).notes;
+}
+
+export function upsertNote(snapshotText: string | null, note: Note): string {
+  const { doc, notes } = readSnapshot(snapshotText);
   const merged = notes.filter((n) => n.path !== note.path);
   merged.push(note);
   merged.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));

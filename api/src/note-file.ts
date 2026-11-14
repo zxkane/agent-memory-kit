@@ -1,7 +1,5 @@
 import type { NoteType } from './validate.ts';
 
-const LINK_RE = /\]\([^()\s]*\.md\)/;
-
 export function composeNote(input: { name: string; description: string; type: NoteType | string; content: string }): string {
   const body = input.content.replace(/\r\n?/g, '\n').trimEnd();
   return [
@@ -32,8 +30,4 @@ export function upsertIndexLine(indexText: string | null, name: string, descript
   if (at >= 0) lines[at] = line;
   else lines.push(line);
   return lines.join('\n') + '\n';
-}
-
-export function countIndexNotes(indexText: string | null): number {
-  return splitLines(indexText).filter((l) => LINK_RE.test(l)).length;
 }

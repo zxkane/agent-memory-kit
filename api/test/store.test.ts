@@ -163,3 +163,23 @@ test('s3Store.put maps 412 and 409 to precondition-failed, rethrows others', asy
   });
   await assert.rejects(() => s3Store('b', client).put('k.md', 'x', null), /InternalError/);
 });
+
+test('update: an error thrown by change reaches the caller unchanged and writes nothing', async () => {
+  const s = fakeStore({ k: 'a' });
+  const boom = new ApiError(400, 'scope_full', 'full');
+  let puts = 0;
+  const put = s.put.bind(s);
+  s.put = async (...args) => {
+    puts++;
+    return put(...args);
+  };
+  await assert.rejects(
+    () =>
+      update(s, 'k', () => {
+        throw boom;
+      }),
+    (err: unknown) => err === boom,
+  );
+  assert.equal(puts, 0);
+  assert.equal(s.objects.get('k')?.body, 'a');
+});
