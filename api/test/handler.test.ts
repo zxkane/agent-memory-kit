@@ -42,11 +42,11 @@ function setup(initial: Record<string, string> = {}) {
 }
 
 const SNAPSHOT = JSON.stringify({
-  notes: [{ path: 'agents/hermes/a-note.md', name: 'a-note', description: 'First', type: 'reference', body: 'hello world' }],
+  notes: [{ path: 'agents/assistant/a-note.md', name: 'a-note', description: 'First', type: 'reference', body: 'hello world' }],
 });
 
 const writeBody = (over: Record<string, unknown> = {}) =>
-  JSON.stringify({ agent: 'hermes', name: 'my-note', description: 'A note', content: 'Hello', ...over });
+  JSON.stringify({ agent: 'assistant', name: 'my-note', description: 'A note', content: 'Hello', ...over });
 
 function json(res: { body?: string }): any {
   return JSON.parse(res.body ?? '');
@@ -59,11 +59,11 @@ test('each route reaches its operation and returns 200 JSON', async () => {
     'mem/global/n.md': 'text',
   });
   const cases: Array<[string, Parameters<typeof event>[1], (b: any) => void]> = [
-    ['GET /v1/scopes', {}, (b) => assert.deepEqual(b.scopes, [{ scope: 'agents/hermes', notes: 1 }])],
+    ['GET /v1/scopes', {}, (b) => assert.deepEqual(b.scopes, [{ scope: 'agents/assistant', notes: 1 }])],
     ['GET /v1/index', { query: { scope: 'global' } }, (b) => assert.equal(b.index, '- index')],
     ['GET /v1/search', { query: { q: 'hello' } }, (b) => assert.equal(b.total, 1)],
     ['GET /v1/note', { query: { path: 'global/n.md' } }, (b) => assert.equal(b.content, 'text')],
-    ['POST /v1/notes', { body: writeBody() }, (b) => assert.deepEqual(b, { path: 'agents/hermes/my-note.md', created: true })],
+    ['POST /v1/notes', { body: writeBody() }, (b) => assert.deepEqual(b, { path: 'agents/assistant/my-note.md', created: true })],
   ];
   for (const [route, opts, check] of cases) {
     const res = await handler(event(route, opts));
@@ -108,12 +108,12 @@ function throwingStore(touched: string[]): Store {
 
 // A valid write body whose serialized size is exactly `bytes` (content is padded with `fill`).
 function bodyOfSize(bytes: number, fill = 'x'): string {
-  const base = JSON.stringify({ agent: 'hermes', name: 'my-note', description: 'A note', content: '' });
+  const base = JSON.stringify({ agent: 'assistant', name: 'my-note', description: 'A note', content: '' });
   const fillBytes = Buffer.byteLength(fill);
   const room = bytes - Buffer.byteLength(base);
   const count = Math.floor(room / fillBytes);
   const content = 'x'.repeat(room - count * fillBytes) + fill.repeat(count);
-  const out = JSON.stringify({ agent: 'hermes', name: 'my-note', description: 'A note', content });
+  const out = JSON.stringify({ agent: 'assistant', name: 'my-note', description: 'A note', content });
   assert.equal(Buffer.byteLength(out), bytes);
   return out;
 }
@@ -163,7 +163,7 @@ test('a base64 body is decoded', async () => {
   const { handler, store } = setup();
   const res = await handler(event('POST /v1/notes', { body: Buffer.from(writeBody()).toString('base64'), base64: true }));
   assert.equal(res.statusCode, 200);
-  assert.ok(store.objects.has('agents/hermes/my-note.md'));
+  assert.ok(store.objects.has('agents/assistant/my-note.md'));
 });
 
 test('an ApiError maps to its status and body', async () => {
@@ -199,7 +199,7 @@ test('an unexpected error is 500 with a fixed message and a log line without the
 
 test('log lines carry client, op, scope, path, status and duration, and no request text', async () => {
   const { handler, lines } = setup({ 'index/agents.json': SNAPSHOT });
-  await handler(event('GET /v1/search', { query: { q: 'MARKER-QUERY', scope: 'agents/hermes' }, clientId: 'abc' }));
+  await handler(event('GET /v1/search', { query: { q: 'MARKER-QUERY', scope: 'agents/assistant' }, clientId: 'abc' }));
   await handler(
     event('POST /v1/notes', {
       body: writeBody({ description: 'MARKER-DESC', content: 'MARKER-CONTENT' }),
@@ -209,12 +209,12 @@ test('log lines carry client, op, scope, path, status and duration, and no reque
   assert.equal(lines.length, 2);
   assert.equal(lines[0]?.op, 'memory_search');
   assert.equal(lines[0]?.clientId, 'abc');
-  assert.equal(lines[0]?.scope, 'agents/hermes');
+  assert.equal(lines[0]?.scope, 'agents/assistant');
   assert.equal(lines[0]?.status, 200);
   assert.equal(typeof lines[0]?.ms, 'number');
   assert.equal(lines[1]?.op, 'memory_write');
-  assert.equal(lines[1]?.scope, 'agents/hermes');
-  assert.equal(lines[1]?.path, 'agents/hermes/my-note.md');
+  assert.equal(lines[1]?.scope, 'agents/assistant');
+  assert.equal(lines[1]?.path, 'agents/assistant/my-note.md');
   const text = JSON.stringify(lines);
   for (const marker of ['MARKER-QUERY', 'MARKER-DESC', 'MARKER-CONTENT']) assert.ok(!text.includes(marker), marker);
 });
@@ -305,8 +305,8 @@ test('a suffix lookalike scope and tab-separated scopes are judged token by toke
 test('a write whose reads are all denied ends as 409 conflict and changes nothing', async () => {
   const initial = {
     'index/agents.json': SNAPSHOT,
-    'agents/hermes/MEMORY.md': '- [a-note](a-note.md) - First\n',
-    'agents/hermes/a-note.md': 'text',
+    'agents/assistant/MEMORY.md': '- [a-note](a-note.md) - First\n',
+    'agents/assistant/a-note.md': 'text',
   };
   const store = fakeStore(initial, { deniedReads: true });
   const before = new Map(store.objects);
@@ -363,8 +363,8 @@ test('a write is visible to search and read through the same handler', async () 
   assert.equal(put.statusCode, 200);
   const found = json(await handler(event('GET /v1/search', { query: { q: 'zebrafish' } })));
   assert.equal(found.total, 1);
-  assert.equal(found.results[0].path, 'agents/hermes/fish.md');
+  assert.equal(found.results[0].path, 'agents/assistant/fish.md');
   assert.match(JSON.stringify(found.results[0]), /zebrafish/);
-  const read = json(await handler(event('GET /v1/note', { query: { path: 'agents/hermes/fish.md' } })));
+  const read = json(await handler(event('GET /v1/note', { query: { path: 'agents/assistant/fish.md' } })));
   assert.match(read.content, /zebrafish tank/);
 });

@@ -103,7 +103,7 @@ test('required query parameters match validation', () => {
 });
 
 const SAMPLE: Record<string, string> = {
-  agent: 'hermes',
+  agent: 'assistant',
   name: 'my-note',
   description: 'A note',
   content: 'Hello',

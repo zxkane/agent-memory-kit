@@ -6,12 +6,12 @@ import { memoryWrite } from '../src/ops/write.ts';
 import { fakeStore } from './fake-store.ts';
 import type { FakeStore } from './fake-store.ts';
 
-const NOTE_KEY = 'agents/hermes/my-note.md';
-const INDEX_KEY = 'agents/hermes/MEMORY.md';
+const NOTE_KEY = 'agents/assistant/my-note.md';
+const INDEX_KEY = 'agents/assistant/MEMORY.md';
 const SNAP_KEY = 'index/agents.json';
 
 const body = (over: Record<string, unknown> = {}) => ({
-  agent: 'hermes',
+  agent: 'assistant',
   name: 'my-note',
   description: 'A note',
   content: 'Hello',
@@ -122,7 +122,7 @@ test('hostile inputs are rejected before any write; successful writes stay in sc
     body({ name: 'memory' }),
     body({ agent: '../mem' }),
     body({ agent: 'a/b' }),
-    body({ agent: 'Hermes' }),
+    body({ agent: 'Assistant' }),
     body({ agent: 'x'.repeat(41) }),
     body({ name: '' }),
     body({ key: 'index/mem.json' }),
@@ -140,7 +140,7 @@ test('hostile inputs are rejected before any write; successful writes stay in sc
   await memoryWrite({ store }, body({ agent: 'other-agent', name: 'z' }));
   assert.ok(log.length > 0);
   for (const key of log) {
-    assert.ok(/^agents\/(hermes|other-agent)\//.test(key) || key === SNAP_KEY, key);
+    assert.ok(/^agents\/(assistant|other-agent)\//.test(key) || key === SNAP_KEY, key);
   }
   assert.ok(!(log as string[]).includes('index/mem.json'));
 });
@@ -156,7 +156,7 @@ test('CRLF content is normalised and injection text is stored unchanged', async 
   assert.equal(snap.notes[0]!.body, text);
 });
 
-function snapshotOf(count: number, agent = 'hermes', filler = 0) {
+function snapshotOf(count: number, agent = 'assistant', filler = 0) {
   const notes = Array.from({ length: count }, (_, i) => ({
     path: `agents/${agent}/n${i}.md`,
     name: `n${i}`,
@@ -210,10 +210,10 @@ test('two concurrent writes both survive in the index and the snapshot', async (
   assert.equal(a.created && b.created, true);
   assert.ok((failures.get(SNAP_KEY) ?? 0) >= 1, 'snapshot update never lost a precondition');
   assert.ok((failures.get(INDEX_KEY) ?? 0) >= 1, 'index update never lost a precondition');
-  assert.ok(store.objects.has('agents/hermes/one.md') && store.objects.has('agents/hermes/two.md'));
+  assert.ok(store.objects.has('agents/assistant/one.md') && store.objects.has('agents/assistant/two.md'));
   const index = store.objects.get(INDEX_KEY)!.body;
   assert.ok(index.includes('(one.md)') && index.includes('(two.md)'));
-  assert.deepEqual(snapshotPaths(store), ['agents/hermes/one.md', 'agents/hermes/two.md']);
+  assert.deepEqual(snapshotPaths(store), ['agents/assistant/one.md', 'agents/assistant/two.md']);
 });
 
 test('the cap holds under concurrency: exactly one of two first writes at 199 notes wins', async () => {
@@ -229,8 +229,8 @@ test('the cap holds under concurrency: exactly one of two first writes at 199 no
   assert.ok(bad[0]!.reason instanceof ApiError);
   assert.equal(bad[0]!.reason.status, 400);
   assert.equal(bad[0]!.reason.code, 'scope_full');
-  assert.equal(snapshotPaths(store).filter((p) => p.startsWith('agents/hermes/')).length, 200);
-  const written = ['one', 'two'].filter((n) => store.objects.has(`agents/hermes/${n}.md`));
+  assert.equal(snapshotPaths(store).filter((p) => p.startsWith('agents/assistant/')).length, 200);
+  const written = ['one', 'two'].filter((n) => store.objects.has(`agents/assistant/${n}.md`));
   assert.equal(written.length, 1);
   const index = store.objects.get(INDEX_KEY)!.body;
   assert.equal(index.split('\n').filter((l) => l.startsWith('- [')).length, 1);
@@ -239,14 +239,14 @@ test('the cap holds under concurrency: exactly one of two first writes at 199 no
 test('a full scope still accepts a replacement, and other scopes are unaffected', async () => {
   const store = fakeStore({ [SNAP_KEY]: snapshotOf(200) });
   const res = await memoryWrite({ store }, body({ name: 'n5', description: 'new' }));
-  assert.deepEqual(res, { path: 'agents/hermes/n5.md', created: false });
+  assert.deepEqual(res, { path: 'agents/assistant/n5.md', created: false });
   await assert.rejects(memoryWrite({ store }, body({ name: 'extra' })), (e: unknown) => e instanceof ApiError && e.code === 'scope_full');
-  assert.ok(!store.objects.has('agents/hermes/extra.md'));
+  assert.ok(!store.objects.has('agents/assistant/extra.md'));
   assert.deepEqual(await memoryWrite({ store }, body({ agent: 'other', name: 'x' })), { path: 'agents/other/x.md', created: true });
 });
 
 test('store_full: a write that takes the snapshot over 4,000,000 bytes is refused and changes nothing', async () => {
-  const initial = snapshotOf(1, 'hermes', 3_950_000);
+  const initial = snapshotOf(1, 'assistant', 3_950_000);
   assert.ok(Buffer.byteLength(initial) < 4_000_000);
   const store = fakeStore({ [SNAP_KEY]: initial });
   const log = logWrites(store);
@@ -258,7 +258,7 @@ test('store_full: a write that takes the snapshot over 4,000,000 bytes is refuse
   });
   assert.deepEqual(log, []);
   assert.equal(store.objects.get(SNAP_KEY)!.body, initial);
-  assert.ok(!store.objects.has('agents/hermes/big.md'));
+  assert.ok(!store.objects.has('agents/assistant/big.md'));
   assert.ok(!store.objects.has(INDEX_KEY));
 });
 
@@ -319,7 +319,7 @@ function scopeOfBytes(agent: string, target: number, lastName = 'zlast', lastDes
 const snap = (entries: unknown[]) => JSON.stringify({ version: 1, notes: entries });
 
 test('per-scope byte quota: a write over it is refused, another scope is unaffected', async () => {
-  const initial = snap(scopeOfBytes('hermes', 239_000));
+  const initial = snap(scopeOfBytes('assistant', 239_000));
   const store = fakeStore({ [SNAP_KEY]: initial });
   const log = logWrites(store);
   await assert.rejects(memoryWrite({ store }, body({ name: 'extra', content: 'x'.repeat(2_000) })), (e: unknown) => {
@@ -335,7 +335,7 @@ test('per-scope byte quota: a write over it is refused, another scope is unaffec
 });
 
 test('a scope at the byte quota still accepts a replacement that keeps or shrinks it', async () => {
-  const at = scopeOfBytes('hermes', 240_000, 'my-note', 'A note');
+  const at = scopeOfBytes('assistant', 240_000, 'my-note', 'A note');
   assert.equal(sizeOf(at), 240_000);
   const last = at[at.length - 1]!;
   const store = fakeStore({ [SNAP_KEY]: snap(at) });
@@ -352,7 +352,7 @@ test('a scope at the byte quota still accepts a replacement that keeps or shrink
 });
 
 test('the byte quota counts UTF-8 bytes, not characters', async () => {
-  const initial = snap(scopeOfBytes('hermes', 200_000, 'zlast', 'd', 4));
+  const initial = snap(scopeOfBytes('assistant', 200_000, 'zlast', 'd', 4));
   const store = fakeStore({ [SNAP_KEY]: initial });
   const content = '记'.repeat(16_000); // 16,000 characters, 48,000 bytes
   assert.ok(200_000 + content.length < 240_000);

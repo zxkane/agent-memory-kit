@@ -26,7 +26,7 @@ function rejects(fn: () => unknown, marker: string = MARKER): void {
   });
 }
 
-const validBody = () => ({ agent: 'hermes', name: 'my-note', description: 'A note', content: 'Body' });
+const validBody = () => ({ agent: 'assistant', name: 'my-note', description: 'A note', content: 'Body' });
 
 test('route table and resource server', () => {
   assert.equal(RESOURCE_SERVER, 'agent-memory');
@@ -51,11 +51,11 @@ test('ApiError carries status, code and message', () => {
 test('parseScope accepts the three scope forms', () => {
   assert.deepEqual(parseScope('global'), { kind: 'global' });
   assert.deepEqual(parseScope('projects/my.proj-1'), { kind: 'project', project: 'my.proj-1' });
-  assert.deepEqual(parseScope('agents/hermes-2'), { kind: 'agent', agent: 'hermes-2' });
+  assert.deepEqual(parseScope('agents/assistant-2'), { kind: 'agent', agent: 'assistant-2' });
 });
 
 test('parseScope rejects malformed scopes', () => {
-  for (const bad of ['', 'projects/', 'projects/a/b', 'projects/..', 'projects/.', 'agents/Hermes', 'agents/a_b', 'global/', '/global', `projects/${MARKER}%`, `${MARKER}`]) {
+  for (const bad of ['', 'projects/', 'projects/a/b', 'projects/..', 'projects/.', 'agents/Assistant', 'agents/a_b', 'global/', '/global', `projects/${MARKER}%`, `${MARKER}`]) {
     rejects(() => parseScope(bad));
   }
   for (const bad of [undefined, null, 5, {}, ['global']]) {
@@ -127,7 +127,7 @@ test('parseQuery', () => {
 
 test('parseWrite accepts a valid body and applies defaults', () => {
   assert.deepEqual(parseWrite(validBody()), {
-    agent: 'hermes',
+    agent: 'assistant',
     name: 'my-note',
     description: 'A note',
     type: 'reference',
