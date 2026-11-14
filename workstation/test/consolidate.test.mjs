@@ -539,7 +539,8 @@ test('extract takes the project extracted longest ago first; maxProjects bounds 
   // q's session is older than p's: newest-session-first would take p.
   f.addSession('-work-q', 'q', 'a question in q', 3 * 3600 * 1000);
   mkdirSync(f.state, { recursive: true });
-  const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+  const base = Date.now(); // one time for the whole test: two equal marks must be equal
+  const days = (n) => new Date(base - n * DAY_MS).toISOString();
   writeFileSync(f.stateFile(), JSON.stringify({ projects: { p: { lastExtract: days(2) }, q: { lastExtract: days(5) } } }));
   f.run('extract');
   assert.deepEqual(f.calls().map((c) => c.scope), ['q']);
@@ -880,7 +881,8 @@ test('F2: failing scopes of every class rotate among themselves', (t) => {
 test('F2: a scope that was organized successfully goes before one whose last run failed', (t) => {
   const f = fixture(t, { consolidate: { maxProjects: 1 } });
   f.seed({ 'projects/p/a.md': note('a', 'A', 'Changed since.'), 'projects/q/a.md': note('a', 'A', 'Also changed.') });
-  const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+  const base = Date.now(); // one time for the whole test: two equal marks must be equal
+  const days = (n) => new Date(base - n * DAY_MS).toISOString();
   mkdirSync(f.state, { recursive: true });
   writeFileSync(f.stateFile(), JSON.stringify({
     projects: {
@@ -940,7 +942,8 @@ test('state without lastExtractTried loads as never tried; unknown keys survive'
   f.setConfig({ maxProjects: 1 });
   f.seed({ 'projects/q/MEMORY.md': index('y.md'), 'projects/q/y.md': note('y', 'Y', 'Another project.') });
   f.addSession('-work-q', 'q', 'a question in q', 3 * 3600 * 1000);
-  const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+  const base = Date.now(); // one time for the whole test: two equal marks must be equal
+  const days = (n) => new Date(base - n * DAY_MS).toISOString();
   mkdirSync(f.state, { recursive: true });
   writeFileSync(f.stateFile(), JSON.stringify({
     // q's window is older, but q was tried recently and p never was (an earlier version wrote no
@@ -1672,7 +1675,8 @@ test('item 1: a scope whose last run failed more than 28 days ago goes first aga
   for (const [age, expected] of [[29, 'p'], [2, 'q']]) {
     const f = fixture(t, { consolidate: { maxProjects: 1 } });
     f.seed({ 'projects/p/a.md': note('a', 'A', 'Failed once.'), 'projects/q/a.md': note('a', 'A', 'Changes every week.') });
-    const days = (n) => new Date(Date.now() - n * DAY_MS).toISOString();
+    const base = Date.now(); // one time for the whole test: two equal marks must be equal
+    const days = (n) => new Date(base - n * DAY_MS).toISOString();
     mkdirSync(f.state, { recursive: true });
     writeFileSync(f.stateFile(), JSON.stringify({
       projects: {

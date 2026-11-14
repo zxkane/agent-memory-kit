@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launcher: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate | consolidate-step
+# Launcher: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate | consolidate-step | canary
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mode="${1:-}"
@@ -88,8 +88,13 @@ case "$mode" in
         fi
         exec "$node_path" "$root/consolidate.mjs" --step "${@:2}"
         ;;
+    canary)
+        # The deployed checks of the memory API. They write nothing into the clone, so no lock.
+        require_node
+        exec "$node_path" "$root/canary.mjs"
+        ;;
     *)
-        printf '%s\n' 'usage: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate extract|organize [options]' >&2
+        printf '%s\n' 'usage: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate extract|organize [options] | canary' >&2
         exit 2
         ;;
 esac

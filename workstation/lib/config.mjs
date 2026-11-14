@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve, sep } from 'node:path';
+import { BUCKET_RE, REGION_RE } from './aws-names.mjs';
 import { scanText } from './secret-scan.mjs';
 
 const HOST_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -76,6 +77,60 @@ function parseConsolidate(block) {
   };
 }
 
+const BRIDGE_KEYS = ['bucket', 'region', 'up', 'down', 'agentsRepoDir', 'agentsRepoUrl'];
+
+// True when one folder is the other, inside it or around it. Both get a trailing separator, so
+// `/a/notes-agents` is not taken to be inside `/a/notes`.
+function overlaps(a, b) {
+  const x = resolve(a) + (resolve(a).endsWith(sep) ? '' : sep);
+  const y = resolve(b) + (resolve(b).endsWith(sep) ? '' : sep);
+  return x.startsWith(y) || y.startsWith(x);
+}
+
+// The optional bridge block, with the same contract as parseConsolidate: `{ value, problem }`.
+function parseBridge(block, repoDir) {
+  if (block === undefined || block === null) return { value: null, problem: null };
+  const bad = (problem) => ({ value: null, problem });
+  if (typeof block !== 'object' || Array.isArray(block)) return bad('bridge');
+  const unknown = Object.keys(block).find((key) => !BRIDGE_KEYS.includes(key));
+  if (unknown !== undefined) return bad(echoable(unknown) ? unknown : '(an unknown key)');
+  if (block.up === undefined && block.down === undefined && block.agentsRepoDir === undefined) return bad('bridge');
+  const up = block.up === undefined ? false : block.up;
+  const down = block.down === undefined ? false : block.down;
+  if (typeof up !== 'boolean') return bad('up');
+  if (typeof down !== 'boolean') return bad('down');
+  const needsBucket = up || down;
+  const bucket = block.bucket ?? null;
+  if (bucket === null ? needsBucket : typeof bucket !== 'string' || !BUCKET_RE.test(bucket)) return bad('bucket');
+  const region = block.region ?? null;
+  if (region === null ? needsBucket : typeof region !== 'string' || !REGION_RE.test(region)) return bad('region');
+  const dir = block.agentsRepoDir ?? null;
+  if (dir === null ? down : typeof dir !== 'string' || !isAbsolute(dir) || CONTROL_RE.test(dir) || overlaps(dir, repoDir)) {
+    return bad('agentsRepoDir');
+  }
+  const url = block.agentsRepoUrl ?? null;
+  // Passed to Git as an argument: no leading dash, whitespace or control character.
+  if (url !== null && (typeof url !== 'string' || !MODEL_RE.test(url))) return bad('agentsRepoUrl');
+  return { value: { bucket, region, up, down, agentsRepoDir: dir, agentsRepoUrl: url }, problem: null };
+}
+
+const CANARY_KEYS = ['stage', 'region', 'schedule'];
+const STAGE_RE = /^[a-z0-9-]{1,32}$/;
+
+// The optional canary block, with the same contract as parseConsolidate: `{ value, problem }`.
+function parseCanary(block) {
+  if (block === undefined || block === null) return { value: null, problem: null };
+  const bad = (problem) => ({ value: null, problem });
+  if (typeof block !== 'object' || Array.isArray(block)) return bad('canary');
+  const unknown = Object.keys(block).find((key) => !CANARY_KEYS.includes(key));
+  if (unknown !== undefined) return bad(echoable(unknown) ? unknown : '(an unknown key)');
+  if (typeof block.stage !== 'string' || !STAGE_RE.test(block.stage)) return bad('stage');
+  if (typeof block.region !== 'string' || !REGION_RE.test(block.region)) return bad('region');
+  const schedule = calendar(block.schedule);
+  if (schedule === undefined) return bad('schedule');
+  return { value: { stage: block.stage, region: block.region, schedule }, problem: null };
+}
+
 // The configuration file: AGENT_MEMORY_CONFIG, or ~/.config/agent-memory/config.json.
 export function configPath(env = process.env) {
   return env.AGENT_MEMORY_CONFIG || join(env.HOME, '.config/agent-memory/config.json');
@@ -98,9 +153,13 @@ export function loadConfig(env = process.env) {
     const stale = raw.staleAfterSeconds ?? 600;
     if (!Number.isFinite(stale) || stale <= 0) return null;
     const consolidate = parseConsolidate(raw.consolidate);
+    const bridge = parseBridge(raw.bridge, raw.repoDir);
+    const canary = parseCanary(raw.canary);
     return {
       host: raw.host, repoDir: raw.repoDir, repoUrl, stateDir, claudeDir, staleAfterSeconds: stale,
       consolidate: consolidate.value, consolidateProblem: consolidate.problem,
+      bridge: bridge.value, bridgeProblem: bridge.problem,
+      canary: canary.value, canaryProblem: canary.problem,
     };
   } catch {
     return null;

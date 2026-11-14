@@ -24,7 +24,7 @@ const lossyUtf8 = new TextDecoder('utf-8');
 const PRIVATE_KEY_END_RE = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
 const GITLINK_MODE = '160000';
 
-const identity = (host) => ['-c', 'user.name=agent-memory-sync', '-c', `user.email=agent-memory-sync@${host}.invalid`];
+export const identity = (host) => ['-c', 'user.name=agent-memory-sync', '-c', `user.email=agent-memory-sync@${host}.invalid`];
 const nulList = (out) => out.split('\0').filter(Boolean);
 const stampOf = (date) => date.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 const quarantineDir = (config) => join(config.stateDir, 'quarantine');
@@ -240,16 +240,24 @@ function pushRefusal(repo) {
   return `unpushed commits contain flagged content: ${list.join('; ')}`;
 }
 
-// A run killed during `git add` or `git commit` leaves index.lock behind. The caller holds the
-// sync lock and nothing else runs Git in this clone, so an old lock is stale.
-function removeStaleIndexLock(repo) {
-  const out = git(repo, ['rev-parse', '--git-path', 'index.lock']).stdout.trim();
-  const lock = isAbsolute(out) ? out : join(repo, out);
-  try {
-    if (Date.now() - lstatSync(lock).mtimeMs > STALE_INDEX_LOCK_MS) unlinkSync(lock);
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
+// A run killed during a Git command leaves its lock files behind. The caller holds the lock of its
+// own clone and nothing else runs Git in it, so a lock older than a minute is stale. `names` are
+// paths inside the Git folder (`index.lock`, `refs/heads/main.lock`); one implementation for the
+// notes clone and for the agents clone of the bridge.
+export function removeStaleLocks(repo, names) {
+  for (const name of names) {
+    const out = git(repo, ['rev-parse', '--git-path', name]).stdout.trim();
+    const lock = isAbsolute(out) ? out : join(repo, out);
+    try {
+      if (Date.now() - lstatSync(lock).mtimeMs > STALE_INDEX_LOCK_MS) unlinkSync(lock);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
   }
+}
+
+function removeStaleIndexLock(repo) {
+  removeStaleLocks(repo, ['index.lock']);
 }
 
 function unmergedPaths(repo) {
@@ -449,7 +457,28 @@ function countConflicts(config) {
 
 const asList = (value) => (Array.isArray(value) ? value.filter((v) => typeof v === 'string') : []);
 
-export function writeStatus(config, result, now = new Date()) {
+const isoString = (value) => (typeof value === 'string' ? value : null);
+
+// One bridge step of status.json. `step` is the record of this run (`null`: the step is not
+// configured; `undefined`: it did not run this time, so the previous entry stays as it was).
+// `lastSuccess` is this run's time after a success and the previous one after a failure;
+// `failingSince` is the time of the first failed run since the last success.
+function bridgeStep(previous, step, lastRun) {
+  if (step === null) return null;
+  if (step === undefined) return previous && typeof previous === 'object' ? previous : null;
+  if (step.ok) return { ...step, lastSuccess: lastRun };
+  const wasFailing = previous?.ok === false && isoString(previous.failingSince) !== null;
+  return {
+    ...step,
+    lastSuccess: isoString(previous?.lastSuccess),
+    failingSince: wasFailing ? previous.failingSince : lastRun,
+  };
+}
+
+// `bridge`: `undefined` (not passed, as by a writer that knows nothing of the bridge) carries the
+// previous file's `bridge` value over unchanged; `null` writes no `bridge` key; an object is
+// `{ up, down }` (see bridgeStep).
+export function writeStatus(config, result, now = new Date(), bridge = undefined) {
   const previous = readStatus(config);
   const lastRun = now.toISOString();
   const status = {
@@ -460,6 +489,13 @@ export function writeStatus(config, result, now = new Date()) {
     conflictCount: countConflicts(config),
     // Kept from every run until the person deletes status.json.
     markerConflicts: [...new Set([...asList(previous?.markerConflicts), ...asList(result.markerConflicts)])].sort(),
+    ...(bridge === undefined ? (previous?.bridge === undefined ? {} : { bridge: previous.bridge }) : {}),
+    ...(bridge ? {
+      bridge: {
+        up: bridgeStep(previous?.bridge?.up, bridge.up, lastRun),
+        down: bridgeStep(previous?.bridge?.down, bridge.down, lastRun),
+      },
+    } : {}),
   };
   mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
   const file = statusFile(config);

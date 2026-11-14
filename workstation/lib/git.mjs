@@ -43,7 +43,8 @@ export function git(repoDir, args, opts = {}) {
     const stdout = execFileSync('git', ['-C', repoDir, ...FIXED_CONFIG, ...args], {
       env: gitEnv(), encoding, maxBuffer: 64 * 1024 * 1024,
       stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-      input: opts.input,
+      // A string is encoded by execFileSync with the `encoding` option, which is 'buffer' here.
+      input: opts.buffer && typeof opts.input === 'string' ? Buffer.from(opts.input, 'utf8') : opts.input,
       timeout: opts.timeoutMs ?? 0,
     });
     return { code: 0, stdout, stderr: '' };
