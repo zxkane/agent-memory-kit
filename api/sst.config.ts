@@ -4,7 +4,12 @@
 //   AGENT_MEMORY_REGION                  required, the AWS region to deploy to
 //   AGENT_MEMORY_WORKSTATION_ROLE_ARNS   optional, comma-separated ARNs of the workstation's IAM roles.
 //                                        When set, the deployment creates a bridge role and a canary
-//                                        role that only those roles may assume. When unset, it creates neither.
+//                                        role that those roles (and the GitHub jobs of the next variable) may
+//                                        assume. Without this and the next variable, it creates neither.
+//   AGENT_MEMORY_GITHUB_SUBJECTS         optional, comma-separated exact GitHub Actions subjects, for example
+//                                        repo:<owner>/<repository>:ref:refs/heads/main. When set, the same two
+//                                        roles also trust those jobs through the account's existing GitHub
+//                                        OIDC provider, which must exist. Either variable creates the roles.
 export default $config({
   app(input) {
     const region = process.env.AGENT_MEMORY_REGION;

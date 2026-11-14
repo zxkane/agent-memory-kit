@@ -534,3 +534,107 @@ test('roleArn: the exchange sends the run fetch, so a test can keep it off the n
   await run(cfg(bridgeBlock({ roleArn: ROLE })), deps);
   assert.equal(exchange[0].fetchImpl, fetchImpl);
 });
+
+// ---- credentials: "environment" ----
+
+const ENV_CREDS = { accessKeyId: 'ASIAENVKEYID', secretAccessKey: 'env-signing-value', sessionToken: 'env-session-value' };
+
+function envFakes(over = {}) {
+  const env = { calls: 0 };
+  const parts = roleFakes({
+    environmentCredentials: () => {
+      env.calls += 1;
+      return ENV_CREDS;
+    },
+    credentials: async () => assert.fail('the metadata service is not asked'),
+    ...over,
+  });
+  return { ...parts, env };
+}
+
+test('environment: S3 gets the environment credentials and the metadata service is never asked', async () => {
+  const { calls, deps, env } = envFakes();
+  const r = await run(cfg(bridgeBlock({ down: true, agentsRepoDir: '/agents', credentials: 'environment' })), deps);
+  assert.equal(r.up.ok && r.down.ok, true);
+  assert.equal(env.calls, 1);
+  assert.equal(calls.credentials, 0);
+  assert.equal(calls.createS3.length, 1);
+  assert.deepEqual(calls.createS3[0].credentials, ENV_CREDS);
+});
+
+test('environment: a missing variable fails the S3 steps with NoEnvironment, the pull-only step runs, no metadata request', async () => {
+  const failing = () => { throw new AwsError('credentials', 0, 'NoEnvironment'); };
+  const { calls, deps } = envFakes({ environmentCredentials: failing });
+  const r = await run(cfg(bridgeBlock({ down: true, agentsRepoDir: '/agents', credentials: 'environment' })), deps);
+  assert.deepEqual(r.up, { ok: false, status: null, error: 'credentials failed: 0 NoEnvironment', at: AT });
+  assert.deepEqual(r.down, { ok: false, status: null, error: 'credentials failed: 0 NoEnvironment', at: AT });
+  assert.deepEqual([calls.credentials, calls.createS3.length, calls.up.length, calls.down.length], [0, 0, 0, 0]);
+  // up true, down false: up fails, the pull still runs without S3.
+  const b = envFakes({ environmentCredentials: failing });
+  const r2 = await run(cfg(bridgeBlock({ down: false, agentsRepoDir: '/agents', credentials: 'environment' })), b.deps);
+  assert.equal(r2.up.error, 'credentials failed: 0 NoEnvironment');
+  assert.equal(r2.down.ok, true);
+  assert.equal(b.calls.down[0].s3, null);
+  assert.equal(b.calls.credentials, 0);
+  // A pull-only block never asks for credentials at all.
+  const c = envFakes({ environmentCredentials: () => assert.fail('no credentials') });
+  const r3 = await run(cfg(bridgeBlock({ up: false, bucket: null, region: null, agentsRepoDir: '/agents', credentials: 'environment' })), c.deps);
+  assert.equal(r3.down.ok, true);
+});
+
+test('environment: the real reader reports BadEnvironment without any of the values', async () => {
+  const bad = 'SECRET IN VALUE';
+  const { deps } = envFakes({ environmentCredentials: undefined });
+  const saved = Object.fromEntries(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'].map((k) => [k, process.env[k]]));
+  try {
+    Object.assign(process.env, { AWS_ACCESS_KEY_ID: 'ASIAENVKEYID', AWS_SECRET_ACCESS_KEY: bad, AWS_SESSION_TOKEN: 'token-value' });
+    const r = await run(cfg(bridgeBlock({ credentials: 'environment' })), deps);
+    assert.equal(r.up.error, 'credentials failed: 0 BadEnvironment');
+    assert.ok(!JSON.stringify(r).includes('SECRET'));
+    delete process.env.AWS_SESSION_TOKEN;
+    assert.equal((await run(cfg(bridgeBlock({ credentials: 'environment' })), deps)).up.error, 'credentials failed: 0 NoEnvironment');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('instance: an environment that holds credentials is ignored', async () => {
+  for (const block of [bridgeBlock(), bridgeBlock({ credentials: 'instance' })]) {
+    const { calls, deps } = fakes({ environmentCredentials: () => assert.fail('the environment is not read') });
+    const r = await run(cfg(block), deps);
+    assert.equal(r.up.ok, true);
+    assert.equal(calls.credentials, 1);
+    assert.equal(calls.createS3[0].credentials.accessKeyId, 'EXAMPLEKEYID');
+  }
+});
+
+test('environment plus roleArn: the exchange starts from the environment credentials', async () => {
+  const { calls, deps, exchange, env } = envFakes();
+  const r = await run(cfg(bridgeBlock({ credentials: 'environment', roleArn: ROLE })), deps);
+  assert.equal(r.up.ok, true);
+  assert.equal(env.calls, 1);
+  assert.equal(calls.credentials, 0);
+  assert.equal(exchange.length, 1);
+  assert.deepEqual(exchange[0].credentials, ENV_CREDS);
+  assert.equal(calls.createS3[0].credentials, ROLE_CREDS);
+});
+
+test('a caller may give the bridge more than its 75-second default', async () => {
+  const { deps } = fakes({
+    runBridgeUp: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return upResult();
+    },
+  });
+  // Shorter than the step: the limit applies; longer: the step finishes.
+  assert.equal((await run(cfg(bridgeBlock()), deps, { limitMs: 30 })).up.error, 'time limit');
+  assert.equal((await run(cfg(bridgeBlock()), deps, { limitMs: 90_000 })).up.ok, true);
+  const seen = [];
+  const { deps: d2 } = fakes({ runBridgeUp: async (args) => { seen.push(args.deadline); return upResult(); } });
+  const before = Date.now();
+  await run(cfg(bridgeBlock()), d2, { limitMs: 600_000 });
+  assert.ok(seen[0] >= before + 599_000 && seen[0] <= Date.now() + 600_000);
+});

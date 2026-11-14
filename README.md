@@ -378,8 +378,9 @@ Add a `bridge` block to `~/.config/agent-memory/config.json`. A value of the wro
 | `agentsRepoDir` | absent | Absolute path of the agents clone, without control characters. It must not be the notes clone's folder, inside it or around it. Setting it is what turns the pull on; with `down` false the clone is only updated from its remote. |
 | `agentsRepoUrl` | absent | Only used by `setup.sh`, which clones this URL into `agentsRepoDir` when that folder does not exist (an existing folder is left alone). No spaces or control characters, not starting with `-`, at most 300 characters. `setup.sh` never prints it. Do not put a credential into it: Git stores the URL in the clone's configuration (`.git/config`), in plain text. Use the machine's Git credential setup (a credential helper or SSH keys) instead. `setup.sh` clones branch `main`, the only branch the bridge works on. |
 | `roleArn` | absent | ARN of a dedicated IAM role (`arn:aws:iam::<aws-account-id>:role/<name>`, with an optional path). When set, each run exchanges the instance role's credentials for this role's short-lived credentials (STS `AssumeRole`, session `agent-memory-bridge`, 15 minutes) and uses only those for S3. See "The dedicated role". On a pull-only block (no `up`, no `down`) it is valid and unused: there is no S3 request, so no exchange. A value that is not a role ARN makes the block invalid (`roleArn`). |
+| `credentials` | `instance` | Where the bridge takes its AWS credentials from: `instance` (the instance metadata service, as described below) or `environment` (the variables `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` of a GitHub Actions job; see "Run the bridge and the canary from GitHub Actions"). Any other value makes the block invalid (`credentials`). |
 
-There is no credential in the block. On each run the bridge asks the instance metadata service (IMDSv2) of the EC2 machine for the credentials of the instance role and signs its requests with them; nothing is stored, and each metadata request has a two-second limit. A machine without an instance role cannot run `up` or `down`. Whichever role signs the S3 requests (the dedicated bridge role, or the instance role without `roleArn`) needs what the API section lists for the bridge role: write and delete of objects under `mem/`; write of `index/mem.json`; read and write of `index/bridge.json`; read of objects under `agents/`; and listing the bucket with the prefixes `mem/` and `agents/`. The bucket policy grants nothing to a workstation, so the role that signs the requests needs these grants in its own policy; the dedicated role has them, and an instance role used without `roleArn` must be given them. It needs no more, and it never reads `mem/` or `index/mem.json` back. A machine that only pulls needs none of it. The workstation jobs build AWS host names under `amazonaws.com`, so regions whose services use another domain (the China regions) are not supported.
+There is no credential in the block. With the default `credentials: "instance"`, on each run the bridge asks the instance metadata service (IMDSv2) of the EC2 machine for the credentials of the instance role and signs its requests with them; nothing is stored, and each metadata request has a two-second limit. A machine without an instance role cannot run `up` or `down`. Whichever role signs the S3 requests (the dedicated bridge role, or the instance role without `roleArn`) needs what the API section lists for the bridge role: write and delete of objects under `mem/`; write of `index/mem.json`; read and write of `index/bridge.json`; read of objects under `agents/`; and listing the bucket with the prefixes `mem/` and `agents/`. The bucket policy grants nothing to a workstation, so the role that signs the requests needs these grants in its own policy; the dedicated role has them, and an instance role used without `roleArn` must be given them. It needs no more, and it never reads `mem/` or `index/mem.json` back. A machine that only pulls needs none of it. The workstation jobs build AWS host names under `amazonaws.com`, so regions whose services use another domain (the China regions) are not supported.
 
 **The dedicated role (recommended).** Without `roleArn` the bridge signs with the machine's instance role, and so can do everything that role is allowed, which on a workstation is usually much more than the grants above. With `roleArn` the bridge's requests are signed with the role's short-lived credentials, which can do nothing else. A deployment that is given the workstation role ARNs (`AGENT_MEMORY_WORKSTATION_ROLE_ARNS`) creates the role `agent-memory-<stage>-bridge` and publishes its ARN as the plain parameter `/agent-memory/<stage>/mcp/bridge/role-arn`; copy that value into `roleArn`. In the same account the instance role needs no change, because the dedicated role's trust policy names it (see the API section); an instance role of another account also needs `sts:AssumeRole` on the dedicated role in its own policy. The exchange happens once per run, inside the bridge's deadline. There is no fallback: when the exchange fails, every step that needs S3 fails with `sts failed: <HTTP status> <code>` (for example `sts failed: 403 AccessDenied`), and the instance credentials are never used for S3, not for a later step of the same run either. Credentials are held in memory only.
 
@@ -485,12 +486,13 @@ Add a `canary` block to `~/.config/agent-memory/config.json`. `stage` and `regio
 | `region` | required | The region of those parameters, for example `ap-northeast-1`. |
 | `schedule` | absent | A systemd calendar expression for the timer, under the same rule as the consolidation schedules: at most 80 characters from letters, digits, space and `* : , . / ~ -`, with at least one that is not a space (when `systemd-analyze` is installed, `setup.sh` also asks it). The example runs at a quarter past midnight, 06, 12 and 18 o'clock. Without a schedule no timer is written and the canary runs only by hand. |
 | `roleArn` | absent | ARN of a dedicated IAM role (`arn:aws:iam::<aws-account-id>:role/<name>`, with an optional path). When set, each run exchanges the instance role's credentials for this role's short-lived credentials (STS `AssumeRole`, session `agent-memory-canary`, 15 minutes) and uses only those for the Parameter Store reads. See "What the machine needs". A value that is not a role ARN makes the block invalid (`roleArn`). |
+| `credentials` | `instance` | Where the canary takes its AWS credentials from: `instance` (the instance metadata service) or `environment` (the variables of a GitHub Actions job; see "Run the bridge and the canary from GitHub Actions"). Any other value makes the block invalid (`credentials`). |
 
 After editing the configuration run `./setup.sh` again. With a `schedule` it writes `agent-memory-canary.service` and `agent-memory-canary.timer` to `~/.config/systemd/user/` and enables the timer (not with `--no-enable`); `--dry-run` lists them. The timer has `Persistent=true`, so a run missed while the machine was off is made up, and `RandomizedDelaySec=5min`. The service is stopped after 300 seconds.
 
 ### What the machine needs
 
-There is no credential in the block. Like the bridge, the canary asks the instance metadata service (IMDSv2) of the EC2 machine for the credentials of the instance role and signs its requests with them. The role must be allowed to read four parameters of the stage:
+There is no credential in the block. With the default `credentials: "instance"`, like the bridge, the canary asks the instance metadata service (IMDSv2) of the EC2 machine for the credentials of the instance role and signs its requests with them. The role must be allowed to read four parameters of the stage:
 
 - `ssm:GetParameter` on `/agent-memory/<stage>/mcp/gateway/url`, `/agent-memory/<stage>/mcp/cognito/token-endpoint`, `/agent-memory/<stage>/mcp/cognito/probe/client-id` and `/agent-memory/<stage>/mcp/cognito/probe/client-secret`.
 
@@ -527,6 +529,193 @@ It prints one `PASS`, `FAIL` or `SKIP` line per check, in the form of `verify-de
 ### Turn it off
 
 Remove the `canary` block, or only its `schedule`, and run `./setup.sh`: it disables the timer and removes both unit files. Without the block the session no longer reports the canary; with the block but without a `schedule`, a failed run recorded earlier is still reported until a run by hand passes. `canary.json` stays on disk and can be deleted.
+
+## Run the bridge and the canary from GitHub Actions (optional)
+
+The bridge and the canary can also run inside a GitHub Actions job. Why you might want that:
+
+- The notes already are in a Git repository, and a job can check that repository out, so the upload needs no workstation that keeps a clone, and no machine of yours needs any AWS access.
+- The job gets short-lived credentials by OpenID Connect (OIDC): GitHub signs a token for the job, and AWS exchanges it for the temporary credentials of the dedicated bridge or canary role (see the API section). Nothing is stored anywhere: not in the repository, not in a secret, not on a disk.
+
+How it works. The login step `aws-actions/configure-aws-credentials` exports the temporary credentials to the job as the standard variables `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`. A `bridge` or `canary` block with `"credentials": "environment"` reads exactly those three variables, and then, as usual, exchanges them for a dedicated role when `roleArn` is set. The rules are fixed:
+
+- **Only temporary credentials are accepted.** All three variables must be set and non-empty (the session token is what makes them temporary) and well-formed. Otherwise the step fails with `credentials failed: 0 NoEnvironment` (missing or empty) or `credentials failed: 0 BadEnvironment` (malformed). The error never holds a value.
+- **No fallback, in either direction.** With `environment` the instance metadata service is never asked, not even when the variables are missing. With `instance` (the default) the environment is never read. A self-hosted runner's own instance role is never used for a block that says `environment`.
+- Credentials are held in memory for the run, never written to a file and never printed.
+
+**`run.sh bridge`.** The bridge normally runs inside the periodic sync. A job has no sync, so `workstation/run.sh bridge [--time-limit <seconds>]` runs the configured steps once, on the clone that the job checked out:
+
+```
+agent-memory bridge up: {"ok":true,"status":"uploaded","error":null,"at":"<time>", ...}
+agent-memory bridge down: {"ok":true,"status":"mirrored","error":null,"at":"<time>", ...}
+```
+
+One line per configured step; a step that is not configured prints none. The JSON is the step's record, the same fixed words and numbers that `status.json` would hold; it never has a path, a key, a URL or text from a bucket or a remote. The exit code is 0 when every configured step is ok, 1 when one failed, 2 for a bad option (`--time-limit` takes an integer from 10 to 1800, default 300) or when no valid `bridge` block is configured (`agent-memory: no bridge is configured.`), and 75 when a sync holds the lock (`agent-memory: a sync is running; try again.`; it does not wait). It does not write `status.json` and does not change the notes clone; it still keeps the bridge's own state file `bridge.json` in the state folder. The canary needs no new mode: `run.sh canary`, with the block's `credentials` set to `environment`.
+
+**What to set up.** A deployment given `AGENT_MEMORY_GITHUB_SUBJECTS`, a comma-separated list of exact GitHub Actions subjects such as `repo:<owner>/<notes-repository>:ref:refs/heads/main`, creates the two dedicated roles `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary`, and they then trust jobs with exactly those subjects through the account's existing OIDC provider for `token.actions.githubusercontent.com` (see the API section). List the subject of every repository whose workflow assumes one of the roles: the notes repository (upload and canary) and the mirror repository (mirror). A repository that is not listed cannot assume the roles. Their ARNs are published as the parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and `/agent-memory/<stage>/mcp/canary/role-arn`. Put the values into repository secrets and variables, never into the workflow file. The samples below use these secrets: `AWS_ROLE_ARN` (the bridge role's ARN, in the notes and mirror repositories) and `AWS_CANARY_ROLE_ARN` (the canary role's ARN); and these variables: `AWS_REGION`, `AGENT_MEMORY_BUCKET` (the bridge jobs) and `AGENT_MEMORY_STAGE` (the canary). The job needs `permissions: id-token: write`, because the OIDC token is requested with it. Each job below uses a `concurrency` group without cancelling a running job, so that two runs never overlap, and writes its configuration file into the runner's temporary folder, then points `AGENT_MEMORY_CONFIG` at it.
+
+### Upload the notes (notes repository)
+
+```yaml
+name: agent-memory bridge up
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: agent-memory-bridge-up
+  cancel-in-progress: false
+jobs:
+  up:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AGENT_MEMORY_BUCKET: ${{ vars.AGENT_MEMORY_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5          # the notes repository, with its whole history
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/checkout@v5          # the kit, at a commit you have reviewed
+        with:
+          repository: <owner>/agent-memory-kit
+          ref: <commit>
+          path: kit
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Write the configuration
+        run: |
+          jq -n --arg repo "$GITHUB_WORKSPACE" --arg state "$RUNNER_TEMP/agent-memory-state" \
+            --arg bucket "$AGENT_MEMORY_BUCKET" --arg region "$AWS_REGION" \
+            '{enabled: true, host: "github-actions", repoDir: $repo, stateDir: $state,
+              bridge: {up: true, bucket: $bucket, region: $region, credentials: "environment"}}' \
+            > "$RUNNER_TEMP/agent-memory.json"
+      - name: Upload
+        env:
+          AGENT_MEMORY_CONFIG: ${{ runner.temp }}/agent-memory.json
+        run: bash kit/workstation/run.sh bridge
+```
+
+The job runs after each push to `main`. The bridge sends only a commit that is also `origin/main`, which is what a checkout of `main` gives, and it reads the history to work out what changed, hence `fetch-depth: 0`. The role named in `AWS_ROLE_ARN` is the dedicated bridge role, so the block has no `roleArn`: the credentials of the login step already are that role's.
+
+### Mirror the agent notes (mirror repository)
+
+The mirror job runs in the agents repository itself, which is the `agentsRepoDir`. Bridge down also wants a notes clone for its guards (the two clones must not overlap and must not share a remote), and in this job there is none; a placeholder fills the place: a folder made with `git init` whose `origin` is set to the notes repository's URL, so that the checks have two different remotes to compare. Nothing is fetched into it.
+
+```yaml
+name: agent-memory bridge down
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: write
+concurrency:
+  group: agent-memory-bridge-down
+  cancel-in-progress: false
+jobs:
+  down:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AGENT_MEMORY_BUCKET: ${{ vars.AGENT_MEMORY_BUCKET }}
+      NOTES_REPOSITORY_URL: https://github.com/<owner>/<notes-repository>.git
+    steps:
+      - uses: actions/checkout@v5          # this repository (the mirror), on main
+        with:
+          ref: main
+          fetch-depth: 0
+          path: mirror
+      - uses: actions/checkout@v5          # the kit, in a folder of its own: the mirror is cleaned
+        with:
+          repository: <owner>/agent-memory-kit
+          ref: <commit>
+          path: kit
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Write the configuration and the placeholder
+        run: |
+          git init --quiet "$RUNNER_TEMP/notes-placeholder"
+          git -C "$RUNNER_TEMP/notes-placeholder" remote add origin "$NOTES_REPOSITORY_URL"
+          jq -n --arg notes "$RUNNER_TEMP/notes-placeholder" --arg mirror "$GITHUB_WORKSPACE/mirror" \
+            --arg state "$RUNNER_TEMP/agent-memory-state" --arg bucket "$AGENT_MEMORY_BUCKET" --arg region "$AWS_REGION" \
+            '{enabled: true, host: "github-actions", repoDir: $notes, stateDir: $state,
+              bridge: {down: true, bucket: $bucket, region: $region, agentsRepoDir: $mirror, credentials: "environment"}}' \
+            > "$RUNNER_TEMP/agent-memory.json"
+      - name: Mirror
+        env:
+          AGENT_MEMORY_CONFIG: ${{ runner.temp }}/agent-memory.json
+        run: bash kit/workstation/run.sh bridge
+```
+
+Bridge down makes the clone equal to the remote's `main` and cleans it, so the kit sits next to the mirror and not inside it, and the mirror repository must carry the marker file `.agent-memory-mirror` (see "Down: the agents repository is a mirror"). The job pushes with the token that `actions/checkout` stored for `contents: write`. The configuration above satisfies what the bridge checks before it changes anything: the two folders do not overlap, `agentsRepoDir` is the top level of its clone and on `main`, both clones have an `origin`, and the two origins differ.
+
+### Run the canary
+
+This workflow lives in the notes repository, like the upload; its branch subject is the one listed for that repository.
+
+```yaml
+name: agent-memory canary
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: agent-memory-canary
+  cancel-in-progress: false
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AGENT_MEMORY_STAGE: ${{ vars.AGENT_MEMORY_STAGE }}
+    steps:
+      - uses: actions/checkout@v5          # the kit, at a commit you have reviewed
+        with:
+          repository: <owner>/agent-memory-kit
+          ref: <commit>
+          path: kit
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_CANARY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Write the configuration
+        run: |
+          jq -n --arg repo "$GITHUB_WORKSPACE" --arg state "$RUNNER_TEMP/agent-memory-state" \
+            --arg stage "$AGENT_MEMORY_STAGE" --arg region "$AWS_REGION" \
+            '{enabled: true, host: "github-actions", repoDir: $repo, stateDir: $state,
+              canary: {stage: $stage, region: $region, credentials: "environment"}}' \
+            > "$RUNNER_TEMP/agent-memory.json"
+      - name: Canary
+        env:
+          AGENT_MEMORY_CONFIG: ${{ runner.temp }}/agent-memory.json
+        run: bash kit/workstation/run.sh canary
+```
+
+The canary exits 1 when a check fails, so the job fails and GitHub tells you in the usual way; the result file in the runner's state folder is gone with the runner.
 
 ## Session messages
 
@@ -661,14 +850,16 @@ AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>
 
 The infrastructure program is not type-checked in CI, so run `npm run typecheck:infra` before each deploy.
 
-`AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of the ARNs of the workstation's own IAM roles (the instance role of the machine that runs the bridge and the canary). When it is set, the deployment creates two roles, `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary`, and nothing is added to the bucket policy, which holds only the TLS-only deny. Each role has a maximum session of one hour, no managed policy and one inline policy, and its trust policy names only the ARNs in the variable (each must be an IAM role ARN; a wildcard is refused). Every ARN in the variable must name a role that exists: IAM refuses a trust policy that names a role it cannot find, and the deployment stops at the creation of the role ("Invalid principal in policy").
+`AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of the ARNs of the workstation's own IAM roles (the instance role of the machine that runs the bridge and the canary). When it is set (or `AGENT_MEMORY_GITHUB_SUBJECTS` is), the deployment creates two roles, `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary`, and nothing is added to the bucket policy, which holds only the TLS-only deny. Each role has a maximum session of one hour, no managed policy and one inline policy, and its trust policy names only the ARNs in the variable (each must be an IAM role ARN; a wildcard is refused), plus the GitHub jobs of `AGENT_MEMORY_GITHUB_SUBJECTS` when that is set (below). Every ARN in the variable must name a role that exists: IAM refuses a trust policy that names a role it cannot find, and the deployment stops at the creation of the role ("Invalid principal in policy").
 
 - The bridge role may write and delete objects under `mem/`; write `index/mem.json`; read and write `index/bridge.json`; read objects under `agents/`; and list the bucket with the prefixes `mem/` and `agents/`. It cannot write or delete anything else, including `agents/` and `index/agents.json`, which only the API writes.
 - The canary role may read (`ssm:GetParameter`) exactly four parameters of the stage: `gateway/url`, `cognito/token-endpoint`, `cognito/probe/client-id` and `cognito/probe/client-secret`, under `/agent-memory/<stage>/mcp/`. It cannot read the hub client's secret. The default key of Parameter Store lets every principal of the account decrypt, so this permission is the whole grant.
 - The ARNs are published as the plain parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and `/agent-memory/<stage>/mcp/canary/role-arn`. Copy them into the `roleArn` of the bridge and canary blocks.
 - Within one account, a role named directly as the principal of a trust policy can assume the role without any identity policy of its own, so the workstation's role needs no change; the exception is an explicit deny, a permissions boundary or an organization policy that forbids it.
 
-Without the variable the deployment creates neither role, no role-ARN parameter and no grant. Pass the list at deploy time in the environment of the deploy command, for example `AGENT_MEMORY_WORKSTATION_ROLE_ARNS=arn:aws:iam::<aws-account-id>:role/<role-name> AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>`; separate several ARNs with commas. **Every later deploy of the stage must pass the variable again**: a deploy without it deletes the two roles, and a bridge or canary configured with `roleArn` then fails with `sts failed: 403 AccessDenied` until the next deploy that has it. IAM records a trusted role by its internal ID, not by its name. If a workstation role is deleted and created again under the same name, the two roles no longer trust it, and the exchange fails with `sts failed: 403 AccessDenied`. To repair it, run `npx sst refresh --stage <stage>` and then deploy again with the variable, so that the trust policies are written anew. The names of the two roles carry the stage and not the region, and IAM role names are shared by the whole account: deploy a stage name in one region per account. A stage that an earlier release deployed with the variable gave the workstation role its S3 grants through the bucket policy. After a deployment of this release a bridge without `roleArn` is refused (`list failed: 403 AccessDenied` or similar) unless that role has its own grants, so set `roleArn` in the `bridge` and `canary` blocks when you deploy. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
+`AGENT_MEMORY_GITHUB_SUBJECTS` optionally holds a comma-separated list of exact GitHub Actions subjects, so that the two roles also trust GitHub Actions jobs (see "Run the bridge and the canary from GitHub Actions (optional)"). A subject is the `sub` claim of the job's OIDC token, and here it names one repository and one branch: `repo:<owner>/<repository>:ref:refs/heads/<branch>` (for example `repo:<owner>/<repository>:ref:refs/heads/main`). Every other form is refused: a wildcard, a pull request, a tag and a GitHub environment (a job that names an environment gets an environment subject from any branch unless the environment itself restricts branches, so that subject is not bound to a branch). A branch name may use only letters, digits, `.`, `_`, `-` and `/`. Subjects follow GitHub's default subject format; a repository or organisation that customised the subject claim sends another format and is refused. A subject is compared exactly, including upper and lower case. **A subject binds a repository and a branch, not a workflow**: every workflow on that branch that asks for `id-token: write` can assume the roles, whatever triggers it. **Every listed subject may assume both roles** (the bridge role and the canary role), so list only repositories you would trust with both. **A subject names a repository by `<owner>/<name>`, not by an ID.** After the repository or its owner is renamed, transferred or deleted, whoever registers the old `<owner>/<name>` gets tokens with that subject and can assume both roles. Remove or replace the subject and deploy again right after a rename, a transfer or a deletion, before the old name is free for others where possible; this also restores a job that a rename locked out. The trust policy gets one more statement, `sts:AssumeRoleWithWebIdentity` for the account's OIDC provider, with the conditions `token.actions.githubusercontent.com:aud` equal to `sts.amazonaws.com` and `token.actions.githubusercontent.com:sub` equal to one of the subjects. The deployment names the provider and does not create it. **The account must already have the OIDC provider for `token.actions.githubusercontent.com`**; without it no job can assume the roles, and the deployment may be refused when it creates them. To check, run `aws iam list-open-id-connect-providers`: one ARN must end in `oidc-provider/token.actions.githubusercontent.com`. Either variable alone creates the two roles and the two parameters; with both, each role trusts both kinds of principal. With only the role ARNs the deployment is the same as before. Every later deploy of the stage must pass every variable that is in use. A deploy without both variables deletes the two roles; a deploy that passes the role ARNs but not the subjects removes the GitHub trust without a warning, and the jobs then fail to assume the roles.
+
+Without either variable the deployment creates neither role, no role-ARN parameter and no grant. Pass the list at deploy time in the environment of the deploy command, for example `AGENT_MEMORY_WORKSTATION_ROLE_ARNS=arn:aws:iam::<aws-account-id>:role/<role-name> AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>`; separate several ARNs with commas. **Every later deploy of the stage must pass the variable again**: a deploy without it (and without the subjects) deletes the two roles, and a bridge or canary configured with `roleArn` then fails with `sts failed: 403 AccessDenied` until the next deploy that has it. IAM records a trusted role by its internal ID, not by its name. If a workstation role is deleted and created again under the same name, the two roles no longer trust it, and the exchange fails with `sts failed: 403 AccessDenied`. To repair it, run `npx sst refresh --stage <stage>` and then deploy again with the variable, so that the trust policies are written anew. The names of the two roles carry the stage and not the region, and IAM role names are shared by the whole account: deploy a stage name in one region per account. A stage that an earlier release deployed with the variable gave the workstation role its S3 grants through the bucket policy. After a deployment of this release a bridge without `roleArn` is refused (`list failed: 403 AccessDenied` or similar) unless that role has its own grants, so set `roleArn` in the `bridge` and `canary` blocks when you deploy. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
 
 The deployment creates:
 
@@ -676,7 +867,7 @@ The deployment creates:
 - a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes; read-only on `prod`), and two scopes, `agent-memory/read` and `agent-memory/write`;
 - an HTTP API with one route per operation and a function behind it;
 - SSM parameters under `/agent-memory/<stage>/mcp/`: `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string) and `bucket/name`;
-- with `AGENT_MEMORY_WORKSTATION_ROLE_ARNS`, the two roles `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary` and the two parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and `/agent-memory/<stage>/mcp/canary/role-arn`.
+- with `AGENT_MEMORY_WORKSTATION_ROLE_ARNS` or `AGENT_MEMORY_GITHUB_SUBJECTS`, the two roles `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary` and the two parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and `/agent-memory/<stage>/mcp/canary/role-arn`.
 
 ### Check a deployment
 

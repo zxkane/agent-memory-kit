@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AwsError, assumeRole, imdsCredentials, signRequest, ssmGetParameter } from '../lib/aws.mjs';
+import { AwsError, assumeRole, environmentCredentials, imdsCredentials, signRequest, ssmGetParameter } from '../lib/aws.mjs';
 
 const creds = { accessKeyId: 'EXAMPLEKEYID', secretAccessKey: 'example-signing-value' };
 const credsToken = { ...creds, sessionToken: 'example-session-value' };
@@ -407,4 +407,68 @@ test('assumeRole: a session token of 5000 characters is accepted, one of 16385 i
     assumeRole({ ...STS_OPTS, fetchImpl: async () => new Response(answer('a'.repeat(16385)), { status: 200 }) }),
     { message: 'sts failed: 200 BadAnswer' },
   );
+});
+
+// ---- environmentCredentials ----
+
+const ENV_OK = {
+  AWS_ACCESS_KEY_ID: 'ASIAEXAMPLEKEYID', AWS_SECRET_ACCESS_KEY: 'example/signing+value=', AWS_SESSION_TOKEN: 'example/session+value=_.-',
+};
+
+test('environmentCredentials returns the three values, synchronously', () => {
+  assert.deepEqual(environmentCredentials(ENV_OK), {
+    accessKeyId: 'ASIAEXAMPLEKEYID', secretAccessKey: 'example/signing+value=', sessionToken: 'example/session+value=_.-',
+  });
+});
+
+test('environmentCredentials: a missing or empty variable is NoEnvironment, with no session token too', () => {
+  for (const name of Object.keys(ENV_OK)) {
+    for (const value of [undefined, '']) {
+      const env = { ...ENV_OK, [name]: value };
+      assert.throws(() => environmentCredentials(env), (err) => {
+        assert.ok(err instanceof AwsError);
+        assert.deepEqual([err.operation, err.status, err.code], ['credentials', 0, 'NoEnvironment']);
+        assert.equal(err.message, 'credentials failed: 0 NoEnvironment');
+        return true;
+      }, `${name}=${JSON.stringify(value)}`);
+    }
+  }
+  assert.throws(() => environmentCredentials({}), /credentials failed: 0 NoEnvironment/);
+  // Long-lived credentials (no session token) are never accepted.
+  const { AWS_SESSION_TOKEN: _drop, ...longLived } = ENV_OK;
+  assert.throws(() => environmentCredentials(longLived), /credentials failed: 0 NoEnvironment/);
+});
+
+test('environmentCredentials: a malformed value is BadEnvironment and the error holds nothing of any value', () => {
+  const bad = 'bad value with spaces and \u00e9 SECRET-IN-VALUE';
+  const cases = [
+    { AWS_ACCESS_KEY_ID: bad }, { AWS_ACCESS_KEY_ID: 'AKIA-EXAMPLE' }, { AWS_ACCESS_KEY_ID: 'A'.repeat(129) },
+    { AWS_SECRET_ACCESS_KEY: bad }, { AWS_SECRET_ACCESS_KEY: 'a\nb' }, { AWS_SECRET_ACCESS_KEY: 'a'.repeat(16385) },
+    { AWS_SESSION_TOKEN: bad }, { AWS_SESSION_TOKEN: 'a\r\nb' }, { AWS_SESSION_TOKEN: 'a'.repeat(16385) },
+  ];
+  for (const over of cases) {
+    const env = { ...ENV_OK, ...over };
+    assert.throws(() => environmentCredentials(env), (err) => {
+      assert.equal(err.message, 'credentials failed: 0 BadEnvironment');
+      assert.equal(err.code, 'BadEnvironment');
+      for (const value of Object.values(env)) assert.ok(!JSON.stringify(err).includes(value) && !err.message.includes(value) && !String(err.stack).includes(value));
+      return true;
+    }, JSON.stringify(Object.keys(over)));
+  }
+});
+
+test('environmentCredentials reads process.env by default and no request is made', () => {
+  const saved = Object.fromEntries(Object.keys(ENV_OK).map((k) => [k, process.env[k]]));
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = () => assert.fail('no request');
+  try {
+    Object.assign(process.env, ENV_OK);
+    assert.equal(environmentCredentials().accessKeyId, 'ASIAEXAMPLEKEYID');
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });
