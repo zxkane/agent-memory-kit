@@ -4,11 +4,13 @@
 //   agent-memory bridge up: <JSON>
 //   agent-memory bridge down: <JSON>
 // The JSON is the step's record as bridge.mjs builds it (fixed words, numbers and a time; never a
-// path, a key, a URL or text from the bucket or a remote). Nothing is written to status.json, and the
-// notes clone is not touched: bridge up reads it, bridge down only reads its origin URL. The step's
-// own state file (<stateDir>/bridge.json) is written as in a sync run.
+// path, a key, a URL or text from the bucket or a remote). Nothing is written to status.json. The
+// notes clone gets no new branch, index entry or work-tree file: bridge up reads it and may run
+// `git fetch` there (which adds objects and writes FETCH_HEAD); bridge down only reads its origin
+// URL. The step's own state file (<stateDir>/bridge.json) is written as in a sync run.
 //
-// Exit codes: 0 every configured step ok; 1 a step failed; 2 no bridge configured or bad usage
+// Exit codes: 0 every configured step ok; 1 a step failed; 2 no bridge configured (no block, or a
+// block that configures no step) or bad usage
 // (`run.sh` adds 75 when a sync holds the lock).
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -43,7 +45,13 @@ export async function bridgeRun({ argv, config, deps = {}, now = new Date() }) {
   let result;
   try {
     // Loaded only here, so that a machine without a bridge block never loads the bridge modules.
-    const run = deps.runBridge ?? (await import('./lib/bridge.mjs')).runBridge;
+    const bridgeModule = await import('./lib/bridge.mjs');
+    const want = bridgeModule.configuredSteps(config.bridge);
+    if (!want.up && !want.down) {
+      out('agent-memory: no bridge is configured.\n');
+      return 2;
+    }
+    const run = deps.runBridge ?? bridgeModule.runBridge;
     result = await run({ config, syncResult: { ok: true }, now, limitMs: seconds * 1000, deps: deps.bridgeDeps });
   } catch {
     err('agent-memory bridge could not run\n');

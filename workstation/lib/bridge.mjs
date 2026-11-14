@@ -17,7 +17,8 @@ const MAX_ERROR_CHARS = 200;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 
 // The unit gives a run 120 s (TimeoutStartSec). One deadline covers the bridge (the sync has its own limits): 110 s
-// after the process started, and at most 75 s after the bridge began. Everything that can block for
+// after the process started, and at most 75 s after the bridge began when it runs after a sync
+// (`run.sh bridge` passes its own, longer limit and has no process deadline). Everything that can block for
 // long is cut at it: S3 requests (the client's signal is aborted then) and the Git network commands
 // of both steps (each gets min(its own limit, time left) and is not started with less than 2 s left).
 // What can still run after the deadline is local work (Git on a local clone, writing status.json),

@@ -6,6 +6,7 @@ import {
   canaryRolePolicy,
   functionPolicy,
   logsPolicy,
+  isGithubSubject,
   isRoleArn,
   jobsTrustPolicy,
   trustPolicy,
@@ -277,6 +278,22 @@ describe('jobsTrustPolicy', () => {
 
   it('still validates the role ARNs', () => {
     assert.throws(() => jobsTrustPolicy({ roleArns: ['*'], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER }), /role/i);
+  });
+});
+
+describe('isGithubSubject', () => {
+  it('accepts exactly one branch of one repository and nothing broader', () => {
+    assert.equal(isGithubSubject('repo:example-owner/example-repo:ref:refs/heads/main'), true);
+    assert.equal(isGithubSubject('repo:example-owner/example-repo:ref:refs/heads/release/1.0'), true);
+    for (const bad of [
+      '',
+      'repo:example-owner/example-repo:environment:production',
+      'repo:example-owner/*:ref:refs/heads/main',
+      'repo:example-owner/example-repo:ref:refs/heads/*',
+      'repo:example-owner/example-repo:pull_request',
+    ]) {
+      assert.equal(isGithubSubject(bad), false, bad);
+    }
   });
 });
 

@@ -3,15 +3,9 @@ import { bucket, parameterResources } from "./api.ts";
 import { mode } from "./mode.ts";
 import { bridgeRolePolicy, canaryRolePolicy, jobsTrustPolicy } from "./policies.ts";
 
-const roleArns = (process.env.AGENT_MEMORY_WORKSTATION_ROLE_ARNS ?? "")
-  .split(",")
-  .map((arn) => arn.trim())
-  .filter((arn) => arn.length > 0);
-
-const githubSubjects = (process.env.AGENT_MEMORY_GITHUB_SUBJECTS ?? "")
-  .split(",")
-  .map((subject) => subject.trim())
-  .filter((subject) => subject.length > 0);
+// Read and checked in mode.ts, before any resource is declared.
+const roleArns = mode.workstationRoleArns;
+const githubSubjects = mode.githubSubjects;
 
 // Without workstation role ARNs and without GitHub subjects nothing here exists: no role, no
 // parameter, no grant. Each role holds one inline policy and no managed policy; only the given

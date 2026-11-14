@@ -122,7 +122,9 @@ describe('infrastructure source', () => {
     assert.equal((body.match(/newaws\.iam\.RolePolicy\(/g) ?? []).length, 2);
     assert.equal((src.match(/newaws\.ssm\.Parameter\(/g) ?? []).length, 2);
     assert.equal((body.match(/newaws\.ssm\.Parameter\(/g) ?? []).length, 2);
-    assert.match(src, /process\.env\.AGENT_MEMORY_WORKSTATION_ROLE_ARNS/);
+    assert.doesNotMatch(src, /process\.env/);
+    assert.match(src, /mode\.workstationRoleArns/);
+    assert.match(src, /mode\.githubSubjects/);
     assert.equal((body.match(/maxSessionDuration:3600/g) ?? []).length, 2);
     assert.equal((body.match(/assumeRolePolicy:trustDocument/g) ?? []).length, 2);
     assert.match(body, /name:`\$\{\$app\.name\}-\$\{\$app\.stage\}-bridge`/);
@@ -130,7 +132,6 @@ describe('infrastructure source', () => {
     assert.match(body, /prefix=`\/\$\{\$app\.name\}\/\$\{\$app\.stage\}\/mcp`/);
     assert.match(body, /name:`\$\{prefix\}\/bridge\/role-arn`/);
     assert.match(body, /name:`\$\{prefix\}\/canary\/role-arn`/);
-    assert.match(src, /process\.env\.AGENT_MEMORY_GITHUB_SUBJECTS/);
     assert.match(src, /jobsTrustPolicy\(/);
     assert.doesNotMatch(src, /workstationTrustPolicy/);
     assert.doesNotMatch(src, /OpenIdConnectProvider/);
@@ -171,10 +172,12 @@ describe('infrastructure source', () => {
   });
 
   describe('deployment switches', () => {
-    it('parses the one variable in mode.ts only, before any resource', () => {
-      assert.match(read('infra/mode.ts'), /AGENT_MEMORY_INVOKER_ROLE_ARNS/);
-      for (const f of files.filter((f) => f !== 'infra/mode.ts')) {
-        assert.doesNotMatch(read(f), /process\.env\.AGENT_MEMORY_INVOKER_ROLE_ARNS/, f);
+    it('parses the three variables in mode.ts only, before any resource', () => {
+      for (const name of ['AGENT_MEMORY_INVOKER_ROLE_ARNS', 'AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'AGENT_MEMORY_GITHUB_SUBJECTS']) {
+        assert.match(read('infra/mode.ts'), new RegExp(name));
+        for (const f of files.filter((f) => f !== 'infra/mode.ts')) {
+          assert.doesNotMatch(read(f), new RegExp(`process\\.env\\.${name}`), f);
+        }
       }
       const run = squash('sst.config.ts');
       const modeAt = run.indexOf('import("./infra/mode.ts")');
@@ -272,8 +275,11 @@ describe('infrastructure source', () => {
       assert.match(src, /bucketName:bucket\.bucket/);
       assert.match(src, /outputs\.functionArn=fn\.arn/);
       assert.match(src, /if\(mode\.direct\)\{outputs\.functionArn/);
-      assert.match(src, /apiUrl/);
-      assert.match(src, /tokenEndpoint/);
+      const http = src.match(/if\(!mode\.direct\)\{(.*?)\}/);
+      assert.ok(http, 'branch on !mode.direct');
+      assert.match(http[1] as string, /outputs\.apiUrl=/);
+      assert.match(http[1] as string, /outputs\.tokenEndpoint=/);
+      assert.doesNotMatch(src.replace(http[1] as string, ''), /apiUrl|tokenEndpoint/);
     });
   });
 });

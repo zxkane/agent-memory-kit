@@ -19,8 +19,9 @@ new aws.s3.BucketServerSideEncryptionConfiguration("MemoryBucketEncryption", {
   rules: [{ applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" } }],
 });
 
-// Not versioned. The notes under mem/ are a copy of the notes repository and the agents' notes are
-// mirrored into a second repository, so a replaced note is recoverable from there. A bucket that an
+// Not versioned. The notes under mem/ are a copy of the notes repository and can be uploaded again.
+// The agents' notes are copied into a second repository only when the bridge's down step runs, and
+// only what a run has copied, so a replaced agent note may have no other copy. A bucket that an
 // earlier release versioned keeps its versioning in the suspended state (S3 cannot turn it off
 // again); this rule then removes the old versions after one day, and the delete markers they left.
 new aws.s3.BucketLifecycleConfiguration("MemoryBucketLifecycle", {

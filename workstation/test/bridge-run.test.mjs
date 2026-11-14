@@ -98,6 +98,11 @@ test('no bridge block (or no config): the fixed line and exit 2, nothing runs', 
   }
 });
 
+test('a valid block that configures no step is treated like a missing block: the fixed line, exit 2, nothing runs', async () => {
+  const r = await drive([], { up: null, down: null }, { stateDir: '/state', repoDir: '/notes', bridge: block({ up: false, down: false, agentsRepoDir: null }) });
+  assert.deepEqual([r.code, r.out, r.err, r.seen.length], [2, 'agent-memory: no bridge is configured.\n', '', 0]);
+});
+
 test('a bridge that throws is "could not run", exit 1, and nothing of the error is printed', async () => {
   const out = [];
   const err = [];

@@ -146,6 +146,11 @@ export function canaryRolePolicy(parameterArns: string[]): PolicyDocument {
 }
 
 const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:ref:refs\/heads\/[A-Za-z0-9._\/-]+$/;
+/** True for a GitHub Actions subject of exactly one branch of one repository. */
+export function isGithubSubject(value: string): boolean {
+  return SUBJECT_RE.test(value);
+}
+
 const GITHUB_PROVIDER_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/;
 const GITHUB_OIDC = 'token.actions.githubusercontent.com';
 
@@ -166,7 +171,7 @@ export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: str
     }
   }
   for (const subject of githubSubjects) {
-    if (!SUBJECT_RE.test(subject)) {
+    if (!isGithubSubject(subject)) {
       throw new Error('Each GitHub subject must be repo:<owner>/<repository>:ref:refs/heads/<branch>.');
     }
   }

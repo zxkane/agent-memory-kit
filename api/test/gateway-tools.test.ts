@@ -38,26 +38,40 @@ test('each description is the summary followed by the description of the operati
   }
 });
 
-test('each input schema matches the document: properties, required, enum and bounds', () => {
+test('each input schema matches the document: properties, required and types', () => {
   for (const tool of tools) {
     const { properties, required } = documented(operation(tool.name));
     const schema = tool.inputSchema;
     assert.equal(schema.type, 'object');
-    assert.equal(schema.additionalProperties, false);
     assert.deepEqual(Object.keys(schema.properties), Object.keys(properties), tool.name);
     assert.deepEqual([...schema.required].sort(), [...required].sort(), tool.name);
     for (const [name, want] of Object.entries<any>(properties)) {
-      const have = schema.properties[name];
-      assert.equal(have.type, want.type, `${tool.name} ${name} type`);
-      assert.equal(have.description, want.description, `${tool.name} ${name} description`);
-      assert.deepEqual(have.enum, want.enum, `${tool.name} ${name} enum`);
-      assert.equal(have.minimum, want.minimum, `${tool.name} ${name} minimum`);
-      assert.equal(have.maximum, want.maximum, `${tool.name} ${name} maximum`);
-      assert.deepEqual(
-        Object.keys(have).filter((k) => !['type', 'description', 'enum', 'minimum', 'maximum'].includes(k)),
-        [],
-        `${tool.name} ${name} has no other keys`,
-      );
+      assert.equal(schema.properties[name].type, want.type, `${tool.name} ${name} type`);
+    }
+  }
+});
+
+// The gateway accepts only these keys in a schema definition of a tool.
+const ALLOWED_KEYS = ['type', 'description', 'properties', 'required'];
+
+function walk(node: any, where: string) {
+  assert.deepEqual(Object.keys(node).filter((k) => !ALLOWED_KEYS.includes(k)), [], `${where} uses only keys the gateway accepts`);
+  for (const [name, child] of Object.entries<any>(node.properties ?? {})) walk(child, `${where}.${name}`);
+}
+
+test('every schema object uses only the keys type, description, properties and required', () => {
+  for (const tool of tools) walk(tool.inputSchema, tool.name);
+});
+
+test('the description of a property states each allowed value and each bound the document gives', () => {
+  for (const tool of tools) {
+    const { properties } = documented(operation(tool.name));
+    for (const [name, want] of Object.entries<any>(properties)) {
+      const text: string = tool.inputSchema.properties[name].description;
+      for (const value of want.enum ?? []) assert.ok(text.includes(String(value)), `${tool.name} ${name} mentions ${value}`);
+      for (const bound of [want.minimum, want.maximum]) {
+        if (bound !== undefined) assert.ok(text.includes(String(bound)), `${tool.name} ${name} mentions ${bound}`);
+      }
     }
   }
 });
