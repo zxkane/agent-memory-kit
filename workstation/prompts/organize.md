@@ -12,7 +12,7 @@ Leave notes/ in this shape:
   metadata:
     type: <user | feedback | project | reference>
   ---
-  The name need not equal the file name. Leave a frontmatter block that has a name, a description and a type alone: repair only what is missing or broken, and a description that no longer matches its note. Do not rewrite a note only to restyle its frontmatter.
+  The name need not equal the file name. Leave frontmatter that is complete and accurate alone: repair only what is missing or broken, and a description that no longer matches its note counts as broken. Do not rewrite a note only to restyle its frontmatter.
 - Notes that say the same thing, and a note wholly contained in another, are merged into the better-named note, keeping every fact and every date. Notes on different topics stay separate and link to each other with [[name]].
 - A .conflict- file is merged into the note it belongs to in the same way, then retired.
 - Where two notes, or two lines of one note, cannot both be true: when one is plainly the later correction, keep the current value and say what it replaced, with dates; otherwise keep both and mark it "CONFLICT: <source, date> says …; <source, date> says …". Do not guess which is right.

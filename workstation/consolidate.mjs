@@ -446,10 +446,15 @@ function stepApply(config, rest) {
     const digest = outcome === 'no-change' || outcome === 'rejected' ? folderDigest(pairs[0].liveDir) : null;
     // For a repair run: a reference copy of the scope's notes as the snapshot took them, from the
     // live folder, which this evaluation has just found unchanged. Never evaluated or applied.
+    // Whatever the model left at original/ (a file, a link, a folder) is removed first, without
+    // following a link; the result says that this step made the copy.
+    let original = false;
     if (outcome === 'rejected' && a['--keep-original'] === true) {
+      rmSync(join(work, ORIGINAL), { recursive: true, force: true });
       snapshot([{ label: 'original', liveDir: pairs[0].liveDir, workDir: join(work, ORIGINAL) }]);
+      original = true;
     }
-    out({ ...result, outcome, report: withReport ? report() : null, digest });
+    out({ ...result, outcome, report: withReport ? report() : null, digest, original });
     return;
   }
 
@@ -867,7 +872,8 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     const mayRepair = first.stopReason === 'completed' && left >= REPAIR_MIN_USD;
     const res = await applyOnce(first, { keepOriginal: mayRepair });
     const original = join(work, ORIGINAL);
-    if (res.outcome !== 'rejected' || !mayRepair || !lstatOrNull(original)?.isDirectory()) {
+    // Only a reference copy that the apply step made counts, never a folder the model created.
+    if (res.outcome !== 'rejected' || !mayRepair || res.original !== true) {
       // Nothing to apply from a model that did not complete is a failed run, not "nothing to do":
       // `no-change` always means the model completed and found nothing.
       if (res.outcome === 'no-change' && first.stopReason !== 'completed') {
@@ -892,7 +898,11 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
     if (await signalsHandled()) return { outcome: 'aborted', model: infoOf(both), work, ...repair };
     // A repair run that did not complete leaves the first check's result, with its stop reason.
     if (second.stopReason !== 'completed') return { ...res, model: infoOf(both), ...repair };
-    return { ...(await applyOnce(both, { repaired: problems.length })), ...repair };
+    const res2 = await applyOnce(both, { repaired: problems.length });
+    // Nothing to apply after a repair run means it undid the first result: that result is still
+    // rejected, with the first check's violations (so Extract keeps its window).
+    if (res2.outcome === 'no-change') return { ...res2, outcome: 'rejected', errors: problems, ...repair };
+    return { ...res2, ...repair };
   } finally {
     if (!opts.keep) removeTree(work);
   }
@@ -948,7 +958,10 @@ function record(config, state, { kind, scope, res, started, dryRun }) {
   let advance = (res.outcome === 'applied' && (kind === 'organize' || completed)) || res.outcome === 'no-change';
   if (kind === 'extract') advance ||= res.outcome === 'no-session';
   else advance ||= res.outcome === 'rejected' && completed;
-  if (modelStarted(res) && !dryRun) entry[kind === 'extract' ? 'lastExtractTried' : 'lastOrganizeTried'] = started.toISOString();
+  // A repair run follows a first run that started the model, however the repair run ended.
+  if ((modelStarted(res) || res.repairs > 0) && !dryRun) {
+    entry[kind === 'extract' ? 'lastExtractTried' : 'lastOrganizeTried'] = started.toISOString();
+  }
   if (advance && !dryRun) {
     if (kind === 'extract') {
       entry.lastExtract = started.toISOString();

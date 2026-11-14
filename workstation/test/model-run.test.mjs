@@ -537,7 +537,7 @@ test('T1: the organize prompt leaves frontmatter alone, never translates, and gi
   const off = renderPrompt('organize', { hasGlobal: false });
   for (const text of [on, off]) {
     assert.ok(text.includes('  name: <a short name for the note>'));
-    assert.ok(text.includes('The name need not equal the file name. Leave a frontmatter block that has a name, a description and a type alone: repair only what is missing or broken, and a description that no longer matches its note. Do not rewrite a note only to restyle its frontmatter.'));
+    assert.ok(text.includes('The name need not equal the file name. Leave frontmatter that is complete and accurate alone: repair only what is missing or broken, and a description that no longer matches its note counts as broken. Do not rewrite a note only to restyle its frontmatter.'));
     assert.ok(text.includes('In [[…]] links and in MOVED TO lines, a note is named by its file name without .md, not by the name in its frontmatter.'));
     assert.ok(text.includes('Keep every fact in the language it is written in; never translate it, also not when you merge it into a note written in another language. A note may hold more than one language.'));
     assert.ok(text.includes('Work in this order, most important first, so that a run that stops early has finished the earlier items: first, when the index is over its limit, bring it within the limit; then merge .conflict- copies and duplicate notes;'));

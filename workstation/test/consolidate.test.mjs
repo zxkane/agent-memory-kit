@@ -23,7 +23,7 @@ const DAY_MS = 24 * 3600 * 1000;
 // A stand-in for the model client. It logs how it was called (and the digest it was given), then
 // edits files in its working directory as the test's instruction file says for its scope.
 const FAKE = `#!${process.execPath}
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { basename, dirname, join } from 'node:path';
 const cwd = process.cwd();
@@ -38,7 +38,7 @@ try {
   earlier = readFileSync(process.env.FAKE_CALLS, 'utf8').split('\\n').filter(Boolean).filter((l) => JSON.parse(l).scope === scope).length;
 } catch {}
 const original = join(cwd, basename(cwd) === 'notes' ? '../original' : 'original');
-appendFileSync(process.env.FAKE_CALLS, JSON.stringify({ scope, cwd, args, digest, pid: process.pid, originalSeen: existsSync(original) }) + '\\n');
+appendFileSync(process.env.FAKE_CALLS, JSON.stringify({ scope, cwd, args, digest, pid: process.pid, originalSeen: existsSync(original), originalFiles: existsSync(original) ? readdirSync(original).sort() : [] }) + '\\n');
 const all = JSON.parse(readFileSync(process.env.FAKE_INSTRUCTIONS, 'utf8'));
 const first = all[scope] ?? all['*'] ?? {};
 const ins = earlier > 0 && first.second ? first.second : first;
@@ -1807,6 +1807,8 @@ test('T2: a signal during the repair run ends the run as aborted; nothing is app
   assert.equal(f.head(), head);
   assert.ok(existsSync(join(f.repo, 'projects/p/b.md')));
   assert.deepEqual(readdirSync(f.workRoot()), []);
+  // m4: the first run started the model, so the scope counts as tried.
+  assert.ok(!Number.isNaN(Date.parse(f.readState().projects.p.lastOrganizeTried)));
 });
 
 test('T2: a dry run repairs the same way and applies nothing', (t) => {
@@ -1841,4 +1843,72 @@ test('T2: Extract gets the same repair run, with original/ as an extra folder', 
   assert.deepEqual(dirs.map((d) => basename(d)).sort(), ['input', 'original']);
   assert.ok(f.remoteFiles().includes('projects/p/port.md'));
   assert.equal(readFileSync(join(f.repo, 'projects/p/a.md'), 'utf8'), note('a', 'Old note', 'An old fact.'));
+});
+
+// Fix round 1 of the tuning: a repair that reverts, original/ made by the model.
+test('I1: an Extract repair that undoes the first result is rejected and keeps the window', (t) => {
+  const f = extractFixture(t);
+  f.instruct({ p: { writes: { 'a.md': '' }, second: { copies: { '../original/a.md': 'a.md' } } } });
+  const head = f.head();
+  const r = f.run('extract', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract p: rejected, nothing applied \(1 rule violation\(s\)\), USD 0\.50, stopped: completed, one repair run \(1 problem\(s\) found first\)$/m);
+  assert.match(r.stdout, /^ {2}- notes\/a\.md: a note may not be emptied; retire it instead$/m);
+  assert.equal(f.head(), head);
+  const p = f.readState().projects.p;
+  assert.equal(p.lastExtract, undefined);
+  assert.ok(!Number.isNaN(Date.parse(p.lastExtractTried)));
+  assert.equal(p.lastOutcome.outcome, 'rejected');
+  assert.equal(p.lastOutcome.repairs, 1);
+});
+
+test('I1: an Organize repair that undoes the first result is rejected and records the digest', (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  f.instruct({
+    p: {
+      ...lossyFirst(),
+      second: { copies: { 'original/a.md': 'notes/a.md', 'original/b.md': 'notes/b.md' }, writes: { 'notes/MEMORY.md': index('a.md', 'b.md') } },
+    },
+  });
+  const head = f.head();
+  const r = f.run('organize');
+  assert.match(r.stdout, /^organize p: rejected, nothing applied \(1 rule violation\(s\)\), USD 0\.50, stopped: completed, one repair run \(1 problem\(s\) found first\)$/m);
+  assert.match(r.stdout, LOSS_LINE);
+  assert.equal(f.head(), head);
+  const p = f.readState().projects.p;
+  assert.equal(p.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
+  assert.equal(p.lastOutcome.repairs, 1);
+});
+
+test('m1: an original/ that the first run made is replaced by the driver\'s copy; the run goes on', (t) => {
+  const f = fixture(t);
+  repairProject(f);
+  f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
+  const first = lossyFirst();
+  first.writes['original/planted.md'] = note('planted', 'P', 'Planted by the model.');
+  first.writes['original/b.md'] = 'not the real note\n';
+  f.instruct({ p: { ...first, second: restoreSecond() } });
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied, 1 change\(s\), USD 0\.50, stopped: completed, one repair run/m);
+  assert.match(r.stdout, /^organize q: /m);
+  const second = f.calls().filter((c) => c.scope === 'p')[1];
+  assert.deepEqual(second.originalFiles, ['MEMORY.md', 'a.md', 'b.md']);
+  assert.equal(readFileSync(join(f.repo, 'projects/p/b.md'), 'utf8'), note('b', 'Details', DETAILS));
+});
+
+test('m1: an original/ that the model made gets no repair run without the driver\'s copy', (t) => {
+  for (const extra of [{}, { 'plan.json': '{"kind":"organize"}' }]) {
+    const f = fixture(t);
+    duplicateProject(f);
+    const instruction = mergeInstruction();
+    Object.assign(instruction.p.writes, { 'original/x.md': note('x', 'X', 'Made by the model.'), ...extra });
+    instruction.p.second = restoreSecond();
+    f.instruct(instruction);
+    const r = f.run('organize');
+    assert.equal(f.calls().length, 1, Object.keys(extra).join() || 'valid result');
+    assert.doesNotMatch(r.stdout, /repair run/);
+    assert.equal(existsSync(join(f.repo, 'projects/p/x.md')), false);
+  }
 });
