@@ -48,7 +48,7 @@ type Quirks = {
   functionForbids?: boolean;
   omit?: { path: string; field: string };
   rejectWrite?: boolean;
-  // Status of a read of a missing note or index (a role without list permission gives 500).
+  // Status of a read of a missing note or index (a store that does not read a missing key as missing gives 500).
   missingStatus?: number;
   unknownPathStatus?: number;
   expiredStatus?: number;
@@ -185,7 +185,7 @@ for (const missingStatus of [500, 403]) {
     const { run } = setup({ missingStatus });
     const failed = (await run()).filter((r) => !r.ok && r.name.startsWith('5a.'));
     assert.equal(failed.length, 2, JSON.stringify(failed));
-    for (const r of failed) assert.match(r.detail, /list permission/);
+    for (const r of failed) assert.match(r.detail, /a missing object did not read as not found/);
   });
 }
 

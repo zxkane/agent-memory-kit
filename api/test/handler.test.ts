@@ -300,25 +300,21 @@ test('a suffix lookalike scope and tab-separated scopes are judged token by toke
   }
 });
 
-// The store as a role without s3:ListBucket sees it: a missing key answers 403.
-test('without list permission a first write and a scopes call end as 500 internal; with it they succeed', async () => {
-  const lines: Line[] = [];
-  const noList = fakeStore({}, { noList: true });
-  const denied = createHandler({ store: noList, log: (l) => lines.push(l as Line) });
-  for (const [route, opts] of [
-    ['POST /v1/notes', { body: writeBody() }],
-    ['GET /v1/scopes', {}],
-  ] as const) {
-    const res = await denied(event(route, opts));
-    assert.equal(res.statusCode, 500, route);
-    assert.equal(json(res).error.code, 'internal', route);
-  }
-  assert.equal(noList.objects.size, 0);
-  assert.ok(lines.every((l) => l.error === 'AccessDenied'));
-
-  const { handler } = setup();
-  assert.equal((await handler(event('POST /v1/notes', { body: writeBody() }))).statusCode, 200);
-  assert.equal((await handler(event('GET /v1/scopes'))).statusCode, 200);
+// A read that is denied for an object that exists reads as missing. The conditional writes then
+// fail, so the write ends as a 409 conflict and changes nothing.
+test('a write whose reads are all denied ends as 409 conflict and changes nothing', async () => {
+  const initial = {
+    'index/agents.json': SNAPSHOT,
+    'agents/hermes/MEMORY.md': '- [a-note](a-note.md) - First\n',
+    'agents/hermes/a-note.md': 'text',
+  };
+  const store = fakeStore(initial, { deniedReads: true });
+  const before = new Map(store.objects);
+  const handler = createHandler({ store, log: () => {} });
+  const res = await handler(event('POST /v1/notes', { body: writeBody() }));
+  assert.equal(res.statusCode, 409);
+  assert.equal(json(res).error.code, 'conflict');
+  assert.deepEqual(store.objects, before);
 });
 
 const credential = () => 'sk-' + 'a1b2c3d4e5'.repeat(4).slice(0, 34);

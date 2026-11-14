@@ -38,10 +38,18 @@ export function s3Store(bucket: string, client: S3Client = new S3Client({})): St
         );
       } catch (err) {
         const status = httpStatus(err);
-        // Only a missing key reads as missing. NoSuchBucket is also a 404, and AccessDenied (what S3
-        // answers for a missing key without s3:ListBucket) is an error, so the name is checked first.
+        // The role deliberately has no list permission. S3 then reports a key that does not exist
+        // as access denied (403) instead of not found (404), so for this role "denied" and
+        // "absent" look the same on a read, and both read as missing. That is safe because every
+        // create goes through If-None-Match: * and every update through If-Match: if a read were
+        // ever denied for an object that does exist, the conditional write that follows fails with
+        // a precondition error instead of overwriting it, and the request ends as a conflict, never
+        // as data loss. NoSuchBucket is an error, so the name is checked before the status.
         const name = errorName(err);
-        if (name === 'NoSuchKey' || (status === 404 && name !== 'NoSuchBucket')) return { status: 'missing' };
+        if (name === 'NoSuchBucket') throw err;
+        if (name === 'NoSuchKey' || name === 'AccessDenied' || status === 404 || status === 403) {
+          return { status: 'missing' };
+        }
         if (status === 304 || errorName(err) === 'NotModified') return { status: 'not-modified' };
         throw err;
       }

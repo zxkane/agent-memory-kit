@@ -243,11 +243,11 @@ async function runSteps(deps: Deps, progress: { step: string }): Promise<CheckRe
   const searchOk = !('error' in search) && search.status === 200 && Array.isArray((search.body as any)?.results) && typeof (search.body as any)?.total === 'number';
   add('5a. memory_search answers with results and total', searchOk, `status ${describe(search)}`);
 
-  // A missing note and a missing scope must read as 404 not_found. Without the list permission S3
-  // answers a get of a missing key with 403 and the function would answer 500.
+  // A missing note and a missing scope must read as 404 not_found. The store reads both a 404 and
+  // the 403 that S3 gives a missing key to a role without list permission as missing.
   const expectNotFound = (name: string, reply: Reply | { error: string }, what: string) => {
     const ok = !('error' in reply) && reply.status === 404 && (reply.body as any)?.error?.code === 'not_found';
-    add(name, ok, ok ? `${what}: 404 not_found` : `${what}: ${describe(reply)}, expect 404 not_found; the function probably lacks the list permission`);
+    add(name, ok, ok ? `${what}: 404 not_found` : `${what}: ${describe(reply)}, expect 404 not_found; a missing object did not read as not found`);
   };
   expectNotFound(
     '5a. memory_read of a missing note answers 404 not_found',

@@ -10,10 +10,10 @@ export type FakeStore = Store & {
 };
 
 /**
- * noList models a role without s3:ListBucket: S3 then answers a get of a missing key with
- * 403 AccessDenied instead of 404.
+ * deniedReads models a read that S3 answers with access denied for an object that exists (which
+ * s3Store reads as missing): get reports missing for every key.
  */
-export function fakeStore(initial: Record<string, string> = {}, opts: { noList?: boolean } = {}): FakeStore {
+export function fakeStore(initial: Record<string, string> = {}, opts: { deniedReads?: boolean } = {}): FakeStore {
   let counter = 0;
   const objects = new Map<string, { body: string; etag: string }>();
   const nextEtag = () => `"etag-${++counter}"`;
@@ -25,12 +25,7 @@ export function fakeStore(initial: Record<string, string> = {}, opts: { noList?:
     async get(key, ifNoneMatch): Promise<Get> {
       store.gets.push({ key, ifNoneMatch });
       const found = objects.get(key);
-      if (!found) {
-        if (opts.noList) {
-          throw Object.assign(new Error('Access Denied'), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } });
-        }
-        return { status: 'missing' };
-      }
+      if (!found || opts.deniedReads) return { status: 'missing' };
       if (ifNoneMatch !== undefined && ifNoneMatch === found.etag) return { status: 'not-modified' };
       return { status: 'ok', body: found.body, etag: found.etag };
     },

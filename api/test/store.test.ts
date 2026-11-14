@@ -106,11 +106,26 @@ test('s3Store.get maps NoSuchKey/404 to missing and 304 to not-modified', async 
   assert.deepEqual(await s3Store('b', b.client).get('k', '"e"'), { status: 'not-modified' });
 });
 
-test('s3Store.get rethrows other errors and rejects bodies over 8 MB', async () => {
-  const a = stubClient(() => {
+test('s3Store.get reads AccessDenied/403 as missing, NoSuchBucket as an error, and put rethrows AccessDenied', async () => {
+  const denied = stubClient(() => {
     throw awsError('AccessDenied', 403);
   });
-  await assert.rejects(() => s3Store('b', a.client).get('k'), /AccessDenied/);
+  assert.deepEqual(await s3Store('b', denied.client).get('k'), { status: 'missing' });
+  const absent = stubClient(() => {
+    throw awsError('NoSuchKey', 404);
+  });
+  assert.deepEqual(await s3Store('b', absent.client).get('k'), { status: 'missing' });
+  const bucket = stubClient(() => {
+    throw awsError('NoSuchBucket', 404);
+  });
+  await assert.rejects(() => s3Store('b', bucket.client).get('k'), /NoSuchBucket/);
+  const put = stubClient(() => {
+    throw awsError('AccessDenied', 403);
+  });
+  await assert.rejects(() => s3Store('b', put.client).put('k', 'x', null), /AccessDenied/);
+});
+
+test('s3Store.get rethrows other errors and rejects bodies over 8 MB', async () => {
   const nb = stubClient(() => {
     throw awsError('NoSuchBucket', 404);
   });

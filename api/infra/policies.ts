@@ -18,8 +18,8 @@ export type PolicyDocument = {
 const ROLE_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:role\/([\w+=,.@-]+\/)*[\w+=,.@-]+$/;
 
 /**
- * The function's whole permission set. No delete. s3:ListBucket is granted only so that S3
- * answers a get of a missing key with 404 instead of 403; the function's code never lists.
+ * The function's whole permission set. No delete and no list: without s3:ListBucket S3 answers a
+ * get of a missing key with 403, which s3Store.get reads as missing (see store.ts).
  */
 export function functionPolicy(bucketArn: string): PolicyDocument {
   return {
@@ -34,11 +34,6 @@ export function functionPolicy(bucketArn: string): PolicyDocument {
         Effect: 'Allow',
         Action: ['s3:PutObject'],
         Resource: [`${bucketArn}/agents/*`, `${bucketArn}/index/agents.json`],
-      },
-      {
-        Effect: 'Allow',
-        Action: ['s3:ListBucket'],
-        Resource: [bucketArn],
       },
     ],
   };
