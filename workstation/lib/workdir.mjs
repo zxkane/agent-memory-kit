@@ -13,8 +13,9 @@ import { INDEX, NOTE_NAME_RE, indexRefs, indexStats, stubTarget } from './notes.
 import { scanText } from './secret-scan.mjs';
 
 const MAX_NOTE_BYTES = 100000;
-const NOTE_MIN_TERMS = 40;
-const RUN_MIN_TERMS = 200;
+const EMPTY = Buffer.alloc(0);
+const NOTE_MIN_TERMS = 15;
+const RUN_MIN_TERMS = 60;
 const GLOBAL = 'global';
 const HASH_RE = /^[0-9a-f]{64}$/;
 
@@ -180,7 +181,8 @@ export function noteTokens(input) {
 
 // The leading invisible format characters of a note (a byte order mark, a zero-width space).
 const stripInvisible = (str) => str.replace(/^\p{Cf}+/u, '');
-const MALFORMED_RE = /^moved\s+to\s*\[\s*\[/i;
+// A body that is nothing but a retirement-like line.
+const MALFORMED_RE = /^moved\s+to\s*\[\s*\[[^\]\n]*\]\s*\]\s*[.!]?$/i;
 
 // The part of a note after a leading frontmatter block (the whole note when it has none).
 function bodyOf(content) {
@@ -196,8 +198,8 @@ function contentProblem(name, buf, beforeBuf) {
   const content = stripInvisible(text(buf));
   const trimmed = content.trim();
   const body = bodyOf(content).trim();
-  if (MALFORMED_RE.test(trimmed.normalize('NFKC')) || MALFORMED_RE.test(body.normalize('NFKC')) ||
-      (body !== trimmed && stubTarget(body) !== null)) {
+  const bare = bodyOf(content).replace(/\p{Cf}/gu, '').normalize('NFKC').trim();
+  if (MALFORMED_RE.test(bare) || (body !== trimmed && stubTarget(body) !== null)) {
     return 'malformed retirement line';
   }
   if (name !== INDEX) {
@@ -212,9 +214,9 @@ function contentProblem(name, buf, beforeBuf) {
 
 // Judges the work folders against the snapshot. "Before" is the live folder, which the snapshot
 // was taken from (`liveChanged` reports when it no longer is); "after" is the live folder with
-// the accepted changes applied. `minRetention` is the share of its distinct terms that each
-// retired or changed note (of 40 or more terms) must keep (0 turns the check off).
-export function evaluate({ pairs, snap, allowRetire, minRetention = 0.3 }) {
+// the accepted changes applied. `minRetention` is the share of its distinct body terms that each
+// retired or changed note (of 15 or more terms) must keep (0 turns the check off).
+export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
   const errors = [];
   const changes = [];
   const ignored = [];
@@ -307,12 +309,25 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.3 }) {
       errors.push(`${label}/${INDEX}: the index may not be emptied while notes remain`);
     }
   }
-  // Each retired or changed note is judged on its own: how many of its distinct terms are still
-  // somewhere they belong. A retired note must find them in its target; a changed note, in itself
-  // or in a note the run adds or changes.
-  const written = new Set();
+  // Each retired or changed note is judged on its own, by the terms of its body: how many of them
+  // are still somewhere they belong. A retired note must find them in its target. A changed note
+  // keeps a term that is in its own new body, or that another note written in this run newly
+  // contains (an added note, or a changed note whose body did not have the term before).
+  const termCache = new WeakMap();
+  const termsOf = (buf) => {
+    let set = termCache.get(buf);
+    if (!set) {
+      set = noteTokens(bodyOf(stripInvisible(text(buf))));
+      termCache.set(buf, set);
+    }
+    return set;
+  };
+  const newlyWritten = new Set();
   for (const c of changes) {
-    if (c.kind !== 'retire' && c.file !== INDEX) for (const t of noteTokens(text(work[c.label].get(c.file)))) written.add(t);
+    if (c.kind === 'retire' || c.file === INDEX) continue;
+    const had = c.kind === 'change' ? live[c.label].get(c.file) : null;
+    const hadTerms = had ? termsOf(had) : new Set();
+    for (const t of termsOf(work[c.label].get(c.file))) if (!hadTerms.has(t)) newlyWritten.add(t);
   }
   let termsBefore = 0;
   let termsKept = 0;
@@ -322,14 +337,12 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.3 }) {
     if (c.file === INDEX || c.kind === 'add') continue;
     const beforeBuf = live[c.label].get(c.file);
     if (!beforeBuf) continue;
-    const beforeTerms = noteTokens(text(beforeBuf));
-    let afterTerms = written;
-    if (c.kind === 'retire') {
-      const targetBuf = afterOf[c.target.label]?.get(c.target.file);
-      afterTerms = targetBuf ? noteTokens(text(targetBuf)) : new Set();
-    }
+    const beforeTerms = termsOf(beforeBuf);
+    const isKept = (t) => (c.kind === 'retire'
+      ? termsOf(afterOf[c.target.label]?.get(c.target.file) ?? EMPTY).has(t)
+      : termsOf(work[c.label].get(c.file)).has(t) || newlyWritten.has(t));
     let kept = 0;
-    for (const t of beforeTerms) if (afterTerms.has(t)) kept += 1;
+    for (const t of beforeTerms) if (isKept(t)) kept += 1;
     termsBefore += beforeTerms.size;
     termsKept += kept;
     if (beforeTerms.size < NOTE_MIN_TERMS) continue;

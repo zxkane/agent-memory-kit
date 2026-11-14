@@ -575,7 +575,7 @@ test('rule 4: an unchanged empty index does not reject a run', (t) => {
 test('rule 6: an emptied note, a near-stub and an empty new note are errors', (t) => {
   const s = setup(t, { notes: BASE_NOTES });
   s.work('notes', 'a.md', ' \n\n');
-  s.work('notes', 'b.md', 'MOVED TO [[a]] and some more words\n');
+  s.work('notes', 'b.md', 'MOVED TO [[a]].\n');
   s.work('notes', 'MEMORY.md', `${INDEX_AB}- [N](n.md) — n\n`);
   s.work('notes', 'n.md', '');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
@@ -770,7 +770,7 @@ test('N2: apply refuses a retire change whose target is not the one the stub nam
 
 // ---- round 3 ----
 
-const MISSING = /^notes\/(n\d)\.md: most of this note's content is missing after the run \(kept (\d+)% of its distinct terms, at least 30% required\)$/;
+const MISSING = /^notes\/(n\d)\.md: most of this note's content is missing after the run \(kept (\d+)% of its distinct terms, at least 25% required\)$/;
 
 // Ten notes of 60 distinct terms each, every one with terms of its own.
 function tenNotes(t) {
@@ -793,8 +793,9 @@ test('rule 7: a note retired into an unrelated note is reported by name', (t) =>
   s.work('notes', 'MEMORY.md', indexWithout(3));
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.equal(r.ok, false);
-  assert.equal(r.errors.length, 1);
+  assert.equal(r.errors.length, 2, 'the note, and the run (60 terms touched)');
   assert.match(r.errors[0], MISSING);
+  assert.match(r.errors[1], RUN_ERROR);
   assert.equal(r.errors[0].startsWith('notes/n3.md: '), true);
   assert.deepEqual(r.stats.retention, { termsBefore: 60, termsKept: 0, share: 0, checked: 1, lowest: 0 });
 });
@@ -880,12 +881,12 @@ test('rule 7: half of a note moved into a new note written in the same run passe
   assert.equal(r.stats.retention.share, 1);
 });
 
-test('rule 7: a short note (under 40 terms) gutted is not judged', (t) => {
-  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('shrt', 0, 20)}\n` } });
+test('rule 7: a short note (under 15 terms) gutted is not judged', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('shrt', 0, 14)}\n` } });
   s.work('notes', 'a.md', 'something else entirely\n');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.deepEqual(r.errors, []);
-  assert.deepEqual(r.stats.retention, { termsBefore: 20, termsKept: 0, share: 0, checked: 0, lowest: null });
+  assert.deepEqual(r.stats.retention, { termsBefore: 14, termsKept: 0, share: 0, checked: 0, lowest: null });
 });
 
 test('rule 7: padding with an unrelated filler note does not hide a gutted note', (t) => {
@@ -895,8 +896,9 @@ test('rule 7: padding with an unrelated filler note does not hide a gutted note'
   s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n- [F](filler.md) — f\n');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.equal(r.ok, false);
-  assert.equal(r.errors.length, 1);
+  assert.equal(r.errors.length, 2);
   assert.match(r.errors[0], /^notes\/a\.md: most of this note's content is missing after the run \(kept 0% /);
+  assert.match(r.errors[1], RUN_ERROR);
 });
 
 test('rule 7: no change leaves stats.retention neutral', (t) => {
@@ -945,16 +947,16 @@ test('live folder missing at snapshot time but now a plain file is reported by l
 
 // ---- round 4 ----
 
-function shortNotes(t, count, extra = {}) {
+function shortNotes(t, count, extra = {}, size = 20) {
   const notes = { 'MEMORY.md': Array.from({ length: count }, (_, i) => `- [S${i}](s${i}.md) — s${i}\n`).join(''), ...extra };
-  for (let i = 0; i < count; i++) notes[`s${i}.md`] = `${terms(`sh${String(i).padStart(2, '0')}x`, 0, 20)}\n`;
+  for (let i = 0; i < count; i++) notes[`s${i}.md`] = `${terms(`sh${String(i).padStart(2, '0')}x`, 0, size)}\n`;
   return setup(t, { notes });
 }
 
-const RUN_ERROR = /^the run would drop too much of the touched notes' content \(kept \d+% of their distinct terms, at least 30% required\)$/;
+const RUN_ERROR = /^the run would drop too much of the touched notes' content \(kept \d+% of their distinct terms, at least 25% required\)$/;
 
 test('run level: thirty short notes gutted give one run-level error and no per-note error', (t) => {
-  const s = shortNotes(t, 30);
+  const s = shortNotes(t, 30, {}, 12);
   for (let i = 0; i < 30; i++) s.work('notes', `s${i}.md`, 'two words\n');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.equal(r.ok, false);
@@ -962,17 +964,17 @@ test('run level: thirty short notes gutted give one run-level error and no per-n
   assert.match(r.errors[0], RUN_ERROR);
   assert.match(r.errors[0], /kept 0% /);
   assert.equal(r.stats.retention.checked, 0);
-  assert.equal(r.stats.retention.termsBefore, 600);
+  assert.equal(r.stats.retention.termsBefore, 360);
   const off = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention: 0 });
   assert.deepEqual(off.errors, []);
 });
 
-test('run level: five short notes gutted (under 200 terms in total) pass', (t) => {
-  const s = shortNotes(t, 5);
-  for (let i = 0; i < 5; i++) s.work('notes', `s${i}.md`, 'two words\n');
+test('run level: four short notes of 14 terms gutted (under 60 terms in total) pass', (t) => {
+  const s = shortNotes(t, 4, {}, 14);
+  for (let i = 0; i < 4; i++) s.work('notes', `s${i}.md`, 'two words\n');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.deepEqual(r.errors, []);
-  assert.equal(r.stats.retention.termsBefore, 100);
+  assert.equal(r.stats.retention.termsBefore, 56);
 });
 
 test('run level: one long note honestly tightened beside untouched short notes passes', (t) => {
@@ -982,4 +984,110 @@ test('run level: one long note honestly tightened beside untouched short notes p
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.deepEqual(r.errors, []);
   assert.equal(r.stats.retention.termsBefore, 240);
+});
+
+// ---- round 5 ----
+
+const front = (description, extra = '') => `---\nname: x\ndescription: ${description}\nmetadata:\n  type: project\n${extra}---\n`;
+const PER_NOTE = (file) => new RegExp(`^notes/${file.replace('.', '\\.')}: most of this note's content is missing after the run \\(kept (\\d+)% of its distinct terms, at least 25% required\\)$`);
+
+test('rule 7 counts the body only: a rich description does not keep a gutted body', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${front(terms('desc', 0, 30))}${terms('body', 0, 30)}\n` } });
+  s.work('notes', 'a.md', `${front(terms('desc', 0, 30))}one line only\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], PER_NOTE('a.md'));
+  assert.deepEqual(r.stats.retention, { termsBefore: 30, termsKept: 0, share: 0, checked: 1, lowest: 0 });
+});
+
+test('rule 7: a frontmatter-only change on a note with an untouched body has share 1', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${front('old words')}${terms('body', 0, 30)}\n` } });
+  s.work('notes', 'a.md', `${front('a repaired and much better description', 'type: reference\n')}${terms('body', 0, 30)}\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.stats.retention, { termsBefore: 30, termsKept: 30, share: 1, checked: 1, lowest: 1 });
+});
+
+test('rule 7: one note gutted while three others get a one-word edit is still an error', (t) => {
+  const s = tenNotes(t);
+  s.work('notes', 'n0.md', 'tiny\n');
+  for (const i of [1, 2, 3]) s.work('notes', `n${i}.md`, `${terms(`note${i}x`, 0, 60)} extraword\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], PER_NOTE('n0.md'));
+  assert.equal(r.stats.retention.lowest, 0);
+  assert.equal(r.stats.retention.checked, 4);
+});
+
+test('rule 7: terms that another changed note already had do not count as kept', (t) => {
+  const shared = terms('sharx', 0, 40);
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n', 'a.md': `${shared}\n`, 'b.md': `${shared} ${terms('bonly', 0, 40)}\n` } });
+  s.work('notes', 'a.md', 'tiny\n');
+  s.work('notes', 'b.md', `${shared} ${terms('bonly', 0, 40)} extraword\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], PER_NOTE('a.md'));
+});
+
+test('rule 7: content moved into an existing note that did not have those terms passes', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n', 'a.md': `${terms('mvdx', 0, 60)}\n`, 'b.md': `${terms('othr', 0, 60)}\n` } });
+  s.work('notes', 'a.md', `${terms('mvdx', 0, 30)}\n`);
+  s.work('notes', 'b.md', `${terms('othr', 0, 60)} ${terms('mvdx', 30, 60)}\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stats.retention.lowest, 1);
+});
+
+test('rule 7: eight short notes (12 terms) gutted give the run-level error only; three of 16 terms give per-note errors', (t) => {
+  const eight = shortNotes(t, 8, {}, 12);
+  for (let i = 0; i < 8; i++) eight.work('notes', `s${i}.md`, 'two words\n');
+  const r = evaluate({ pairs: eight.pairs, snap: eight.snap, allowRetire: true });
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], RUN_ERROR);
+  assert.equal(r.stats.retention.termsBefore, 96);
+  assert.equal(r.stats.retention.checked, 0);
+  const three = shortNotes(t, 3, {}, 16);
+  for (let i = 0; i < 3; i++) three.work('notes', `s${i}.md`, 'two words\n');
+  const q = evaluate({ pairs: three.pairs, snap: three.snap, allowRetire: true });
+  assert.equal(q.errors.length, 3);
+  for (let i = 0; i < 3; i++) assert.match(q.errors[i], PER_NOTE(`s${i}.md`));
+  assert.equal(q.stats.retention.termsBefore, 48);
+});
+
+test('rule 7: a single note of 14 body terms gutted is not judged', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${front('d')}${terms('tiny', 0, 14)}\n` } });
+  s.work('notes', 'a.md', `${front('d')}gone\n`);
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.stats.retention, { termsBefore: 14, termsKept: 0, share: 0, checked: 0, lowest: null });
+});
+
+test('rule 7: the default is 0.25', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n', 'a.md': `${terms('dflt', 0, 40)}\n` } });
+  s.work('notes', 'a.md', `${terms('dflt', 0, 9)}\n`);
+  assert.equal(evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true }).ok, false);
+  s.work('notes', 'a.md', `${terms('dflt', 0, 10)}\n`);
+  assert.equal(evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true }).ok, true);
+  assert.equal(evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true, minRetention: 0.3 }).ok, false);
+});
+
+test('rule 6: whole-body retirement lines only; prose that goes on is not rule 6', (t) => {
+  const reject = ['MOVED TO [[a]].', 'moved to [ [a] ]', 'MOVED \u200bTO [[a]]', 'MO\u200bVED TO [[a]]', 'MOVED\u00a0TO [[a]]', '\n\u200bMOVED TO [[a]]'];
+  for (const form of reject) {
+    const s = setup(t, { notes: BASE_NOTES });
+    s.work('notes', 'b.md', `${form}\n`);
+    const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+    assert.deepEqual(r.errors, ['notes/b.md: malformed retirement line'], JSON.stringify(form));
+  }
+  const prose = setup(t, { notes: BASE_NOTES });
+  prose.work('notes', 'b.md', 'Moved to [[a]] the deploy section; the rest stays here.\n');
+  assert.deepEqual(evaluate({ pairs: prose.pairs, snap: prose.snap, allowRetire: true }).errors, []);
+});
+
+test('rule 6: a stub plus a few words over a rich note is a rule 7 error, not rule 6', (t) => {
+  const s = setup(t, { notes: { 'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n', 'a.md': 'note a\n', 'b.md': `${terms('seeb', 0, 30)}\n` } });
+  s.work('notes', 'b.md', 'MOVED TO [[a]] see there\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.errors.length, 1);
+  assert.match(r.errors[0], PER_NOTE('b.md'));
 });
