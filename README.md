@@ -87,12 +87,12 @@ Then it:
 2. Clones the notes repository to `~/agent-memory` if it is missing.
 3. Creates `~/.local/state/agent-memory` (mode 700).
 4. Adds the two hooks to `~/.claude/settings.json`, keeping every other setting, records the path of the Node.js binary in `workstation/node.local.path` (ignored by Git), writes the launcher `~/.config/agent-memory/run.sh` and, when `~/.codex` or `~/.kiro` exists, registers their session-start hook (see "Codex and Kiro").
-5. Writes `agent-memory-sync.service` and `agent-memory-sync.timer` to `~/.config/systemd/user/` and enables the timer.
+5. Writes `agent-memory-sync.service` and `agent-memory-sync.timer` to `~/.config/systemd/user/` and enables the timer. When the configuration has a `consolidate` block with `extract` or `organize` schedules, it also writes and enables the matching weekly timers, and removes those of a schedule that is gone (see "Consolidation").
 
 Options:
 
 - `--dry-run` runs the checks, prints what would happen and changes nothing. For Codex and Kiro it says whether a file would be written, or left unchanged because it or its folder is a symbolic link, and, with `--no-hooks`, what would be removed.
-- `--no-enable` writes the units but does not run `systemctl`.
+- `--no-enable` writes the units but does not enable the timers. (A timer whose schedule was removed is still disabled before its unit files are deleted.)
 - `--no-hooks` does everything else but does not register the Claude Code, Codex and Kiro hooks, and removes the kit's own hook entries if they are present. Running `setup.sh` later without the flag registers them.
 
 On a machine that already has Claude Code memory, this order lets you move the existing notes and review the result before sessions start adopting folders on their own:
@@ -175,6 +175,148 @@ Each project folder holds a one-line file named `.project` with the identity of 
 
 The result of the last sync is in `~/.local/state/agent-memory/status.json`: when it last ran, when it last succeeded, whether it committed, merged and pushed, how many files are in quarantine or in conflict, and which project folders had their `.project` claimed by different repositories on two machines (`markerConflicts`).
 
+## Consolidation
+
+Over time notes pile up: duplicates, notes that contradict each other, an index that outgrows what a session can read, facts that only appear in old conversations. Consolidation is an optional weekly job in which a language model tidies the notes, and a driver applies the result only if fixed checks accept it. Nothing about it is active until you add a `consolidate` block to the configuration; a machine without the block behaves exactly as before.
+
+There are two jobs, each run per folder of notes (a "scope": one project folder, or `global/`):
+
+- **Extract** reads the recent conversations of one project and corrects or adds notes for what they show. It works on project folders only, never on `global/`, and it never retires a note.
+- **Organize** tidies a folder: it merges notes that say the same thing, repairs frontmatter, marks facts that cannot both be true, turns relative dates into absolute ones, and keeps `MEMORY.md` complete and within 200 lines and 25,000 bytes. For a project it also sees `global/` and may move a note about the person there. It may retire a note (see below).
+
+Both are started with `workstation/run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]`.
+
+### How a run is kept safe
+
+1. The driver first runs a sync, then copies the scope's note files (and, for an Organize run on a project, `global/`) to a private work folder under `~/.local/state/agent-memory/consolidate/<timestamp>-<pid>/<scope>/` (mode 700).
+2. The model client runs inside that copy with file tools only (`Read`, `Write`, `Edit`, `Glob`, `Grep`), no permission prompts, no MCP servers, no saved session, a turn limit and a spending limit. It cannot run commands, so it cannot touch Git, and it cannot delete or rename files. It is started in the copy, not in the clone.
+3. Afterwards the driver compares the copy with the live folder and applies the result only if every rule below holds. A rejected result changes nothing in your notes.
+4. The applied change is committed as one commit, `consolidate(<host>): <kind> projects/<name>` (or `... global`), together with a report, and the next sync pushes it.
+
+The rules:
+
+- Only note files change: a regular `*.md` file with a plain name. Links, folders and other file types in the copy reject the result.
+- Retirement: a note is retired by replacing its whole content with the single line `MOVED TO [[name]]` (or `MOVED TO [[global:name]]` for a note that went to `global/`). The target must exist, must not itself be retired and must not be the index, and the index must not be retired. A retired file is deleted when the result is applied. An Extract run cannot retire: such a file is listed under "Not applied".
+- No credentials: a changed or new note, or a file name, that the secret scan flags rejects the result.
+- A note may not be emptied (retire it instead), may not be made into a malformed retirement line (for example `MOVED TO [[name]]` with extra text), and may not exceed 100000 bytes.
+- The index may not lose notes: the number of notes without an index line may not grow, and the index may not be emptied while notes remain.
+- Content retention (next section).
+- The live folder must still be what was copied: if a session or a sync changed a note meanwhile, nothing is applied (`changed-meanwhile`). Applying checks again, file by file, immediately before it writes.
+
+**Content retention.** To stop a run from "tidying" by dropping facts, each retired or changed note is compared with its previous version. The terms are its distinct words of four or more letters (for Han characters, every pair of adjacent characters), taken from the note body without the frontmatter. A term counts as kept when it is still in the note's new body, in the note it was retired into, or in a note that this run newly wrote. A note with 15 or more terms is rejected when it keeps less than a quarter of them, and so is a run whose touched notes (with 60 or more terms in all) keep less than a quarter overall. The default is `0.25`. For one deliberate, heavy clean-up, pass `--min-retention <0..1>`, for example `--min-retention 0.1`; `--min-retention 0` turns the check off for that run. The setting is only for the command line, not for the timers.
+
+### Configure
+
+Add a `consolidate` block to `~/.config/agent-memory/config.json`. `command` and `model` are required; everything else has the default shown. A value outside its bound, or of the wrong type, makes the whole block count as absent (the rest of the configuration still works), so check with a dry run.
+
+```json
+{
+  "consolidate": {
+    "command": "/path/to/claude",
+    "model": "<model-id>",
+    "env": { "SETTING_NAME": "<value>" },
+    "extract": "Sat *-*-* 03:00",
+    "organize": "Sun *-*-* 04:30",
+    "maxProjects": 5,
+    "maxTranscriptBytes": 200000,
+    "maxTurns": 200,
+    "maxBudgetUsd": 5,
+    "timeoutMinutes": 30
+  }
+}
+```
+
+| Field | Default | Meaning and bounds |
+|---|---|---|
+| `command` | required | Absolute path of the model client. |
+| `model` | required | Model ID passed to the client, no spaces. Use a full model ID; see "What was tested". `--model <id>` overrides it for one run. |
+| `env` | `{}` | Extra environment variables for the client, for example the settings it needs to reach its model service. Names are upper-case letters, digits and `_`; values are text without control characters. Besides these the client gets only `HOME`, `PATH`, `LANG` and `TZ` of the calling process. |
+| `extract`, `organize` | absent | A systemd calendar expression for the weekly timer, for example `Sat *-*-* 03:00`. At most 80 characters from letters, digits, space and `* : , . / ~ -`. Absent means no timer for that job. |
+| `maxProjects` | 5 | Scopes consolidated per run, 1 to 50. Does not limit a run that names its scopes with `--project`. |
+| `maxTranscriptBytes` | 200000 | Extract: size of the conversation text given to the model, 10000 to 2000000. |
+| `maxTurns` | 200 | Turns the model may take for one scope, 1 to 1000. |
+| `maxBudgetUsd` | 5 | Spending limit for one scope, a number above 0 and at most 100. |
+| `timeoutMinutes` | 30 | Time limit for one scope, 1 to 240. |
+
+The cost is bounded three ways: at most `maxProjects` scopes per run, at most `maxBudgetUsd` for each, and a ceiling for the whole run of `maxProjects` times `maxBudgetUsd` (a scope whose cost is not reported counts at its full limit). When the ceiling is reached the run stops with a message and the remaining scopes wait for the next run. Start low: a first run on one project costs far less than the ceiling.
+
+### The weekly timers
+
+After editing the configuration, run `./setup.sh` again. For each schedule it writes `agent-memory-extract.service` / `.timer` and `agent-memory-organize.service` / `.timer` to `~/.config/systemd/user/` and enables the timers (not with `--no-enable`). Each timer has `Persistent=true`, so a run missed while the machine was off happens at the next start, and `RandomizedDelaySec=10min`. Each service runs `run.sh consolidate extract` or `organize` at low priority (`Nice=10`) with a four-hour limit. When you remove a schedule (or the whole block) and run `./setup.sh` again, that timer is disabled and its two unit files are removed. Read the log with `journalctl --user -u agent-memory-organize.service`.
+
+Only one consolidation runs at a time on a machine: a second start prints *agent-memory: a consolidation is already running.* and exits. A run in your terminal can be stopped with Ctrl-C: the model is stopped, nothing more is applied and the work folder is removed. Stopping the service with `systemctl --user stop` does the same, because the unit keeps systemd's default of stopping everything in its control group, which includes the model client.
+
+**Which machine.** When several machines share the notes, enable Organize on one machine only, and Extract on each. Two machines organizing the same folders would rewrite the same notes at the same time and produce conflict copies, and each machine remembers only its own runs, so both would repeat the same work. Extract reads the conversations stored on the machine it runs on, so every machine that has conversations should run it, at a different hour. Schedule Organize after the Extract runs.
+
+### Which scopes a run takes
+
+Per run, at most `maxProjects` scopes (all named ones with `--project`).
+
+- **Organize** takes a scope that has notes and whose content changed since this machine last organized it (or that was never organized). A scope that did not change but is still over the index limits (200 lines or 25,000 bytes) or still holds a `.conflict-` copy is taken again after 28 days: the model could not fix it last time. The order is: over the limits, then holding a conflict copy, then organized longest ago.
+- **Extract** takes a project folder when this machine has Claude Code conversation folders linked to it and a conversation file changed since the last Extract (in the last 7 days when it never ran). The project extracted longest ago goes first. It reads this machine's interactive sessions (typed by a person) and sessions that wrote memory, newest first; automated sessions that did neither are skipped. The text is cut to `maxTranscriptBytes`, and every line the secret scan flags, and each private key block, is replaced by `[redacted]`. The conversation text never leaves the machine except as the prompt to the configured model; it is not written into the notes repository (the notes the model writes from it are).
+
+State is kept in `~/.local/state/agent-memory/consolidate.json` (last run and outcome per scope). A scope's marks move forward after an applied run and after a run that changed nothing; after a rejected Organize run they move forward too, so the same notes are not retried until they change; after a rejected Extract run they do not, so those conversations are read again. A dry run never moves them. An unreadable state file is moved aside and the run starts afresh.
+
+### Try it first
+
+Run Organize on one project with a dry run and keep the work folder:
+
+```
+workstation/run.sh consolidate organize --project <name> --dry-run --keep
+```
+
+The model runs for real (and costs what a real run costs), but nothing in your notes changes and no marks move. The sync before the copy still runs, as in any run. The output is a headline, `organize <name>: dry-run, <n> change(s), USD <cost>, stopped: <reason>`, and the report that a real run would commit:
+
+- the model, turns, cost and why it stopped (`completed`, `timeout`, or the client's own limit reason such as a turn or budget limit; the result is judged whatever the reason);
+- index lines and bytes before and after, and the number of notes with no index line before and after;
+- note bytes before and after and how many were retired;
+- the share of distinct terms kept (the retention check);
+- the lists Added (with each note's description), Changed, Retired (`note -> target`) and Not applied.
+
+If the result would be rejected, the rule violations are listed instead of `dry-run`. The last line gives the kept work folder. Compare it with the live notes:
+
+```
+diff -r <work folder>/notes ~/agent-memory/projects/<name>
+```
+
+(`<work folder>/global` for the `global/` copy.) The folder is mode 700 and is never removed automatically. For an Extract run it also holds `input/digest.md`, the conversation text given to the model: **a kept Extract folder contains conversation text**, so delete it (`rm -r`) when you are done. Folders from a killed run that were not kept are removed by the next run when older than a day.
+
+Satisfied? Run the same command without `--dry-run` for one project, check the commit, then enable the timers.
+
+### Outcomes
+
+Each scope prints one headline, `<kind> <scope>: <outcome>, <n> change(s), USD <cost>, stopped: <reason>`, with details beneath it.
+
+| Outcome | Meaning and what to do |
+|---|---|
+| `applied` | The result was accepted, written, reported in `_reports/<date>-<host>-<kind>-<scope>.md` and committed. *push pending* means the sync after it failed; the next sync retries. *the report could not be written* means the notes changed but the report did not. |
+| `no-change` | The model found nothing to change. Nothing to do. |
+| `dry-run` | With `--dry-run`: the result would be applied. The report is printed. |
+| `rejected` | A rule above failed; the violations are listed and nothing was applied. Read them. A retention message means the model dropped content: look at the kept folder, and use `--min-retention` only if you accept the loss. A repeated rejection of the same folder usually means the notes need a manual change first. |
+| `changed-meanwhile` | A note changed during the run, so nothing was applied; the files are named. The next run tries again. |
+| `sync-failed` | The sync before the snapshot or before applying failed (the reason is shown), so nothing was applied and the run stops. Fix the sync first: `journalctl --user -u agent-memory-sync.service` and `status.json`. |
+| `skipped` | The folder was not available (the reason is shown). |
+| `no-session` | Extract found no usable conversation text. Nothing was run. |
+| `aborted` | The run was interrupted; nothing was applied. |
+| `step-failed`, `error` | A step could not run or failed (the step and reason are shown), for example because the clone is missing or a sync held the lock for over five minutes. The run stops and exits with 1. |
+
+Other lines: *nothing to do*; *stopped; the model cost of this run reached its ceiling*; *stopped; the sync failed...*; *interrupted by SIGINT; nothing more was applied* (exit 130; 143 for SIGTERM, 129 for SIGHUP); *agent-memory: consolidation is not configured.*; and an error for a `--project` name that is not a project folder (exit 2). A project folder named `global` is never consolidated.
+
+### Undo a run
+
+Every applied run is a single commit in the notes repository. To undo it:
+
+```
+git -C ~/agent-memory log --oneline --grep '^consolidate('
+git -C ~/agent-memory revert <commit>
+```
+
+The next sync pushes the revert; retired notes come back with it. Reports stay in `_reports/` (Organize runs delete reports older than 90 days).
+
+### What was tested
+
+Tested with Claude Code's command-line client, started in its restricted mode, with a full model ID from the model service in use. A model alias (a short name such as a family name) may not resolve in restricted mode, so put the full ID in `model`. Another client needs to accept the same options: `-p`, `--restricted`, `--tools`, `--permission-mode acceptEdits`, `--permission-prompts none`, `--strict-mcp-config`, `--no-session-persistence`, `--output-format json`, `--model`, `--max-turns`, `--max-budget-usd` and `--add-dir`, and report its cost and turns in the JSON result.
+
 ## Session messages
 
 At the start of a session you may see one of these lines. `<...>` stands for a value filled in by the session.
@@ -224,7 +366,7 @@ A clone that still has the old history refuses to sync with *remote history was 
 On each machine:
 
 1. Delete `~/.config/agent-memory/config.json`. The hooks and the sync stop acting immediately.
-2. Disable the timer: `systemctl --user disable --now agent-memory-sync.timer`.
+2. Disable the timer: `systemctl --user disable --now agent-memory-sync.timer`, and, if you enabled consolidation, `agent-memory-extract.timer` and `agent-memory-organize.timer` the same way.
 3. Remove the two hook entries from `~/.claude/settings.json`: the commands that end with `# agent-memory-kit`, one under `SessionStart` and one under `PreToolUse`. `./setup.sh --no-hooks --no-enable`, run before step 1, does this for you, and also removes the Codex and Kiro hook entries (a `~/.codex/hooks.json` that is a symbolic link or in a linked folder is not edited, nor is a linked Kiro file removed; setup says what to remove).
 4. To unlink the memory folders: each linked folder `~/.claude/projects/<folder name>/memory` is a symlink into the clone, with a `memory.local-backup-<timestamp>` folder beside it. Remove the symlink, create the `memory` folder again and copy the project's notes from `~/agent-memory/projects/<name>/` into it. Delete the backup folders once you have confirmed that their notes are in the clone.
 
