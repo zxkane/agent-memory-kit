@@ -1320,39 +1320,65 @@ test('run folders older than a day are removed at the start unless marked by --k
   assert.deepEqual(readdirSync(root).sort(), ['fresh-run', 'kept-run']);
 });
 
-// Makes the n-th `git fetch` of the run slow: it touches `<tmp>/in-step`, then sleeps 3 s. Every
-// fetch is counted in `<tmp>/fetches`. Each sync fetches once: the snapshot step's sync is the
-// first fetch of a scope, the sync before applying the second, the sync after applying the third.
-// The slow fetch also writes the pid of the step that runs it to `<tmp>/step.pid`, and touches
-// `<tmp>/slept` when its sleep is over; when that step is gone by then, it exits without
-// fetching.
-function slowFetch(f, n) {
+// True when the process `pid` has a child whose command is `name` (it has started that program).
+const hasChild = (pid, name) => spawnSync('pgrep', ['-P', String(pid), '-x', name]).status === 0;
+
+// Makes the n-th `git fetch` of the run wait, so that a test can act while that locked step is
+// running. Every fetch is counted in `<tmp>/fetches`; each sync fetches once: the snapshot step's
+// sync is the first fetch of a scope, the sync before applying the second, the sync after applying
+// the third. The waiting fetch writes the pid of its step to `<tmp>/step.pid` and touches
+// `<tmp>/slept` when its wait is over; when its step is gone by then, it exits without fetching.
+// Two ways to wait, chosen for what the test does:
+// - `hold` (for a signal to the whole process group): a long `sleep` in the foreground. `ready()` is
+//   true once that sleep is running, so bash is waiting for a child that the signal ends, and the
+//   signal ends bash too. (Signalled while bash still waits for a child that then exits normally,
+//   bash would ignore a SIGINT and carry on: that was the race.)
+// - otherwise (for a signal to the driver alone, or SIGKILL to the step): a gate. `ready()` is true
+//   once the fetch waits at it; it waits until `release()` opens it or its step is gone, so the
+//   step is certain to be running when the test signals.
+function slowFetch(f, n, { hold = false } = {}) {
   const count = join(f.tmp, 'fetches');
   const marker = join(f.tmp, 'in-step');
   const pidFile = join(f.tmp, 'step.pid');
+  const wrapperPid = join(f.tmp, 'wrapper.pid');
+  const gate = join(f.tmp, 'gate-open');
   const slept = join(f.tmp, 'slept');
-  wrapGit(f, `for a in "$@"; do if [[ "$a" == fetch ]]; then k=$(cat "${count}" 2>/dev/null || echo 0); k=$((k+1)); echo $k > "${count}"; if [[ $k == ${n} ]]; then echo $PPID > "${pidFile}"; touch "${marker}"; sleep 3; touch "${slept}"; kill -0 $PPID 2>/dev/null || exit 1; fi; fi; done`);
+  const wait = hold
+    ? 'sleep 30'
+    : `while [[ ! -e "${gate}" ]] && kill -0 $PPID 2>/dev/null; do sleep 0.05; done`;
+  wrapGit(f, `for a in "$@"; do if [[ "$a" == fetch ]]; then k=$(cat "${count}" 2>/dev/null || echo 0); k=$((k+1)); echo $k > "${count}"; if [[ $k == ${n} ]]; then echo $PPID > "${pidFile}"; echo $$ > "${wrapperPid}"; touch "${marker}"; ${wait}; touch "${slept}"; kill -0 $PPID 2>/dev/null || exit 1; fi; fi; done`);
+  const pidIn = (file) => {
+    try { return Number(readFileSync(file, 'utf8').trim()) || null; } catch { return null; }
+  };
   return {
     marker,
     slept,
-    stepPid: () => Number(readFileSync(pidFile, 'utf8').trim()),
+    ready: () => existsSync(marker) && (!hold || (pidIn(wrapperPid) !== null && hasChild(pidIn(wrapperPid), 'sleep'))),
+    // Also called after the test, when the temporary folder may be gone already.
+    release: () => {
+      try { writeFileSync(gate, ''); } catch { /* the folder is gone, and with it the step */ }
+    },
+    stepPid: () => pidIn(pidFile),
     fetches: () => Number(readFileSync(count, 'utf8').trim()),
   };
 }
 
-// Starts `run.sh consolidate <args>` and, once `marker` exists (a locked step is then running),
+// Starts `run.sh consolidate <args>` and, once `step.ready()` (a locked step is then running),
 // sends `signal` to the driver alone, or with `group` to its whole process group as a terminal
-// does (the step dies too). Returns the exit status and stdout.
-async function signalDuringStep(t, f, signal, marker, args, { group = false } = {}) {
+// does (the step's Git command dies too); then opens the step's gate. Returns the exit status
+// and stdout.
+async function signalDuringStep(t, f, signal, step, args, { group = false } = {}) {
   const child = spawn(RUN_SH, ['consolidate', ...args], { env: f.env, stdio: ['ignore', 'pipe', 'ignore'], detached: group });
   let stdout = '';
   child.stdout.on('data', (d) => { stdout += d; });
   const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
   t.after(() => {
+    step.release();
     try { process.kill(group ? -child.pid : child.pid, 'SIGKILL'); } catch { /* already gone */ }
   });
-  assert.ok(await waitFor(() => existsSync(marker)), 'the step started');
+  assert.ok(await waitFor(step.ready), 'the step is running');
   process.kill(group ? -child.pid : child.pid, signal);
+  step.release();
   return { status: await exited, stdout };
 }
 
@@ -1361,9 +1387,9 @@ test('a signal during a locked step ends the run as aborted; the model is never 
     const f = fixture(t);
     duplicateProject(f);
     f.instruct(mergeInstruction());
-    const { marker } = slowFetch(f, 1);
+    const step = slowFetch(f, 1, { hold: group });
     const head = f.head();
-    const { status, stdout } = await signalDuringStep(t, f, signal, marker, ['organize'], { group });
+    const { status, stdout } = await signalDuringStep(t, f, signal, step, ['organize'], { group });
     assert.deepEqual(status, { code, signal: null }, signal);
     // No model information on the line: the model was never started.
     assert.match(stdout, /^organize p: aborted, nothing applied, USD 0\.00$/m, signal);
@@ -1381,11 +1407,14 @@ test('a terminal signal during the sync after applying: the apply stands and its
     duplicateProject(f);
     f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
     f.instruct(mergeInstruction());
-    const { marker } = slowFetch(f, 3);
-    const { status, stdout } = await signalDuringStep(t, f, signal, marker, ['organize'], { group: true });
+    const step = slowFetch(f, 3, { hold: true });
+    const { status, stdout } = await signalDuringStep(t, f, signal, step, ['organize'], { group: true });
     assert.deepEqual(status, { code, signal: null }, signal);
     assert.match(stdout, /^organize p: applied, 3 change\(s\), USD 0\.25, stopped: completed$/m, signal);
+    // The signal ended the sync's Git command: the commit is made, the push is pending.
     assert.match(stdout, /push pending/, signal);
+    assert.equal(existsSync(step.slept), false, signal);
+    assert.ok(f.remoteFiles().includes('projects/p/b.md'), `${signal}: the remote does not have the commit yet`);
     assert.doesNotMatch(stdout, /nothing applied/, signal);
     assert.doesNotMatch(stdout, /organize q:/, signal);
     assert.match(f.subjects()[0], /^consolidate\(alpha\): organize projects\/p/, signal);
@@ -1464,8 +1493,12 @@ test('a signal while the apply step waits for the lock: aborted, nothing applied
     child.stdout.on('data', (d) => { stdout += d; });
     const exited = new Promise((resolve) => child.once('close', (code2, sig) => resolve({ code: code2, signal: sig })));
     t.after(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } });
-    // The apply step is waiting once its run.sh is running with the work folder of this run.
-    const waiting = () => spawnSync('pgrep', ['-f', `consolidate-step apply --work ${f.state}`]).status === 0;
+    // The apply step is waiting once its run.sh, started with the work folder of this run, is
+    // running flock: bash then waits for a child that the signal ends.
+    const waiting = () => {
+      const found = spawnSync('pgrep', ['-f', `consolidate-step apply --work ${f.state}`], { encoding: 'utf8' });
+      return found.status === 0 && found.stdout.trim().split('\n').some((pid) => hasChild(pid, 'flock'));
+    };
     assert.ok(await waitFor(waiting), 'the apply step is waiting for the lock');
     process.kill(-child.pid, signal);
     const status = await exited;
@@ -1488,8 +1521,11 @@ test('an apply step killed outright is reported as possibly applied, never as no
   let stdout = '';
   child.stdout.on('data', (d) => { stdout += d; });
   const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
-  t.after(() => child.kill('SIGKILL'));
-  assert.ok(await waitFor(() => existsSync(step.marker)), 'the step started');
+  t.after(() => {
+    step.release();
+    child.kill('SIGKILL');
+  });
+  assert.ok(await waitFor(step.ready), 'the step is running');
   process.kill(step.stepPid(), 'SIGKILL');
   const status = await exited;
   assert.ok(await waitFor(() => existsSync(step.slept)), 'the slow fetch finished');
@@ -1532,8 +1568,8 @@ test('a signal while the apply step runs: the finished apply stands and the run 
   duplicateProject(f);
   f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
   f.instruct(mergeInstruction());
-  const { marker } = slowFetch(f, 3);
-  const { status, stdout } = await signalDuringStep(t, f, 'SIGTERM', marker, ['organize']);
+  const step = slowFetch(f, 3);
+  const { status, stdout } = await signalDuringStep(t, f, 'SIGTERM', step, ['organize']);
   assert.deepEqual(status, { code: 143, signal: null });
   assert.match(stdout, /^organize p: applied, 3 change\(s\), USD 0\.25, stopped: completed$/m);
   assert.match(stdout, /^organize: interrupted by SIGTERM; nothing more was applied$/m);
@@ -1549,12 +1585,12 @@ test('a signal between two scopes: the next snapshot step never runs', async (t)
   duplicateProject(f);
   f.seed({ 'projects/q/a.md': note('a', 'A', 'Also due.') });
   // p changes nothing, so its apply step makes two fetches; the signal comes during the second.
-  const { marker, fetches } = slowFetch(f, 2);
-  const { status, stdout } = await signalDuringStep(t, f, 'SIGINT', marker, ['organize']);
+  const step = slowFetch(f, 2);
+  const { status, stdout } = await signalDuringStep(t, f, 'SIGINT', step, ['organize']);
   assert.deepEqual(status, { code: 130, signal: null });
   assert.match(stdout, /^organize p: no-change, 0 change\(s\)/m);
   assert.doesNotMatch(stdout, /organize q:/);
-  assert.equal(fetches(), 2);
+  assert.equal(step.fetches(), 2);
   assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
 });
 
