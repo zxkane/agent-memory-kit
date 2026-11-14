@@ -1,0 +1,79 @@
+// Pure policy documents. No SST or Pulumi imports, so tests and the normal
+// type check can load this file without the generated platform types.
+
+export type PolicyStatement = {
+  Effect: 'Allow' | 'Deny';
+  Principal?: '*' | { AWS: string[] };
+  Action: string[];
+  Resource: string[];
+  Condition?: Record<string, Record<string, string | string[]>>;
+};
+
+export type PolicyDocument = {
+  Version: '2012-10-17';
+  Statement: PolicyStatement[];
+};
+
+const ROLE_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]+$/;
+
+/** The function's whole permission set. No delete, no list. */
+export function functionPolicy(bucketArn: string): PolicyDocument {
+  return {
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Effect: 'Allow',
+        Action: ['s3:GetObject'],
+        Resource: [`${bucketArn}/mem/*`, `${bucketArn}/index/*`, `${bucketArn}/agents/*`],
+      },
+      {
+        Effect: 'Allow',
+        Action: ['s3:PutObject'],
+        Resource: [`${bucketArn}/agents/*`, `${bucketArn}/index/agents.json`],
+      },
+    ],
+  };
+}
+
+/** TLS-only deny, plus the workstation bridge roles when given. */
+export function bucketPolicy(bucketArn: string, workstationRoleArns: string[]): PolicyDocument {
+  for (const arn of workstationRoleArns) {
+    if (!ROLE_ARN_RE.test(arn)) {
+      throw new Error('Each workstation role ARN must be an IAM role ARN.');
+    }
+  }
+  const statements: PolicyStatement[] = [
+    {
+      Effect: 'Deny',
+      Principal: '*',
+      Action: ['s3:*'],
+      Resource: [bucketArn, `${bucketArn}/*`],
+      Condition: { Bool: { 'aws:SecureTransport': 'false' } },
+    },
+  ];
+  if (workstationRoleArns.length > 0) {
+    const principal = { AWS: workstationRoleArns };
+    statements.push(
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+        Resource: [`${bucketArn}/mem/*`, `${bucketArn}/index/*`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:GetObject'],
+        Resource: [`${bucketArn}/agents/*`],
+      },
+      {
+        Effect: 'Allow',
+        Principal: principal,
+        Action: ['s3:ListBucket'],
+        Resource: [bucketArn],
+        Condition: { StringLike: { 's3:prefix': ['mem/*', 'index/*', 'agents/*'] } },
+      },
+    );
+  }
+  return { Version: '2012-10-17', Statement: statements };
+}

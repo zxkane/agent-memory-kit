@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["sst.config.ts", "infra", "src/routes.ts", ".sst/platform/config.d.ts"]
+}
