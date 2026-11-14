@@ -11,8 +11,11 @@ import { RESOURCE_SERVER, ROUTES } from '../src/routes.ts';
 
 export type CheckResult = { name: string; ok: boolean; detail: string; skipped?: boolean };
 
-// Thrown by mintToken when the probe client may not have a requested scope (Cognito answers the
-// token request with HTTP 400 and invalid_scope). runChecks treats it as a skip, not an error.
+// Thrown by mintToken when the probe client may not have a requested scope: the token request is
+// answered with HTTP 400 and invalid_grant or invalid_scope. Amazon Cognito sends invalid_grant (its
+// developer guide lists invalid_request, invalid_client, invalid_grant, unauthorized_client and
+// unsupported_grant_type for the token endpoint); invalid_scope is the generic OAuth 2.0 value.
+// runChecks treats it as a skip, not an error.
 export class ScopeNotAllowedError extends Error {}
 
 // Thrown by runChecks when it cannot continue. It names the step and the error class only, never
@@ -50,7 +53,7 @@ export function makeMintToken(options: {
       signal: AbortSignal.timeout(options.timeoutMs ?? REQUEST_TIMEOUT_MS),
     });
     const body: any = await res.json().catch(() => null);
-    if (res.status === 400 && body?.error === 'invalid_scope') {
+    if (res.status === 400 && (body?.error === 'invalid_grant' || body?.error === 'invalid_scope')) {
       throw new ScopeNotAllowedError(`scope not allowed for the probe client: ${scopes.join(' ')}`);
     }
     if (!res.ok || typeof body?.access_token !== 'string') {
