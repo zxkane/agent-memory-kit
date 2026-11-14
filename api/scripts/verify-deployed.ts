@@ -78,6 +78,8 @@ export type Deps = {
   onResult?: (result: CheckResult) => void;
   // Timeout of each request, in milliseconds. Default 15000.
   timeoutMs?: number;
+  // The stage under test. On prod the probe client must not be able to write.
+  stage?: string;
 };
 
 const READ = `${RESOURCE_SERVER}/read`;
@@ -122,13 +124,11 @@ function tokenExpiry(token: string): number | null {
   }
 }
 
-// Required response fields of an operation: the schema's `required` list when it has one,
-// otherwise every property the description declares.
-function requiredFields(openapi: any, method: string, path: string): string[] {
+// Required response fields of an operation: the `required` list of its 200 schema, or null when
+// the description has none (which check 6 reports as a failure).
+function requiredFields(openapi: any, method: string, path: string): string[] | null {
   const schema = openapi?.paths?.[path]?.[method.toLowerCase()]?.responses?.['200']?.content?.['application/json']?.schema;
-  if (schema === undefined) return [];
-  if (Array.isArray(schema.required)) return schema.required;
-  return Object.keys(schema.properties ?? {});
+  return Array.isArray(schema?.required) ? schema.required : null;
 }
 
 export async function runChecks(deps: Deps): Promise<CheckResult[]> {
@@ -217,7 +217,16 @@ async function runSteps(deps: Deps, progress: { step: string }): Promise<CheckRe
   progress.step = 'check 4';
   const readToken = await mintToken([READ]);
   const forbidden = await call('POST', '/v1/notes', { token: readToken, body: probeNote });
-  add('4. a read-only token cannot write', !('error' in forbidden) && forbidden.status === 403, `POST /v1/notes with only ${READ}: ${describe(forbidden)}, expect 403`);
+  // API Gateway's own refusal has the body {"message":"Forbidden"}; the function's refusal carries
+  // error.code. Only the gateway's answer proves the route itself requires the write scope.
+  const byFunction = !('error' in forbidden) && forbidden.status === 403 && typeof (forbidden.body as any)?.error?.code === 'string';
+  add(
+    '4. a read-only token cannot write',
+    !('error' in forbidden) && forbidden.status === 403 && !byFunction,
+    byFunction
+      ? `POST /v1/notes with only ${READ}: 403 from the function; the gateway let the request through; the route may have lost its scope`
+      : `POST /v1/notes with only ${READ}: ${describe(forbidden)}, expect 403 from the gateway`,
+  );
 
   // Check 5a: positive read checks with a read-only token.
   const replies = new Map<string, Reply>();
@@ -234,6 +243,23 @@ async function runSteps(deps: Deps, progress: { step: string }): Promise<CheckRe
   const searchOk = !('error' in search) && search.status === 200 && Array.isArray((search.body as any)?.results) && typeof (search.body as any)?.total === 'number';
   add('5a. memory_search answers with results and total', searchOk, `status ${describe(search)}`);
 
+  // A missing note and a missing scope must read as 404 not_found. Without the list permission S3
+  // answers a get of a missing key with 403 and the function would answer 500.
+  const expectNotFound = (name: string, reply: Reply | { error: string }, what: string) => {
+    const ok = !('error' in reply) && reply.status === 404 && (reply.body as any)?.error?.code === 'not_found';
+    add(name, ok, ok ? `${what}: 404 not_found` : `${what}: ${describe(reply)}, expect 404 not_found; the function probably lacks the list permission`);
+  };
+  expectNotFound(
+    '5a. memory_read of a missing note answers 404 not_found',
+    await call('GET', '/v1/note', { token: readToken, query: { path: `agents/${PROBE_AGENT}/no-such-note.md` } }),
+    'memory_read',
+  );
+  expectNotFound(
+    '5a. memory_index of a missing scope answers 404 not_found',
+    await call('GET', '/v1/index', { token: readToken, query: { scope: 'agents/no-such-agent' } }),
+    'memory_index',
+  );
+
   // Check 5b: write, then read it back. Needs a token with the write scope, which the probe client
   // does not have on every stage.
   progress.step = 'check 5b';
@@ -245,6 +271,8 @@ async function runSteps(deps: Deps, progress: { step: string }): Promise<CheckRe
   }
   if (bothToken === undefined) {
     add('5b. write and read back a note', true, 'SKIP: the probe client has no write scope on this stage', true);
+  } else if (deps.stage === 'prod') {
+    add('5b. the probe client is read-only on prod', false, 'a token with the write scope was issued on prod; the probe client must be read-only on prod, so 5b did not run');
   } else {
     const write = await fetched(bothToken, 'memory_write', 'POST', '/v1/notes', { body: probeNote });
     if (!('error' in write) && write.status === 200) {
@@ -285,7 +313,9 @@ async function runSteps(deps: Deps, progress: { step: string }): Promise<CheckRe
     if (reply === undefined || reply.status !== 200) continue;
     checked.push(route.operationId);
     const body = reply.body;
-    for (const field of requiredFields(openapi, route.method, route.path)) {
+    const fields = requiredFields(openapi, route.method, route.path);
+    if (fields === null) missing.push(`${route.operationId} (no required list in openapi.json)`);
+    for (const field of fields ?? []) {
       if (typeof body !== 'object' || body === null || !(field in body)) missing.push(`${route.operationId}.${field}`);
     }
   }
@@ -376,6 +406,7 @@ async function main(): Promise<number> {
       now: () => Date.now(),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       expired: args.expired,
+      stage: args.stage,
       onResult: (r) => console.log(formatResult(r)),
     });
     return results.some((r) => !r.ok) ? 1 : 0;

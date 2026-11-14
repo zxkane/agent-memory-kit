@@ -21,7 +21,17 @@ function makeToken(scopes: string[], exp: number): string {
   return [b64({ alg: 'RS256', typ: 'JWT' }), b64({ iss: ISSUER, scope: scopes.join(' '), exp }), SIGNATURE_MARKER].join('.');
 }
 
-const OPENAPI = {
+const withRequired = (doc: any) => {
+  for (const item of Object.values<any>(doc.paths)) {
+    for (const op of Object.values<any>(item)) {
+      const schema = op.responses[200].content['application/json'].schema;
+      schema.required = Object.keys(schema.properties);
+    }
+  }
+  return doc;
+};
+
+const OPENAPI = withRequired({
   paths: {
     '/v1/scopes': { get: { operationId: 'memory_scopes', responses: { 200: { content: { 'application/json': { schema: { type: 'object', properties: { scopes: {} } } } } } } } },
     '/v1/index': { get: { operationId: 'memory_index', responses: { 200: { content: { 'application/json': { schema: { type: 'object', properties: { scope: {}, index: {}, truncated: {} } } } } } } } },
@@ -29,13 +39,17 @@ const OPENAPI = {
     '/v1/note': { get: { operationId: 'memory_read', responses: { 200: { content: { 'application/json': { schema: { type: 'object', properties: { path: {}, content: {}, truncated: {} } } } } } } } },
     '/v1/notes': { post: { operationId: 'memory_write', responses: { 200: { content: { 'application/json': { schema: { type: 'object', properties: { path: {}, created: {} } } } } } } } },
   },
-};
+});
 
 type Quirks = {
   noAuthStatus?: number;
   readTokenOnWrite?: boolean;
+  // The gateway lets a read-only token through, so the function answers 403 with its own body.
+  functionForbids?: boolean;
   omit?: { path: string; field: string };
   rejectWrite?: boolean;
+  // Status of a read of a missing note or index (a role without list permission gives 500).
+  missingStatus?: number;
   unknownPathStatus?: number;
   expiredStatus?: number;
   writeReply?: { status: number; code?: string } | 'network';
@@ -78,17 +92,19 @@ function fakeApi(valid: Set<string>, quirks: Quirks = {}) {
       case 'GET /v1/index': {
         const scope = url.searchParams.get('scope');
         const lines = [...notes.keys()].filter((k) => k.startsWith(`${scope}/`)).map((k) => `- [${k}](${k})`);
+        if (lines.length === 0) return quirks.missingStatus === undefined ? json(404, { error: { code: 'not_found', message: 'x' } }) : json(quirks.missingStatus, { error: { code: 'internal', message: 'x' } });
         return reply('/v1/index', { scope, index: lines.join('\n'), truncated: false });
       }
       case 'GET /v1/search':
         return reply('/v1/search', { results: [], total: 0 });
       case 'GET /v1/note': {
         const path = url.searchParams.get('path')!;
-        return notes.has(path) ? reply('/v1/note', { path, content: notes.get(path), truncated: false }) : json(404, { error: { code: 'not_found', message: 'x' } });
+        if (notes.has(path)) return reply('/v1/note', { path, content: notes.get(path), truncated: false });
+        return quirks.missingStatus === undefined ? json(404, { error: { code: 'not_found', message: 'x' } }) : json(quirks.missingStatus, { error: { code: 'internal', message: 'x' } });
       }
       case 'POST /v1/notes': {
         if (!granted.includes('agent-memory/write') && !quirks.readTokenOnWrite) {
-          return json(403, { error: { code: 'forbidden', message: 'x' } });
+          return quirks.functionForbids ? json(403, { error: { code: 'forbidden', message: 'x' } }) : json(403, { message: 'Forbidden' });
         }
         if (quirks.rejectWrite) return json(400, { error: { code: 'store_full', message: 'x' } });
         if (quirks.writeReply === 'network') throw new TypeError(`connect failed ${quirks.bodyMarker ?? ''}`);
@@ -107,7 +123,7 @@ function fakeApi(valid: Set<string>, quirks: Quirks = {}) {
   return fake;
 }
 
-function setup(quirks: Quirks = {}, options: { expired?: boolean } = {}) {
+function setup(quirks: Quirks = {}, options: { expired?: boolean; stage?: string } = {}) {
   const valid = new Set<string>();
   const fake = fakeApi(valid, quirks);
   const minted: string[][] = [];
@@ -156,6 +172,87 @@ test('check 4 fails when the read-only token is accepted on the write route', as
   assert.ok(failed.some((r) => r.name.startsWith('4.')));
 });
 
+test('check 4 passes only on the gateway\'s own 403, not on the function\'s', async () => {
+  const ok = (await setup().run()).find((r) => r.name.startsWith('4.'))!;
+  assert.equal(ok.ok, true);
+  const bad = (await setup({ functionForbids: true }).run()).find((r) => r.name.startsWith('4.'))!;
+  assert.equal(bad.ok, false);
+  assert.match(bad.detail, /the gateway let the request through; the route may have lost its scope/);
+});
+
+for (const missingStatus of [500, 403]) {
+  test(`check 5a fails when a missing note or index answers ${missingStatus}`, async () => {
+    const { run } = setup({ missingStatus });
+    const failed = (await run()).filter((r) => !r.ok && r.name.startsWith('5a.'));
+    assert.equal(failed.length, 2, JSON.stringify(failed));
+    for (const r of failed) assert.match(r.detail, /list permission/);
+  });
+}
+
+test('check 5a expects 404 not_found for a missing note and a missing index scope', async () => {
+  const { run, fake } = setup();
+  const results = await run();
+  const five = results.filter((r) => r.name.startsWith('5a.'));
+  assert.equal(five.length, 4);
+  assert.ok(five.every((r) => r.ok));
+  assert.ok(fake.calls.includes('GET /v1/note') && fake.calls.includes('GET /v1/index'));
+});
+
+test('on prod a token that can write is a failure and 5b does not run', async () => {
+  const { run, fake } = setup({}, { stage: 'prod' });
+  const results = await run();
+  const failed = results.filter((r) => !r.ok);
+  assert.equal(failed.length, 1, JSON.stringify(failed));
+  assert.match(failed[0]!.detail, /the probe client must be read-only on prod/);
+  assert.equal(fake.notes.size, 0);
+  // Three refused posts (checks 1-3) and the read-only post of check 4; no probe write follows.
+  assert.equal(fake.calls.filter((c) => c === 'POST /v1/notes').length, 4);
+  assert.deepEqual(results.filter((r) => r.name.startsWith('5b.') && r.ok), []);
+});
+
+test('on prod a read-only probe client passes and 5b is skipped; other stages are unchanged', async () => {
+  const valid = new Set<string>();
+  const fake = fakeApi(valid);
+  const results = await runChecks({
+    fetch: fake.fetch,
+    config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+    mintToken: async (scopes) => {
+      if (scopes.includes('agent-memory/write')) throw new ScopeNotAllowedError('no write scope');
+      const token = makeToken(scopes, 2_000_000_000);
+      valid.add(token);
+      return token;
+    },
+    now: () => fake.clock.value,
+    sleep: async () => {},
+    openapi: OPENAPI,
+    stage: 'prod',
+  });
+  assert.deepEqual(results.filter((r) => !r.ok), []);
+  assert.equal(results.filter((r) => r.skipped).length, 1);
+  const dev = await setup({}, { stage: 'dev' }).run();
+  assert.ok(dev.some((r) => r.name.startsWith('5b.') && r.ok && !r.skipped));
+});
+
+test('check 6 fails when the description has no required list', async () => {
+  const bare: any = JSON.parse(JSON.stringify(OPENAPI));
+  delete bare.paths['/v1/scopes'].get.responses[200].content['application/json'].schema.required;
+  const valid = new Set<string>();
+  const fake = fakeApi(valid);
+  const results = await runChecks({
+    fetch: fake.fetch,
+    config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+    mintToken: async (scopes) => {
+      const token = makeToken(scopes, 2_000_000_000);
+      valid.add(token);
+      return token;
+    },
+    now: () => fake.clock.value,
+    sleep: async () => {},
+    openapi: bare,
+  });
+  assert.ok(results.some((r) => !r.ok && r.name.startsWith('6.') && r.detail.includes('memory_scopes')));
+});
+
 test('check 6 fails when a response lacks a required field', async () => {
   const { run } = setup({ omit: { path: '/v1/note', field: 'truncated' } });
   const failed = (await run()).filter((r) => !r.ok);
@@ -189,7 +286,7 @@ test('a probe client without the write scope skips 5b and everything else passes
   assert.ok(skipped[0]!.name.startsWith('5b.'));
   assert.ok(skipped[0]!.detail.includes('the probe client has no write scope on this stage'));
   assert.ok(results.some((r) => r.name.startsWith('4.') && r.ok));
-  assert.ok(results.filter((r) => r.name.startsWith('5a.')).length === 2);
+  assert.ok(results.filter((r) => r.name.startsWith('5a.')).length === 4);
   assert.deepEqual([...fake.notes.keys()], []);
 });
 

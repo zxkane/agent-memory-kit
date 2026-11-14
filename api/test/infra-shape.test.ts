@@ -80,6 +80,19 @@ describe('infrastructure source', () => {
     assert.equal((squash('infra/auth.ts').match(/explicitAuthFlows:\[\]/g) ?? []).length, 1);
   });
 
+  it('expires noncurrent versions of index/ after one day and keeps the 90-day bucket-wide rule', () => {
+    const src = squash('infra/storage.ts');
+    assert.match(
+      src,
+      /id:"expire-old-versions-and-abandoned-uploads",status:"Enabled",filter:\{\},noncurrentVersionExpiration:\{noncurrentDays:90\}/,
+    );
+    assert.match(
+      src,
+      /id:"expire-index-snapshot-versions",status:"Enabled",filter:\{prefix:"index\/"\},noncurrentVersionExpiration:\{noncurrentDays:1\}/,
+    );
+    assert.equal((src.match(/noncurrentVersionExpiration/g) ?? []).length, 2);
+  });
+
   it('logs the source IP', () => {
     assert.match(read('infra/api.ts'), /\$context\.identity\.sourceIp/);
   });

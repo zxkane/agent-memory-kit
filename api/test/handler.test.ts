@@ -336,7 +336,7 @@ test('a refused name, agent or path never reaches the log line', async () => {
   for (const [route, opts] of cases) {
     const { handler, lines, store } = setup();
     const res = await handler(event(route, opts));
-    assert.ok(res.statusCode < 500, `${route} ${res.statusCode}`);
+    assert.ok((res.statusCode ?? 0) < 500, `${route} ${res.statusCode}`);
     if (route === 'POST /v1/notes') assert.equal(json(res).error.code, 'secret_detected');
     assert.equal(store.objects.size, 0);
     assert.equal(lines.length, 1);

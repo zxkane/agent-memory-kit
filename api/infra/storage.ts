@@ -41,6 +41,15 @@ new aws.s3.BucketLifecycleConfiguration(
         noncurrentVersionExpiration: { noncurrentDays: 90 },
         abortIncompleteMultipartUpload: { daysAfterInitiation: 7 },
       },
+      // The two snapshots are rewritten on every write and can be megabytes each, so their old
+      // versions go after one day. A noncurrent version expires as soon as any rule that matches
+      // it is due, so this shorter rule wins for index/ and the 90-day rule covers the rest.
+      {
+        id: "expire-index-snapshot-versions",
+        status: "Enabled",
+        filter: { prefix: "index/" },
+        noncurrentVersionExpiration: { noncurrentDays: 1 },
+      },
     ],
   },
   { dependsOn: [versioning] },
