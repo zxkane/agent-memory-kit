@@ -93,6 +93,22 @@ test('committed counts additions, modifications and deletions', (t) => {
   assert.match(sh(f.a, 'git', ['log', '-1', '--format=%s']), /^sync\(alpha\): 3 file\(s\)/);
 });
 
+test('a single-line message replaces the working-tree commit subject; any other value is ignored', (t) => {
+  const f = fixture(t);
+  write(f.a, 'projects/p/one.md', '1');
+  assert.equal(f.syncA({ message: 'consolidate(alpha): organize projects/p' }).ok, true);
+  assert.equal(sh(f.a, 'git', ['log', '-1', '--format=%s']).trim(), 'consolidate(alpha): organize projects/p (1 file(s))');
+  assert.equal(sh(f.remote, 'git', ['log', '-1', '--format=%s', 'main']).trim(), 'consolidate(alpha): organize projects/p (1 file(s))');
+  for (const message of ['two\nlines', '', 42]) {
+    write(f.a, 'projects/p/one.md', `changed ${JSON.stringify(message)}`);
+    assert.equal(f.syncA({ message }).ok, true);
+    assert.equal(sh(f.a, 'git', ['log', '-1', '--format=%s']).trim(), 'sync(alpha): 1 file(s)');
+  }
+  write(f.a, 'projects/p/one.md', 'again');
+  f.syncA();
+  assert.equal(sh(f.a, 'git', ['log', '-1', '--format=%s']).trim(), 'sync(alpha): 1 file(s)');
+});
+
 test('a second clone receives the note', (t) => {
   const f = fixture(t);
   write(f.a, 'projects/p/note.md', 'hello');

@@ -5,7 +5,9 @@
 #
 # --init writes ~/.config/agent-memory/config.json (first run only).
 # --dry-run prints what would happen and changes nothing.
-# --no-enable writes the systemd units but does not enable the timer.
+# --no-enable writes the systemd units but does not enable the timers.
+# When the config has consolidate.extract / consolidate.organize schedules, the matching
+# weekly timer is written too; a scope without a schedule has its units removed.
 # --no-hooks does everything else but does not register the Claude Code, Codex and
 #   Kiro hooks (and removes the kit's own entries if present).
 set -euo pipefail
@@ -26,6 +28,9 @@ hooks=1
 init_host=""
 repo_url_arg=""
 init=0
+extract_cal=""
+organize_cal=""
+consolidate_problem=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
@@ -112,11 +117,27 @@ else
         const { loadConfig } = await import(process.argv[1]);
         const c = loadConfig({ HOME: process.env.HOME });
         if (!c) process.exit(3);
-        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? ""]));
+        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? "", c.consolidate?.extract ?? "", c.consolidate?.organize ?? "", c.consolidateProblem ?? ""]));
     ' "file://$kit_dir/workstation/lib/config.mjs")" || die "$config_file is not a valid, enabled configuration."
     repo_dir="$(node -p 'JSON.parse(process.argv[1])[0]' "$cfg")"
     repo_url="$(node -p 'JSON.parse(process.argv[1])[1]' "$cfg")"
+    extract_cal="$(node -p 'JSON.parse(process.argv[1])[2]' "$cfg")"
+    organize_cal="$(node -p 'JSON.parse(process.argv[1])[3]' "$cfg")"
+    consolidate_problem="$(node -p 'JSON.parse(process.argv[1])[4]' "$cfg")"
 fi
+# A consolidate block that is present but invalid leaves the consolidation units as they are:
+# reading it as "no schedule" would remove timers that the person did not ask to remove.
+# True when systemd-analyze is on the PATH and rejects the calendar expression $2 of scope $1;
+# then prints one line, and that scope's units are left as they are. Without the tool, nothing
+# is checked here (setup's own check in config.mjs still applies).
+calendar_rejected() { # calendar_rejected <extract|organize> <calendar>
+    command -v systemd-analyze > /dev/null 2>&1 || return 1
+    systemd-analyze calendar "$2" > /dev/null 2>&1 && return 1
+    printf 'the %s schedule "%s" is not a valid systemd calendar expression (systemd-analyze calendar rejected it); the %s units were left as they are.\n' "$1" "$2" "$1"
+}
+invalid_block_line() {
+    printf 'the consolidate block in %s is invalid (%s); the consolidation units were left as they are.\n' "$config_file" "$consolidate_problem"
+}
 
 # 4. The notes clone: an existing directory must already be a clone on main.
 clone_needed=0
@@ -164,8 +185,24 @@ if [[ $dry_run -eq 1 ]]; then
     fi
     node "$kit_dir/workstation/install.mjs" --plan ${install_flags[@]+"${install_flags[@]}"}
     printf 'would write %s/agent-memory-sync.service and agent-memory-sync.timer\n' "$unit_dir"
+    timers_on=""
+    [[ -z "$consolidate_problem" ]] || invalid_block_line
+    for scope in extract organize; do
+        [[ -z "$consolidate_problem" ]] || break
+        cal_var="${scope}_cal"
+        if [[ -n "${!cal_var}" ]] && calendar_rejected "$scope" "${!cal_var}"; then
+            continue
+        elif [[ -n "${!cal_var}" ]]; then
+            printf 'would write %s/agent-memory-%s.service and agent-memory-%s.timer\n' "$unit_dir" "$scope" "$scope"
+            timers_on="$timers_on agent-memory-$scope.timer"
+        else
+            for f in "$unit_dir/agent-memory-$scope.timer" "$unit_dir/agent-memory-$scope.service"; do
+                [[ -e "$f" ]] && printf 'would remove %s\n' "$f"
+            done
+        fi
+    done
     if [[ $enable -eq 1 ]]; then
-        printf '%s\n' 'would run systemctl --user daemon-reload and enable --now agent-memory-sync.timer'
+        printf '%s\n' "would run systemctl --user daemon-reload and enable --now agent-memory-sync.timer$timers_on"
     fi
     exit 0
 fi
@@ -231,10 +268,69 @@ WantedBy=timers.target
 UNIT
 printf 'wrote units in %s\n' "$unit_dir"
 
+# Consolidation: one weekly timer per scope that has a schedule; a scope without one loses its units.
+# The calendar expression is validated by workstation/lib/config.mjs and is one line.
+timers_on=()
+removed=0
+write_consolidate_units() { # write_consolidate_units <extract|organize> <calendar>
+    write_unit "agent-memory-$1.service" << UNIT
+# Managed by agent-memory-kit setup.sh.
+[Unit]
+Description=Consolidate the shared agent memory ($1)
+
+[Service]
+Type=oneshot
+Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin
+ExecStart="$kit_dir/workstation/run.sh" consolidate $1
+TimeoutStartSec=4h
+UMask=0077
+Nice=10
+UNIT
+    write_unit "agent-memory-$1.timer" << UNIT
+# Managed by agent-memory-kit setup.sh.
+[Unit]
+Description=Consolidate the shared agent memory ($1) weekly
+
+[Timer]
+OnCalendar=$2
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
+UNIT
+    timers_on+=("agent-memory-$1.timer")
+}
+[[ -z "$consolidate_problem" ]] || invalid_block_line
+for scope in extract organize; do
+    [[ -z "$consolidate_problem" ]] || break
+    cal_var="${scope}_cal"
+    if [[ -n "${!cal_var}" ]] && calendar_rejected "$scope" "${!cal_var}"; then
+        continue
+    elif [[ -n "${!cal_var}" ]]; then
+        write_consolidate_units "$scope" "${!cal_var}"
+        printf 'wrote agent-memory-%s.service and agent-memory-%s.timer\n' "$scope" "$scope"
+    elif [[ -e "$unit_dir/agent-memory-$scope.timer" || -e "$unit_dir/agent-memory-$scope.service" ]]; then
+        if [[ -e "$unit_dir/agent-memory-$scope.timer" ]]; then
+            systemctl --user disable --now "agent-memory-$scope.timer" || true
+        fi
+        rm -f "$unit_dir/agent-memory-$scope.timer" "$unit_dir/agent-memory-$scope.service"
+        removed=1
+        printf 'removed agent-memory-%s.service and agent-memory-%s.timer\n' "$scope" "$scope"
+    fi
+done
+
 if [[ $enable -eq 1 ]]; then
     systemctl --user daemon-reload
     systemctl --user enable --now agent-memory-sync.timer
     printf '%s\n' 'enabled agent-memory-sync.timer'
+    for t in ${timers_on[@]+"${timers_on[@]}"}; do
+        systemctl --user enable --now "$t"
+        printf 'enabled %s\n' "$t"
+    done
 else
+    if [[ $removed -ne 0 ]] && ! systemctl --user daemon-reload; then
+        printf '%s\n' 'could not reload systemd (systemctl --user daemon-reload failed); run it by hand'
+    fi
     printf '%s\n' 'timer not enabled (--no-enable)'
 fi

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadConfig } from '../lib/config.mjs';
+import { MODEL_RE, loadConfig } from '../lib/config.mjs';
 import { tempDir } from './helpers.mjs';
 
 function setup(t) {
@@ -33,7 +33,7 @@ test('applies defaults', (t) => {
   assert.deepEqual(loadConfig(env), {
     host: 'alpha', repoDir: '/home/u/agent-memory', repoUrl: null,
     stateDir: join(dir, '.local/state/agent-memory'), claudeDir: join(dir, '.claude'),
-    staleAfterSeconds: 600,
+    staleAfterSeconds: 600, consolidate: null, consolidateProblem: null,
   });
 });
 
@@ -46,7 +46,7 @@ test('reads the default path under HOME and honors explicit values', (t) => {
   }));
   assert.deepEqual(loadConfig({ HOME: dir }), {
     host: 'beta', repoDir: '/r', repoUrl: 'git@example.com:u/m.git',
-    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30,
+    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30, consolidate: null, consolidateProblem: null,
   });
 });
 
@@ -63,4 +63,142 @@ test('rejects a bad host, a relative repoDir and invalid JSON', (t) => {
   }
   writeRaw('{not json');
   assert.equal(loadConfig(env), null);
+});
+
+const BASE = { enabled: true, host: 'alpha', repoDir: '/home/u/agent-memory' };
+
+test('consolidate is null when the block is absent', (t) => {
+  const { env, write } = setup(t);
+  write(BASE);
+  assert.equal(loadConfig(env).consolidate, null);
+});
+
+test('consolidate block is returned with given values', (t) => {
+  const { env, write } = setup(t);
+  const block = {
+    command: '/usr/local/bin/model', model: 'big-model', env: { FOO_BAR: 'x' },
+    extract: 'Mon *-*-* 03:00:00', organize: 'Sun *-*-* 04:30', maxProjects: 7,
+    maxTranscriptBytes: 50000, maxTurns: 10, maxBudgetUsd: 1.5, timeoutMinutes: 12,
+  };
+  write({ ...BASE, consolidate: block });
+  assert.deepEqual(loadConfig(env).consolidate, block);
+});
+
+test('consolidate defaults are filled', (t) => {
+  const { env, write } = setup(t);
+  write({ ...BASE, consolidate: { command: '/bin/m', model: 'm1' } });
+  assert.deepEqual(loadConfig(env).consolidate, {
+    command: '/bin/m', model: 'm1', env: {}, extract: null, organize: null,
+    maxProjects: 5, maxTranscriptBytes: 200000, maxTurns: 200, maxBudgetUsd: 5, timeoutMinutes: 30,
+  });
+});
+
+test('an invalid consolidate block gives null without disabling the config', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  for (const bad of [
+    { ...ok, command: 'rel/m' },
+    { ...ok, command: undefined },
+    { ...ok, command: '/bin/m\nx' },
+    { ...ok, command: '/bin/m\u0000x' },
+    { ...ok, command: '/bin/m\u007fx' },
+    { ...ok, env: { FOO: 'a\nb' } },
+    { ...ok, env: { FOO: 'a\u0000b' } },
+    { ...ok, model: '' },
+    { ...ok, model: 'a b' },
+    { ...ok, env: { lower: 'x' } },
+    { ...ok, env: { FOO: 1 } },
+    { ...ok, extract: 'Mon; rm' },
+    { ...ok, extract: 'Mon\n03:00' },
+    { ...ok, organize: '' },
+    { ...ok, organize: '   ' },
+    { ...ok, extract: ' ' },
+    { ...ok, organize: 'x'.repeat(81) },
+    { ...ok, maxProjects: 0 },
+    { ...ok, maxProjects: 51 },
+    { ...ok, maxProjects: 1.5 },
+    { ...ok, maxTranscriptBytes: 9999 },
+    { ...ok, maxTurns: 1001 },
+    { ...ok, maxBudgetUsd: 0 },
+    { ...ok, maxBudgetUsd: 101 },
+    { ...ok, timeoutMinutes: 1000 },
+    'text',
+    [],
+  ]) {
+    write({ ...BASE, consolidate: bad });
+    const cfg = loadConfig(env);
+    assert.notEqual(cfg, null);
+    assert.equal(cfg.host, 'alpha');
+    assert.equal(cfg.repoDir, '/home/u/agent-memory');
+    assert.equal(cfg.consolidate, null);
+  }
+});
+
+test('F4: an invalid consolidate block names the first field that failed; absent or valid gives null', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  const cases = [
+    [{ ...ok, command: 'rel/m' }, 'command'],
+    [{ ...ok, command: undefined }, 'command'],
+    [{ ...ok, command: '/bin/m\nx' }, 'command'],
+    [{ ...ok, model: '' }, 'model'],
+    [{ ...ok, model: 'a b' }, 'model'],
+    [{ ...ok, env: { lower: 'x' } }, 'env'],
+    [{ ...ok, env: { FOO: 1 } }, 'env'],
+    [{ ...ok, env: [] }, 'env'],
+    [{ ...ok, extract: 'Mon; rm' }, 'extract'],
+    [{ ...ok, organize: '   ' }, 'organize'],
+    [{ ...ok, maxProjects: 51 }, 'maxProjects'],
+    [{ ...ok, maxTranscriptBytes: 9999 }, 'maxTranscriptBytes'],
+    [{ ...ok, maxTurns: 2000 }, 'maxTurns'],
+    [{ ...ok, maxBudgetUsd: 200 }, 'maxBudgetUsd'],
+    [{ ...ok, timeoutMinutes: 1000 }, 'timeoutMinutes'],
+    [{ ...ok, model: 'a b', maxTurns: 2000 }, 'model'],
+    ['text', 'consolidate'],
+    [[], 'consolidate'],
+  ];
+  for (const [block, field] of cases) {
+    write({ ...BASE, consolidate: block });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.consolidate, null, field);
+    assert.equal(cfg.consolidateProblem, field, JSON.stringify(block));
+  }
+  write(BASE);
+  assert.equal(loadConfig(env).consolidateProblem, null);
+  write({ ...BASE, consolidate: null });
+  assert.equal(loadConfig(env).consolidateProblem, null);
+  write({ ...BASE, consolidate: ok });
+  assert.equal(loadConfig(env).consolidateProblem, null);
+});
+
+test('m13: the model is checked with MODEL_RE, the rule of the --model option', (t) => {
+  const { env, write } = setup(t);
+  for (const model of ['-x', 'a\u0001b', 'a\u007fb', 'x'.repeat(301)]) {
+    assert.equal(MODEL_RE.test(model), false, model);
+    write({ ...BASE, consolidate: { command: '/bin/m', model } });
+    assert.equal(loadConfig(env).consolidateProblem, 'model', model);
+  }
+  for (const model of ['m1', 'vendor.family-1-2', 'name[1m]', 'x'.repeat(300)]) {
+    assert.equal(MODEL_RE.test(model), true, model);
+    write({ ...BASE, consolidate: { command: '/bin/m', model } });
+    assert.equal(loadConfig(env).consolidate.model, model);
+  }
+});
+
+test('item 4: a key the consolidate block does not know makes it invalid, naming that key', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  for (const key of ['organise', 'maxBudget', 'Command']) {
+    write({ ...BASE, consolidate: { ...ok, [key]: 'x' } });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.consolidate, null, key);
+    assert.equal(cfg.consolidateProblem, key);
+  }
+  const every = {
+    command: '/bin/m', model: 'm1', env: { A_B: 'x' }, extract: 'Sat *-*-* 03:00', organize: 'Sun *-*-* 04:30',
+    maxProjects: 2, maxTranscriptBytes: 20000, maxTurns: 20, maxBudgetUsd: 2, timeoutMinutes: 20,
+  };
+  write({ ...BASE, consolidate: every });
+  assert.deepEqual(loadConfig(env).consolidate, every);
+  assert.equal(loadConfig(env).consolidateProblem, null);
 });

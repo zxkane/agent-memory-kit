@@ -283,6 +283,168 @@ check 'linked run writes nothing into the linked folders' test -z "$(ls -A "$tmp
 check 'linked run prints the Codex entry to add' has_text "$out" 'Add this hook to it:'
 check 'linked run prints the Kiro document to save' has_text "$out" 'regular file named agent-memory-kit.json'
 
+# Consolidation timers: written from the config's consolidate.extract / consolidate.organize.
+udir="$home/.config/systemd/user"
+set_consolidate() { # set_consolidate <json of the consolidate block, or "none">
+    node -e '
+        const fs = require("node:fs");
+        const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        if (process.argv[2] === "none") delete c.consolidate;
+        else c.consolidate = JSON.parse(process.argv[2]);
+        fs.writeFileSync(process.argv[1], JSON.stringify(c, null, 2) + "\n");
+    ' "$cfg" "$1"
+}
+both='{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00","organize":"Sun *-*-* 04:30"}'
+fresh_home
+run_setup --init alpha --repo-url "$remote" --no-enable
+check 'no consolidate block exits 0' test "$status" -eq 0
+check 'no consolidate block writes no extract unit' test ! -e "$udir/agent-memory-extract.service" -a ! -e "$udir/agent-memory-extract.timer"
+check 'no consolidate block writes no organize unit' test ! -e "$udir/agent-memory-organize.service" -a ! -e "$udir/agent-memory-organize.timer"
+check 'no consolidate block prints nothing about them' bash -c '! grep -qiE "extract|organize" <<< "$1"' _ "$out"
+run_setup --dry-run
+check 'no consolidate block dry run prints nothing about them' bash -c '! grep -qiE "extract|organize" <<< "$1"' _ "$out"
+set_consolidate "$both"
+rm -rf "$udir" "$calls"
+run_setup --dry-run
+check 'consolidate dry run exits 0' test "$status" -eq 0
+check 'consolidate dry run names the extract units' has_text "$out" "would write $udir/agent-memory-extract.service and agent-memory-extract.timer"
+check 'consolidate dry run names the organize units' has_text "$out" "would write $udir/agent-memory-organize.service and agent-memory-organize.timer"
+check 'consolidate dry run says it would enable them' has_text "$out" 'agent-memory-extract.timer agent-memory-organize.timer'
+check 'consolidate dry run writes nothing' test ! -e "$udir"
+check 'consolidate dry run does not call systemctl' no_calls
+run_setup --no-enable
+check 'consolidate run exits 0' test "$status" -eq 0
+check 'consolidate no-enable does not call systemctl' no_calls
+for name in extract organize; do
+    check "$name service exists" test -f "$udir/agent-memory-$name.service"
+    check "$name timer exists" test -f "$udir/agent-memory-$name.timer"
+    check "$name service ExecStart" has_line "$udir/agent-memory-$name.service" "ExecStart=\"$kit/workstation/run.sh\" consolidate $name"
+    check "$name service PATH" has_line "$udir/agent-memory-$name.service" "Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin"
+    check "$name service is oneshot" has_line "$udir/agent-memory-$name.service" 'Type=oneshot'
+    check "$name service timeout" has_line "$udir/agent-memory-$name.service" 'TimeoutStartSec=4h'
+    check "$name service umask" has_line "$udir/agent-memory-$name.service" 'UMask=0077'
+    check "$name service is nice" has_line "$udir/agent-memory-$name.service" 'Nice=10'
+    check "$name service leaves KillMode alone" bash -c '! grep -q KillMode "$1"' _ "$udir/agent-memory-$name.service"
+    check "$name timer persistent" has_line "$udir/agent-memory-$name.timer" 'Persistent=true'
+    check "$name timer jitter" has_line "$udir/agent-memory-$name.timer" 'RandomizedDelaySec=10min'
+    check "$name timer wanted by timers.target" has_line "$udir/agent-memory-$name.timer" 'WantedBy=timers.target'
+done
+check 'extract OnCalendar' has_line "$udir/agent-memory-extract.timer" 'OnCalendar=Sat *-*-* 03:00'
+check 'organize OnCalendar' has_line "$udir/agent-memory-organize.timer" 'OnCalendar=Sun *-*-* 04:30'
+run_setup
+check 'consolidate enabling run exits 0' test "$status" -eq 0
+check 'consolidate run enables the extract timer' has_line "$calls" '--user enable --now agent-memory-extract.timer'
+check 'consolidate run enables the organize timer' has_line "$calls" '--user enable --now agent-memory-organize.timer'
+check 'consolidate run still enables the sync timer' has_line "$calls" '--user enable --now agent-memory-sync.timer'
+check 'consolidate run reloads once' test "$(grep -cxF -- '--user daemon-reload' "$calls")" -eq 1
+# Removing a schedule disables its timer and removes both of its unit files.
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00"}'
+run_setup --dry-run
+check 'removal dry run names the organize files' has_text "$out" "would remove $udir/agent-memory-organize.service"
+check 'removal dry run names the organize timer' has_text "$out" "would remove $udir/agent-memory-organize.timer"
+check 'removal dry run removes nothing' test -f "$udir/agent-memory-organize.timer"
+rm -f "$calls"
+run_setup
+check 'removal exits 0' test "$status" -eq 0
+check 'removal disables the organize timer' has_line "$calls" '--user disable --now agent-memory-organize.timer'
+check 'removal removes the organize service' test ! -e "$udir/agent-memory-organize.service"
+check 'removal removes the organize timer' test ! -e "$udir/agent-memory-organize.timer"
+check 'removal keeps the extract units' test -f "$udir/agent-memory-extract.service" -a -f "$udir/agent-memory-extract.timer"
+run_setup --dry-run
+check 'a second dry run has nothing left to remove' bash -c '! grep -q "would remove" <<< "$1"' _ "$out"
+# Removing the whole block removes the rest.
+set_consolidate none
+run_setup
+check 'removing the block exits 0' test "$status" -eq 0
+check 'removing the block removes the extract units' test ! -e "$udir/agent-memory-extract.service" -a ! -e "$udir/agent-memory-extract.timer"
+check 'removing the block keeps the sync units' test -f "$svc" -a -f "$tim"
+# An invalid block counts as absent.
+set_consolidate '{"command":"relative/claude","model":"model-id","extract":"Sat *-*-* 03:00"}'
+run_setup --no-enable
+check 'an invalid block writes no unit' test ! -e "$udir/agent-memory-extract.timer"
+# F4: an invalid block leaves existing consolidation units alone and says which field failed.
+set_consolidate "$both"
+run_setup --no-enable
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00","maxTurns":2000}'
+cp "$udir/agent-memory-organize.timer" "$tmp/organize.timer.before"
+rm -f "$calls"
+run_setup --dry-run
+invalid_line="the consolidate block in $cfg is invalid (maxTurns); the consolidation units were left as they are."
+check 'invalid block dry run exits 0' test "$status" -eq 0
+check 'invalid block dry run names the field' has_text "$out" "$invalid_line"
+check 'invalid block dry run would write no consolidation unit' bash -c '! grep -qE "would (write|remove) .*agent-memory-(extract|organize)" <<< "$1"' _ "$out"
+check 'invalid block dry run still names the sync units' has_text "$out" "would write $udir/agent-memory-sync.service"
+run_setup
+check 'invalid block run exits 0' test "$status" -eq 0
+check 'invalid block run names the field' has_text "$out" "$invalid_line"
+check 'invalid block keeps the organize units' cmp -s "$udir/agent-memory-organize.timer" "$tmp/organize.timer.before"
+check 'invalid block keeps the extract units' test -f "$udir/agent-memory-extract.service" -a -f "$udir/agent-memory-extract.timer"
+check 'invalid block does not disable a consolidation timer' bash -c '! grep -qE "disable.*agent-memory-(extract|organize)" "$1"' _ "$calls"
+check 'invalid block does not enable a consolidation timer' bash -c '! grep -qE "enable --now agent-memory-(extract|organize)" "$1"' _ "$calls"
+check 'invalid block still enables the sync timer' has_line "$calls" '--user enable --now agent-memory-sync.timer'
+# Item 4: an unknown key makes the block invalid, named like any other field.
+set_consolidate '{"command":"/path/to/claude","model":"model-id","organise":"Sun *-*-* 04:30"}'
+run_setup --dry-run
+check 'an unknown key is named' has_text "$out" "the consolidate block in $cfg is invalid (organise); the consolidation units were left as they are."
+set_consolidate none
+run_setup --no-enable
+
+# m11: each schedule is checked with `systemd-analyze calendar` when that tool is on the PATH.
+sa_accept="$tmp/sa-accept"
+sa_reject="$tmp/sa-reject"
+mkdir -p "$sa_accept" "$sa_reject"
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$sa_accept/systemd-analyze"
+printf '%s\n' '#!/bin/bash' '[[ "$1" == calendar && "$2" == *Saturday* ]] && exit 1' 'exit 0' > "$sa_reject/systemd-analyze"
+chmod +x "$sa_accept/systemd-analyze" "$sa_reject/systemd-analyze"
+set_consolidate "$both"
+rm -f "$udir"/agent-memory-extract.* "$udir"/agent-memory-organize.* "$calls"
+setup_path="$sa_accept:$bin:$PATH" run_setup --no-enable
+check 'accepted schedules are written' test -f "$udir/agent-memory-extract.timer" -a -f "$udir/agent-memory-organize.timer"
+cp "$udir/agent-memory-extract.timer" "$tmp/extract.timer.before"
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Saturday 3am","organize":"Sun *-*-* 04:30"}'
+rejected_line='the extract schedule "Saturday 3am" is not a valid systemd calendar expression (systemd-analyze calendar rejected it); the extract units were left as they are.'
+setup_path="$sa_reject:$bin:$PATH" run_setup --dry-run
+check 'rejected schedule dry run exits 0' test "$status" -eq 0
+check 'rejected schedule dry run names it' has_text "$out" "$rejected_line"
+check 'rejected schedule dry run would not touch the extract units' bash -c '! grep -qE "would (write|remove) .*agent-memory-extract" <<< "$1"' _ "$out"
+check 'rejected schedule dry run still writes the organize units' has_text "$out" "would write $udir/agent-memory-organize.service and agent-memory-organize.timer"
+rm -f "$calls"
+setup_path="$sa_reject:$bin:$PATH" run_setup
+check 'rejected schedule run exits 0' test "$status" -eq 0
+check 'rejected schedule run names it' has_text "$out" "$rejected_line"
+check 'rejected schedule keeps the extract timer as it was' cmp -s "$udir/agent-memory-extract.timer" "$tmp/extract.timer.before"
+check 'rejected schedule does not enable the extract timer' bash -c '! grep -q "enable --now agent-memory-extract.timer" "$1"' _ "$calls"
+check 'rejected schedule still enables the organize timer' has_line "$calls" '--user enable --now agent-memory-organize.timer'
+# Without systemd-analyze on the PATH, the schedule is written as before.
+no_sa="$tmp/no-systemd-analyze"
+mkdir -p "$no_sa"
+IFS=: read -ra path_dirs <<< "$bin:$PATH"
+for d in "${path_dirs[@]}"; do
+    for f in "$d"/*; do
+        n="${f##*/}"
+        [[ -f "$f" && -x "$f" && "$n" != systemd-analyze && ! -e "$no_sa/$n" ]] || continue
+        ln -s "$f" "$no_sa/$n"
+    done
+done
+setup_path="$no_sa" run_setup --no-enable
+check 'without systemd-analyze setup exits 0' test "$status" -eq 0
+check 'without systemd-analyze the schedule is written' has_line "$udir/agent-memory-extract.timer" 'OnCalendar=Saturday 3am'
+check 'without systemd-analyze nothing is said about it' bash -c '! grep -q "not a valid systemd calendar" <<< "$1"' _ "$out"
+
+# A failing daemon-reload after a removal under --no-enable does not abort setup.
+set_consolidate "$both"
+run_setup --no-enable
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00"}'
+failbin="$tmp/failbin"
+mkdir -p "$failbin"
+printf '%s\n' '#!/bin/bash' "printf '%s\\n' \"\$*\" >> \"$calls\"" 'if [[ "$*" == *daemon-reload* ]]; then exit 1; fi' > "$failbin/systemctl"
+chmod +x "$failbin/systemctl"
+rm -f "$calls"
+setup_path="$failbin:$PATH" run_setup --no-enable
+check 'failing reload after a removal exits 0' test "$status" -eq 0
+check 'failing reload still removed the organize files' test ! -e "$udir/agent-memory-organize.timer" -a ! -e "$udir/agent-memory-organize.service"
+check 'failing reload is reported' has_text "$out" 'could not reload systemd'
+
 # Node.js 24 or later is accepted, an older one is not.
 real_node="$(command -v node)"
 for version in 25 23; do

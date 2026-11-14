@@ -338,18 +338,20 @@ function checkRepo(repo) {
 }
 
 // Stages the working tree, quarantines flagged content and commits the rest. Returns the
-// number of files committed.
-function commitWorkingTree(config, repo, stamp, result) {
+// number of files committed. `message`, when given, replaces the default subject.
+function commitWorkingTree(config, repo, stamp, result, message) {
   git(repo, ['add', '-A']);
   for (const rel of quarantineSecrets(config, repo, stamp)) {
     if (!result.quarantined.includes(rel)) result.quarantined.push(rel);
   }
   const staged = stagedChanges(repo).length;
-  if (staged > 0) git(repo, [...identity(config.host), 'commit', '-q', '-m', `sync(${config.host}): ${staged} file(s)`]);
+  const subject = message ? `${message} (${staged} file(s))` : `sync(${config.host}): ${staged} file(s)`;
+  if (staged > 0) git(repo, [...identity(config.host), 'commit', '-q', '-m', subject]);
   return staged;
 }
 
-// `opts.afterRebuild` lets tests act right after the rebuild commit.
+// `opts.message`, a non-empty single-line string, is the subject of the working-tree commit
+// (followed by the file count). `opts.afterRebuild` lets tests act right after the rebuild commit.
 export function runSync(config, opts = {}) {
   const result = {
     ok: false, committed: 0, merged: false, pushed: false, quarantined: [], conflicts: [], markerConflicts: [], error: null,
@@ -359,12 +361,14 @@ export function runSync(config, opts = {}) {
   const maxPushAttempts = opts.maxPushAttempts ?? DEFAULT_PUSH_ATTEMPTS;
   const timeoutMs = opts.networkTimeoutMs ?? NETWORK_TIMEOUT_MS;
   const stamp = stampOf(opts.now ?? new Date());
+  const message = typeof opts.message === 'string' && opts.message !== '' && !/[\r\n]/.test(opts.message)
+    ? opts.message : null;
   try {
     checkRepo(repo);
     removeStaleIndexLock(repo);
     if (mergeInProgress(repo)) git(repo, ['merge', '--abort']);
 
-    result.committed = commitWorkingTree(config, repo, stamp, result);
+    result.committed = commitWorkingTree(config, repo, stamp, result, message);
 
     let rebuilt = false;
     for (let attempt = 1; attempt <= maxPushAttempts; attempt++) {
@@ -381,7 +385,7 @@ export function runSync(config, opts = {}) {
         // which is kept, so that the usual scan and quarantine apply to them.
         rebuilt = true;
         git(repo, ['reset', '-q', '--mixed', 'origin/main']);
-        result.committed = commitWorkingTree(config, repo, stamp, result);
+        result.committed = commitWorkingTree(config, repo, stamp, result, message);
         opts.afterRebuild?.();
         if (revParse(repo, 'HEAD') === revParse(repo, 'origin/main')) break;
         refusal = pushRefusal(repo);
