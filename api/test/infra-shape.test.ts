@@ -113,9 +113,9 @@ describe('infrastructure source', () => {
     assert.match(read('infra/api.ts'), /\$context\.identity\.sourceIp/);
   });
 
-  it('creates the two workstation roles and their parameters only inside the non-empty-variable branch', () => {
+  it('creates the two workstation roles and their parameters only inside the branch that requires one of the two variables', () => {
     const src = squash('infra/workstation.ts');
-    const branch = src.match(/if\(roleArns\.length>0\)\{(.*)\}$/);
+    const branch = src.match(/if\(roleArns\.length>0\|\|githubSubjects\.length>0\)\{(.*)\}$/);
     assert.ok(branch, 'branch on the role ARNs');
     const body = branch[1];
     assert.equal((src.match(/newaws\.iam\.Role\(/g) ?? []).length, 2);
@@ -126,12 +126,18 @@ describe('infrastructure source', () => {
     assert.equal((body.match(/newaws\.ssm\.Parameter\(/g) ?? []).length, 2);
     assert.match(src, /process\.env\.AGENT_MEMORY_WORKSTATION_ROLE_ARNS/);
     assert.equal((body.match(/maxSessionDuration:3600/g) ?? []).length, 2);
-    assert.equal((body.match(/assumeRolePolicy:JSON\.stringify\(workstationTrustPolicy\(roleArns\)\)/g) ?? []).length, 2);
+    assert.equal((body.match(/assumeRolePolicy:trustDocument/g) ?? []).length, 2);
     assert.match(body, /name:`\$\{\$app\.name\}-\$\{\$app\.stage\}-bridge`/);
     assert.match(body, /name:`\$\{\$app\.name\}-\$\{\$app\.stage\}-canary`/);
     assert.match(body, /prefix=`\/\$\{\$app\.name\}\/\$\{\$app\.stage\}\/mcp`/);
     assert.match(body, /name:`\$\{prefix\}\/bridge\/role-arn`/);
     assert.match(body, /name:`\$\{prefix\}\/canary\/role-arn`/);
+    assert.match(src, /process\.env\.AGENT_MEMORY_GITHUB_SUBJECTS/);
+    assert.match(src, /jobsTrustPolicy\(/);
+    assert.doesNotMatch(src, /workstationTrustPolicy/);
+    assert.doesNotMatch(src, /OpenIdConnectProvider/);
+    assert.match(src, /getCallerIdentityOutput\(\)/);
+    assert.match(src, /getPartitionOutput\(\)/);
     assert.doesNotMatch(src, /managedPolicyArns|aws\.iam\.RolePolicyAttachment/);
   });
 

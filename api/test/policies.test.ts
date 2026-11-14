@@ -6,6 +6,7 @@ import {
   canaryRolePolicy,
   functionPolicy,
   logsPolicy,
+  jobsTrustPolicy,
   trustPolicy,
   workstationTrustPolicy,
 } from '../infra/policies.ts';
@@ -181,6 +182,96 @@ describe('workstationTrustPolicy', () => {
     for (const ok of ['arn:aws:iam::123456789012:role/name', 'arn:aws:iam::123456789012:role/path/name']) {
       assert.doesNotThrow(() => workstationTrustPolicy([ok]), ok);
     }
+  });
+});
+
+describe('jobsTrustPolicy', () => {
+  const PROVIDER = 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com';
+  const SUBJECT = 'repo:o/r:ref:refs/heads/main';
+  const roleStatement = { Effect: 'Allow', Principal: { AWS: [ROLE_A, ROLE_B] }, Action: 'sts:AssumeRole' };
+  const githubStatement = (subjects: string[]) => ({
+    Effect: 'Allow',
+    Principal: { Federated: PROVIDER },
+    Action: 'sts:AssumeRoleWithWebIdentity',
+    Condition: {
+      StringEquals: {
+        'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+        'token.actions.githubusercontent.com:sub': subjects,
+      },
+    },
+  });
+
+  it('for roles only returns exactly the workstation document', () => {
+    const doc = jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [] });
+    assert.deepEqual(doc, workstationTrustPolicy([ROLE_A, ROLE_B]));
+    assert.deepEqual(doc, { Version: '2012-10-17', Statement: [roleStatement] });
+  });
+
+  it('for subjects only returns one GitHub statement with the audience condition', () => {
+    assert.deepEqual(
+      jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER }),
+      { Version: '2012-10-17', Statement: [githubStatement([SUBJECT])] },
+    );
+  });
+
+  it('for both returns the role statement then the GitHub statement', () => {
+    const env = 'repo:o/r:environment:prod';
+    assert.deepEqual(
+      jobsTrustPolicy({ roleArns: [ROLE_A, ROLE_B], githubSubjects: [SUBJECT, env], githubProviderArn: PROVIDER }),
+      { Version: '2012-10-17', Statement: [roleStatement, githubStatement([SUBJECT, env])] },
+    );
+  });
+
+  it('refuses two empty lists', () => {
+    assert.throws(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [] }), /at least one/i);
+  });
+
+  it('refuses subjects that are not an exact branch or environment', () => {
+    for (const bad of [
+      'repo:o/*:ref:refs/heads/main',
+      'repo:o/r:*',
+      'repo:o/r:ref:refs/heads/*',
+      'repo:o/r:pull_request',
+      'repo:o/r:ref:refs/tags/v1',
+      'repo:o/r:environment:',
+      'repo:o:ref:refs/heads/main',
+      'repo:o/r:ref:refs/heads/',
+      'o/r:ref:refs/heads/main',
+      '',
+    ]) {
+      assert.throws(
+        () => jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT, bad], githubProviderArn: PROVIDER }),
+        /subject/i,
+        bad,
+      );
+    }
+  });
+
+  it('accepts branch names with slashes and environments', () => {
+    for (const ok of ['repo:o/r:ref:refs/heads/feature/x', 'repo:o-1/r_2.x:environment:prod-1']) {
+      assert.doesNotThrow(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [ok], githubProviderArn: PROVIDER }), ok);
+    }
+  });
+
+  it('refuses subjects without a provider ARN, and a provider ARN of another issuer', () => {
+    assert.throws(() => jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT] }), /provider/i);
+    for (const bad of [
+      'arn:aws:iam::123456789012:oidc-provider/example.com',
+      'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com.evil.example',
+      'arn:aws:iam::123456789012:role/token.actions.githubusercontent.com',
+      'arn:aws:iam::123:oidc-provider/token.actions.githubusercontent.com',
+      '*',
+    ]) {
+      assert.throws(
+        () => jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT], githubProviderArn: bad }),
+        /provider/i,
+        bad,
+      );
+    }
+  });
+
+  it('still validates the role ARNs', () => {
+    assert.throws(() => jobsTrustPolicy({ roleArns: ['*'], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER }), /role/i);
   });
 });
 
