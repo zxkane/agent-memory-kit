@@ -22,7 +22,7 @@ new aws.s3.BucketServerSideEncryptionConfiguration("MemoryBucketEncryption", {
 // Not versioned. The notes under mem/ are a copy of the notes repository and the agents' notes are
 // mirrored into a second repository, so a replaced note is recoverable from there. A bucket that an
 // earlier release versioned keeps its versioning in the suspended state (S3 cannot turn it off
-// again); this rule then removes the old versions after one day.
+// again); this rule then removes the old versions after one day, and the delete markers they left.
 new aws.s3.BucketLifecycleConfiguration("MemoryBucketLifecycle", {
   bucket: bucket.bucket,
   rules: [
@@ -32,6 +32,7 @@ new aws.s3.BucketLifecycleConfiguration("MemoryBucketLifecycle", {
       filter: {},
       abortIncompleteMultipartUpload: { daysAfterInitiation: 7 },
       noncurrentVersionExpiration: { noncurrentDays: 1 },
+      expiration: { expiredObjectDeleteMarker: true },
     },
   ],
 });

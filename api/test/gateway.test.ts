@@ -43,9 +43,11 @@ function setup(initial: Record<string, string> = SEED, direct: boolean | undefin
   const store = fakeStore(initial);
   const lines: Line[] = [];
   const handler = createHandler({ store, log: (l) => lines.push(l as Line), direct });
+  // The same store and log behind a deployment without direct invocation, for the HTTP events.
+  const http = createHandler({ store, log: (l) => lines.push(l as Line), direct: false });
   const call = (tool: string, args: unknown, extra?: Record<string, unknown>) =>
     handler(args, gatewayContext(tool, extra)) as Promise<any>;
-  return { store, lines, handler, call };
+  return { store, lines, handler, http, call };
 }
 
 const WRITE = { agent: 'assistant', name: 'my-note', description: 'A note', content: 'Hello' };
@@ -61,7 +63,7 @@ test('each tool answers with the JSON body of the HTTP path for the same input',
   for (const c of cases) {
     // Separate stores with the same content, so a write on one path does not change the other's answer.
     const viaGateway = await setup().call(c.tool, c.args);
-    const viaHttp = await setup().handler(httpEvent(c.route, { query: c.query, body: c.body }));
+    const viaHttp = await setup().http(httpEvent(c.route, { query: c.query, body: c.body }));
     assert.equal(viaHttp.statusCode, 200, c.tool);
     assert.deepEqual(viaGateway, JSON.parse(viaHttp.body ?? ''), c.tool);
   }
@@ -156,7 +158,7 @@ test('every refusal of the HTTP path is the same on the gateway path', async () 
   ];
   for (const c of cases) {
     const gateway = await setup().call(c.tool, c.body ?? c.args);
-    const http = await setup().handler(
+    const http = await setup().http(
       httpEvent(
         c.route,
         c.body
@@ -209,7 +211,7 @@ test('without direct, the invocation is refused and the store is not touched', a
 });
 
 test('an HTTP event whose body or query names a tool is still an HTTP request with its scope check', async () => {
-  const { handler, store } = setup();
+  const { http: handler, store } = setup();
   const trick = { bedrockAgentCoreToolName: 'x___memory_scopes' };
   const query = httpEvent('GET /v1/scopes', { query: trick, scope: 'other/thing' });
   assert.equal(((await handler(query)) as any).statusCode, 403);
@@ -274,7 +276,7 @@ test('a failing store gives an internal error, not an exception', async () => {
 });
 
 test('the gateway log line has the HTTP fields plus via, gateway and target, and no text', async () => {
-  const { call, lines, handler } = setup();
+  const { call, lines, http: handler } = setup();
   await call('memory_read', { path: 'global/n.md' });
   await call('memory_write', { ...WRITE, content: 'NOTE-TEXT-SENTINEL' });
   await call('memory_search', { q: 'SEARCH-SENTINEL' });
@@ -342,14 +344,14 @@ test('the client context custom values may arrive as custom or as Custom', async
     assert.deepEqual(await off.handler({}, context as Ctx), { error: { code: 'forbidden', message: 'direct invocation is not enabled' } }, key);
     assert.deepEqual(off.store.gets, []);
   }
-  const { handler } = setup();
+  const { http: handler } = setup();
   const neither = (await handler(httpEvent('GET /v1/scopes'), { clientContext: { Custom: {}, custom: {} } } as Ctx)) as any;
   assert.equal(neither.statusCode, 200);
 });
 
 test('without a gateway context, an event that is not an object is an unknown route and does not throw', async () => {
   for (const event of [null, undefined, 'text', 5, []]) {
-    const { handler, lines } = setup();
+    const { http: handler, lines } = setup();
     const res = (await handler(event as never, { clientContext: { custom: { bedrockAgentCoreToolName: 5 } } } as Ctx)) as any;
     assert.equal(res.statusCode, 404);
     assert.equal(JSON.parse(res.body).error.message, 'unknown route');
@@ -367,7 +369,7 @@ test('an unknown tool is reported before a non-object event', async () => {
 });
 
 test('a refused argument still leaves the valid scope and path in the log line', async () => {
-  const { call, lines, handler } = setup();
+  const { call, lines, http: handler } = setup();
   await call('memory_search', { q: 5, scope: 'global' });
   await call('memory_read', { path: 'global/n.md', extra: 5 });
   await handler(httpEvent('GET /v1/search', { query: { q: 'x', scope: 'global', limit: '99' } }));
@@ -401,5 +403,43 @@ test('the exported handler enables direct invocation only for DIRECT_INVOCATION=
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+  }
+});
+
+test('with direct, an invocation that is not from a gateway is refused and nothing is read or written', async () => {
+  const calls: string[] = [];
+  const guarded: Store = {
+    async get(key) {
+      calls.push(`get ${key}`);
+      throw new Error('touched');
+    },
+    async put(key) {
+      calls.push(`put ${key}`);
+      throw new Error('touched');
+    },
+  };
+  const lines: Line[] = [];
+  const handler = createHandler({ store: guarded, log: (l) => lines.push(l as Line), direct: true });
+  const forged = httpEvent('POST /v1/notes', { body: JSON.stringify(WRITE) });
+  const events: unknown[] = [
+    httpEvent('GET /v1/scopes'),
+    forged,
+    { routeKey: 'GET /v1/scopes', requestContext: { authorizer: { jwt: { claims: { client_id: 'someone-else', scope: 'agent-memory/read' } } } } },
+    null,
+    {},
+  ];
+  for (const event of events) {
+    for (const context of [undefined, {}, { clientContext: { custom: {} } }, { clientContext: { custom: { bedrockAgentCoreToolName: 7 } } }]) {
+      const res = await (handler as (e: unknown, c?: unknown) => Promise<unknown>)(event, context);
+      assert.deepEqual(res, { error: { code: 'forbidden', message: 'this deployment serves gateway invocations only' } });
+    }
+  }
+  assert.deepEqual(calls, []);
+  assert.equal(lines.length, events.length * 4);
+  for (const l of lines) {
+    assert.equal(l.op, null);
+    assert.equal(l.clientId, null);
+    assert.equal(l.status, 403);
+    assert.ok(!('via' in l));
   }
 });

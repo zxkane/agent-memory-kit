@@ -18,7 +18,7 @@ export const fn = new sst.aws.Function("MemoryApiFunction", {
   architecture: "arm64",
   memory: "256 MB",
   timeout: "10 seconds",
-  environment: { BUCKET: bucket.bucket, ...(mode.invokerRoleArns.length > 0 ? { DIRECT_INVOCATION: "on" } : {}) },
+  environment: { BUCKET: bucket.bucket, ...(mode.direct ? { DIRECT_INVOCATION: "on" } : {}) },
   logging: { logGroup: logGroup.name },
   dev: false,
   transform: {
@@ -51,7 +51,7 @@ publishParameter("bucket/name", "String", bucket.bucket);
 
 // Direct invocation: each named role may invoke the function, and nobody else gets a permission.
 // The logical name carries the position, not the ARN, so that the ARN text is not an identity.
-if (mode.invokerRoleArns.length > 0) {
+if (mode.direct) {
   mode.invokerRoleArns.forEach((roleArn, index) => {
     new aws.lambda.Permission(`MemoryApiInvoker${index}`, {
       action: "lambda:InvokeFunction",

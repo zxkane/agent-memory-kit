@@ -12,9 +12,8 @@
 //                                        OIDC provider, which must exist. Either variable creates the roles.
 //   AGENT_MEMORY_INVOKER_ROLE_ARNS       optional, comma-separated ARNs of the IAM roles that may invoke the
 //                                        function directly, for example the execution role of an AgentCore
-//                                        gateway. When set, the function also answers such invocations.
-//   AGENT_MEMORY_HTTP_API                optional, "on" (the default) or "off". "off" deploys neither the HTTP
-//                                        API nor the token issuer and needs AGENT_MEMORY_INVOKER_ROLE_ARNS.
+//                                        gateway. When set, the deployment serves direct invocation only:
+//                                        no HTTP API and no token issuer. Without it, the HTTP API as always.
 export default $config({
   app(input) {
     const region = process.env.AGENT_MEMORY_REGION;
@@ -54,12 +53,12 @@ export default $config({
     const { bucket, fn } = await import("./infra/api.ts");
 
     const outputs: Record<string, $util.Output<string>> = { bucketName: bucket.bucket };
-    if (mode.httpApi) {
+    if (!mode.direct) {
       const http = await import("./infra/http.ts");
       outputs.apiUrl = http.api.url;
       outputs.tokenEndpoint = http.tokenEndpoint;
     }
-    if (mode.invokerRoleArns.length > 0) {
+    if (mode.direct) {
       outputs.functionArn = fn.arn;
     }
 

@@ -2,7 +2,7 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructured
 import { ApiError } from './errors.ts';
 import { handleGateway, isGatewayInvocation, isObject } from './gateway.ts';
 import type { GatewayContext } from './gateway.ts';
-import { MAX_BODY_BYTES, failure, runOperation, writeLine } from './run.ts';
+import { MAX_BODY_BYTES, errorBody, failure, runOperation, writeLine } from './run.ts';
 import type { Line, Query } from './run.ts';
 import { RESOURCE_SERVER, ROUTES } from './routes.ts';
 import { createSnapshots } from './snapshot.ts';
@@ -74,10 +74,20 @@ export function createHandler(deps: { store: Store; log?: (line: object) => void
 
   // Only the platform's context can say that this is a gateway invocation; an HTTP API event
   // carries no such context, and nothing inside an event can make it take the direct path.
-  return ((event: unknown, context?: GatewayContext) =>
-    isGatewayInvocation(context)
-      ? handleGateway({ ops, log, direct: deps.direct === true }, event, context)
-      : http((isObject(event) ? event : {}) as unknown as APIGatewayProxyEventV2WithJWTAuthorizer)) as Handler;
+  // A deployment with direct invocation serves nothing else: any role that may invoke the function
+  // could send an event shaped like an HTTP API event with claims of its choosing, which the
+  // function cannot tell from API Gateway's. Such an invocation is refused before anything is read.
+  const gatewayOnly = (started: number) => {
+    const line: Line = { op: null, clientId: null, scope: null, path: null, status: 403, ms: 0 };
+    writeLine(log, line, started, {}, undefined);
+    return errorBody('forbidden', 'this deployment serves gateway invocations only');
+  };
+
+  return ((event: unknown, context?: GatewayContext) => {
+    if (isGatewayInvocation(context)) return handleGateway({ ops, log, direct: deps.direct === true }, event, context);
+    if (deps.direct === true) return Promise.resolve(gatewayOnly(Date.now()));
+    return http((isObject(event) ? event : {}) as unknown as APIGatewayProxyEventV2WithJWTAuthorizer);
+  }) as Handler;
 }
 
 // Built on first use, so importing this module needs neither the BUCKET variable nor AWS.

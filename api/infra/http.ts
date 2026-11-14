@@ -5,8 +5,8 @@ import { hubClient, issuer, probeClient, tokenEndpoint } from "./auth.ts";
 
 export { tokenEndpoint };
 
-// The HTTP API with its token issuer. sst.config.ts loads this file only when AGENT_MEMORY_HTTP_API
-// is not "off"; the function itself is declared in api.ts.
+// The HTTP API with its token issuer. sst.config.ts loads this file only for a deployment without
+// invoker roles; the function itself is declared in api.ts.
 
 // No query string and no headers. The client ID comes from the validated token.
 const accessLogFormat = JSON.stringify({

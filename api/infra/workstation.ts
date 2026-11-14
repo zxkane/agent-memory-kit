@@ -38,8 +38,8 @@ if (roleArns.length > 0 || githubSubjects.length > 0) {
     policy: bucket.arn.apply((arn) => JSON.stringify(bridgeRolePolicy(arn))),
   });
 
-  // The canary reads the HTTP API's parameters, so it exists only with the HTTP API.
-  if (mode.httpApi) {
+  // The canary reads the HTTP API's parameters, so it exists only without invoker roles.
+  if (!mode.direct) {
     // The four parameters the canary's checks read, and no others (not the hub client's secret).
     const canaryParameterArns = [
       "gateway/url",

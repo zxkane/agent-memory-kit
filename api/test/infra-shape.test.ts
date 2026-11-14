@@ -98,7 +98,7 @@ describe('infrastructure source', () => {
     assert.equal((src.match(/id:"/g) ?? []).length, 1);
     assert.match(
       src,
-      /rules:\[\{id:"expire-abandoned-uploads-and-old-versions",status:"Enabled",filter:\{\},abortIncompleteMultipartUpload:\{daysAfterInitiation:7\},noncurrentVersionExpiration:\{noncurrentDays:1\},\},\],/,
+      /rules:\[\{id:"expire-abandoned-uploads-and-old-versions",status:"Enabled",filter:\{\},abortIncompleteMultipartUpload:\{daysAfterInitiation:7\},noncurrentVersionExpiration:\{noncurrentDays:1\},expiration:\{expiredObjectDeleteMarker:true\},\},\],/,
     );
     assert.doesNotMatch(src, /transition|storageClass/i);
   });
@@ -171,11 +171,10 @@ describe('infrastructure source', () => {
   });
 
   describe('deployment switches', () => {
-    it('parses the two variables in mode.ts only, before any resource', () => {
-      assert.match(read('infra/mode.ts'), /AGENT_MEMORY_HTTP_API/);
+    it('parses the one variable in mode.ts only, before any resource', () => {
       assert.match(read('infra/mode.ts'), /AGENT_MEMORY_INVOKER_ROLE_ARNS/);
       for (const f of files.filter((f) => f !== 'infra/mode.ts')) {
-        assert.doesNotMatch(read(f), /process\.env\.AGENT_MEMORY_(HTTP_API|INVOKER_ROLE_ARNS)/, f);
+        assert.doesNotMatch(read(f), /process\.env\.AGENT_MEMORY_INVOKER_ROLE_ARNS/, f);
       }
       const run = squash('sst.config.ts');
       const modeAt = run.indexOf('import("./infra/mode.ts")');
@@ -183,11 +182,34 @@ describe('infrastructure source', () => {
       assert.ok(modeAt < run.indexOf('import("./infra/storage.ts")'), 'mode before storage');
     });
 
-    it('loads the HTTP API program, and with it the token issuer, only when the HTTP API is on', () => {
+    it('has no switch for the HTTP API anywhere in api/ or the README', () => {
+      const name = ['AGENT_MEMORY', 'HTTP_API'].join('_');
+      const dirs = ['infra', 'src', 'scripts', 'test'];
+      const names = ['sst.config.ts', 'package.json', 'openapi.json', 'gateway-tools.json'];
+      const all = [
+        ...names.map((n) => new URL(n, root)),
+        ...dirs.flatMap((d) =>
+          readdirSync(new URL(`${d}/`, root), { withFileTypes: true })
+            .filter((e) => e.isFile())
+            .map((e) => new URL(`${d}/${e.name}`, root)),
+        ),
+        new URL('../README.md', root),
+      ];
+      for (const url of all) {
+        assert.ok(!readFileSync(url, 'utf8').includes(name), url.pathname);
+      }
+    });
+
+    it('loads the HTTP API program, and with it the token issuer, only without invoker roles', () => {
       const cfg = squash('sst.config.ts');
       assert.equal((cfg.match(/import\("\.\/infra\/http\.ts"\)/g) ?? []).length, 1);
       assert.equal((cfg.match(/import\("\.\/infra\/auth\.ts"\)/g) ?? []).length, 0);
-      assert.match(cfg, /if\(mode\.httpApi\)\{[^}]*import\("\.\/infra\/http\.ts"\)/);
+      assert.match(cfg, /if\(!mode\.direct\)\{[^}]*import\("\.\/infra\/http\.ts"\)/);
+      // Nothing else may load the token issuer or the HTTP API program.
+      for (const f of files) {
+        if (f !== 'infra/http.ts') assert.doesNotMatch(read(f), /["']\.\/(infra\/)?auth(\.ts)?["']/, f);
+        if (f !== 'sst.config.ts') assert.doesNotMatch(read(f), /\bhttp\.ts\b/, f);
+      }
       assert.doesNotMatch(read('infra/api.ts'), /auth\.ts|sst\.aws\.ApiGatewayV2|addAuthorizer|\.route\(/);
       assert.match(read('infra/http.ts'), /from\s+"\.\/auth\.ts"/);
       assert.doesNotMatch(read('infra/http.ts'), /new sst\.aws\.Function/);
@@ -209,7 +231,7 @@ describe('infrastructure source', () => {
       assert.equal((src.match(/newaws\.lambda\.Permission\(/g) ?? []).length, 1);
       assert.equal((src.match(/DIRECT_INVOCATION/g) ?? []).length, 1);
       assert.equal((src.match(/function\/arn/g) ?? []).length, 1);
-      const branch = src.match(/if\(mode\.invokerRoleArns\.length>0\)\{(.*)\}/);
+      const branch = src.match(/if\(mode\.direct\)\{(.*)\}/);
       assert.ok(branch, 'branch on invoker roles');
       const body = branch[1] as string;
       assert.match(body, /newaws\.lambda\.Permission\(/);
@@ -220,7 +242,7 @@ describe('infrastructure source', () => {
       assert.doesNotMatch(body, /sourceArn|principal:"\*"|service/i);
       assert.match(
         src,
-        /environment:\{BUCKET:bucket\.bucket,\.\.\.\(mode\.invokerRoleArns\.length>0\?\{DIRECT_INVOCATION:"on"\}:\{\}\)\}/,
+        /environment:\{BUCKET:bucket\.bucket,\.\.\.\(mode\.direct\?\{DIRECT_INVOCATION:"on"\}:\{\}\)\}/,
       );
     });
 
@@ -233,10 +255,10 @@ describe('infrastructure source', () => {
       assert.match(squash('infra/http.ts'), /\{key:"gateway\/url"/);
     });
 
-    it('creates the canary role, its policy and its parameter only with the HTTP API', () => {
+    it('creates the canary role, its policy and its parameter only without invoker roles', () => {
       const src = squash('infra/workstation.ts');
-      const canary = src.match(/if\(mode\.httpApi\)\{(.*?)\}newaws\.ssm\.Parameter\("ParamBridgeRoleArn"/);
-      assert.ok(canary, 'branch on mode.httpApi inside the role branch');
+      const canary = src.match(/if\(!mode\.direct\)\{(.*?)\}newaws\.ssm\.Parameter\("ParamBridgeRoleArn"/);
+      assert.ok(canary, 'branch on !mode.direct inside the role branch');
       const body = canary[1] as string;
       assert.match(body, /newaws\.iam\.Role\("WorkstationCanaryRole"/);
       assert.match(body, /newaws\.iam\.RolePolicy\("WorkstationCanaryRolePolicy"/);
@@ -249,6 +271,7 @@ describe('infrastructure source', () => {
       const src = squash('sst.config.ts');
       assert.match(src, /bucketName:bucket\.bucket/);
       assert.match(src, /outputs\.functionArn=fn\.arn/);
+      assert.match(src, /if\(mode\.direct\)\{outputs\.functionArn/);
       assert.match(src, /apiUrl/);
       assert.match(src, /tokenEndpoint/);
     });
