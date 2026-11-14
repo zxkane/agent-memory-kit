@@ -556,16 +556,71 @@ function extractFixture(t) {
     const then = new Date(Date.now() - ageMs);
     utimesSync(file, then, then);
   };
+  // Turns are an hour old, like their files, so that they lie inside the session window.
   const turn = (type, text, extra = {}) => ({
-    type, timestamp: '2026-11-13T10:00:00Z',
+    type, timestamp: new Date(Date.now() - 3600 * 1000).toISOString(),
     message: { role: type, content: type === 'user' ? text : [{ type: 'text', text }] }, ...extra,
   });
   session('-work-p', 'p', [turn('user', SESSION_PHRASE, { promptSource: 'typed' }), turn('assistant', 'Noted.')]);
   session('-work-h', 'h', [turn('user', 'run the batch', { promptSource: 'sdk' }), turn('assistant', 'Done.')]);
   f.addSession = (slug, project, text, ageMs) =>
     session(slug, project, [turn('user', text, { promptSource: 'typed' }), turn('assistant', 'Noted.')], ageMs);
+  // A session file for `project` holding typed turns given as [text, age in ms].
+  f.typedSession = (slug, project, turns, fileAgeMs = 3600 * 1000) => session(slug, project, turns.map(([text, ageMs]) => ({
+    type: 'user', promptSource: 'typed', timestamp: new Date(Date.now() - ageMs).toISOString(),
+    message: { role: 'user', content: text },
+  })), fileAgeMs);
   return f;
 }
+
+test('F3: a session file touched again that holds only turns from before the window is no-session', (t) => {
+  const f = extractFixture(t);
+  const hours = (n) => n * 3600 * 1000;
+  f.typedSession('-work-q', 'h', [['an old question', hours(30)], ['an old answer', hours(29)]], hours(1));
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.stateFile(), JSON.stringify({ projects: { h: { lastExtract: new Date(Date.now() - hours(2)).toISOString() } } }));
+  const r = f.run('extract', '--project', 'h');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract h: no-session/m);
+  assert.deepEqual(f.calls(), []);
+});
+
+test('F3: with lastExtract 60 days ago, only the last 28 days are read', (t) => {
+  const f = extractFixture(t);
+  f.typedSession('-work-q', 'h', [['FORTY-DAYS-AGO question', 40 * DAY_MS], ['TEN-DAYS-AGO question', 10 * DAY_MS]]);
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.stateFile(), JSON.stringify({ projects: { h: { lastExtract: new Date(Date.now() - 60 * DAY_MS).toISOString() } } }));
+  const r = f.run('extract', '--project', 'h');
+  assert.equal(r.status, 0, r.stderr);
+  const [call] = f.calls();
+  assert.match(call.digest, /TEN-DAYS-AGO/);
+  assert.doesNotMatch(call.digest, /FORTY-DAYS-AGO/);
+});
+
+test('F3: a cut digest is shown in the headline, the report and lastOutcome; a whole one too', (t) => {
+  const f = extractFixture(t);
+  const turns = Array.from({ length: 40 }, (_, i) => [`turn ${i} ${'x'.repeat(600)}`, (50 - i) * 60 * 1000]);
+  f.typedSession('-work-q', 'h', turns);
+  const writes = { 'port.md': note('port', 'Staging port', 'Staging listens on 8443.'), 'MEMORY.md': index('x.md', 'port.md') };
+  f.instruct({ h: { writes }, p: { writes: { ...writes, 'MEMORY.md': index('a.md', 'port.md') } } });
+  f.setConfig({ maxTranscriptBytes: 10000 });
+  let r = f.run('extract', '--project', 'h');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract h: applied, 2 change\(s\), USD 0\.25, stopped: completed, conversation text cut$/m);
+  let text = readFileSync(join(f.repo, `_reports/${today()}-alpha-extract-h.md`), 'utf8');
+  assert.match(text, /^- Conversation text: cut to \d+ bytes; 0 session\(s\) left out$/m);
+  let outcome = f.readState().projects.h.lastOutcome;
+  assert.equal(outcome.truncated, true);
+  assert.equal(outcome.sessionsLeftOut, 0);
+
+  r = f.run('extract', '--project', 'p');
+  assert.match(r.stdout, /^extract p: applied, 2 change\(s\), USD 0\.25, stopped: completed$/m);
+  text = readFileSync(join(f.repo, `_reports/${today()}-alpha-extract-p.md`), 'utf8');
+  assert.match(text, /^- Conversation text: complete$/m);
+  outcome = f.readState().projects.p.lastOutcome;
+  assert.equal(outcome.truncated, false);
+  assert.equal(outcome.sessionsLeftOut, 0);
+});
 
 test('extract feeds the digest to the model, applies an added note and never stores the digest', (t) => {
   const f = extractFixture(t);

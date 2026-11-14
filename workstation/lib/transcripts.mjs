@@ -147,7 +147,21 @@ function fitBytes(text, limit) {
   return out;
 }
 
-export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 2000 }) {
+// The turns of a session that lie after the window start `since` (ms): a turn whose time is known
+// and is at or before it was digested by an earlier run. A turn without a time is kept. The
+// session's first and last times are those of the turns kept.
+function inWindow(session, since) {
+  const turns = session.turns.filter((turn) => turn.at === null || !(Date.parse(turn.at) <= since));
+  const times = turns.map((turn) => turn.at).filter((at) => at !== null).sort();
+  return { ...session, turns, firstAt: times[0] ?? null, lastAt: times.at(-1) ?? null };
+}
+
+// A bounded digest of the sessions, newest session first. With `since`, only turns after it are
+// used, and a session with none left is not used. When the newest session alone is too large,
+// its newest turns are kept (in their order); when not even its newest turn fits, that turn is
+// cut. `truncated` says that anything was cut or left out; `sessionsLeftOut` counts the
+// qualifying sessions of which nothing reached the digest.
+export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 2000, since = null }) {
   const sessions = [];
   for (const file of files) {
     let session;
@@ -156,7 +170,9 @@ export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 200
     } catch {
       continue; // Missing, unreadable or not a file: the other sessions are still used.
     }
-    if ((session.interactive || session.wroteMemory) && session.turns.length > 0) sessions.push({ file, session });
+    if (!session.interactive && !session.wroteMemory) continue;
+    if (since !== null) session = inWindow(session, since);
+    if (session.turns.length > 0) sessions.push({ file, session });
   }
   sessions.sort((a, b) => (b.session.lastAt ?? '').localeCompare(a.session.lastAt ?? ''));
   let text = '';
@@ -175,26 +191,29 @@ export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 200
     }
     truncated = true;
     if (count === 0) {
-      // The first session alone is too large. Keep the turns that fit whole. When not even the
-      // first turn fits, cut that turn further so the header and one turn fit. Only when the
-      // header line alone does not fit is the digest empty (truncated, with no sessions).
-      let part = header;
-      for (const block of blocks) {
-        if (bytes(part) + bytes(block) > maxBytes) break;
-        part += block;
+      // The newest session alone is too large. Keep its newest turns that fit whole. When not
+      // even the newest turn fits, cut that turn further so the header and one turn fit. Only
+      // when the header line alone does not fit is the digest empty (truncated, no sessions).
+      const kept = [];
+      let size = bytes(header);
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        if (size + bytes(blocks[i]) > maxBytes) break;
+        kept.unshift(blocks[i]);
+        size += bytes(blocks[i]);
       }
-      if (part === header) {
-        const room = maxBytes - bytes(header) - bytes(turns[0].label) - bytes('[cut]\n\n');
-        if (room > 0) part = `${header}${turns[0].label}${fitBytes(turns[0].body, room)}[cut]\n\n`;
+      if (kept.length === 0) {
+        const last = turns.at(-1);
+        const room = maxBytes - bytes(header) - bytes(last.label) - bytes('[cut]\n\n');
+        if (room > 0) kept.push(`${last.label}${fitBytes(last.body, room)}[cut]\n\n`);
       }
-      if (part !== header) {
-        text = part;
+      if (kept.length > 0) {
+        text = header + kept.join('');
         count = 1;
       }
     }
     break;
   }
-  return { text, sessions: count, truncated };
+  return { text, sessions: count, truncated, sessionsLeftOut: sessions.length - count };
 }
 
 // Top-level *.jsonl files in the folders that changed after sinceMs.

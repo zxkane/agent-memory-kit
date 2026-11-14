@@ -141,22 +141,27 @@ test('buildDigest skips a file that cannot be read', async (t) => {
   assert.match(d.text, /session gggggggg/);
 });
 
-test('an oversized first turn is cut further so header and one turn fit', async (t) => {
+test('an oversized newest turn is cut further so header and one turn fit', async (t) => {
   const dir = tempDir(t);
-  const file = sessionFile(dir, 'aaaaaaaa.jsonl', '2026-11-09T00:00:00Z', 'q'.repeat(500));
+  const file = join(dir, 'aaaaaaaa.jsonl');
+  writeJsonl(file, [
+    user('hello', { promptSource: 'typed', timestamp: '2026-11-09T00:00:00Z' }),
+    agent('q'.repeat(500), { timestamp: '2026-11-09T00:00:00Z' }),
+  ]);
   const header = '=== session aaaaaaaa, 2026-11-09T00:00:00Z to 2026-11-09T00:00:00Z ===\n';
   const limit = Buffer.byteLength(header, 'utf8') + 80;
   const d = await buildDigest({ files: [file], repoDir: REPO, maxBytes: limit });
   assert.equal(d.sessions, 1);
   assert.equal(d.truncated, true);
   assert.ok(Buffer.byteLength(d.text, 'utf8') <= limit);
-  assert.match(d.text, /USER \(.*\):\nq+\[cut\]\n\n$/);
+  assert.match(d.text, /^AGENT \(.*\):\nq+\[cut\]\n\n$/m);
+  assert.ok(!d.text.includes('hello'));
 });
 
 test('when not even the header fits the digest is empty and truncated', async (t) => {
   const file = sessionFile(tempDir(t), 'aaaaaaaa.jsonl', '2026-11-09T00:00:00Z');
   assert.deepEqual(await buildDigest({ files: [file], repoDir: REPO, maxBytes: 5 }),
-    { text: '', sessions: 0, truncated: true });
+    { text: '', sessions: 0, truncated: true, sessionsLeftOut: 1 });
 });
 
 function sessionFile(dir, name, lastAt, text = 'hello') {
@@ -229,10 +234,66 @@ test('buildDigest stops before a session that would pass maxBytes', async (t) =>
   const d = await buildDigest({ files: [a, b], repoDir: REPO, maxBytes: size + 10 });
   assert.equal(d.sessions, 1);
   assert.equal(d.truncated, true);
+  assert.equal(d.sessionsLeftOut, 1);
   assert.equal(d.text, one.text);
 });
 
-test('buildDigest includes a first session that alone is too large, cut at a turn boundary', async (t) => {
+// F3: one session of 300 turns, the first half before the window, the second half inside it.
+function longSession(dir, windowStart) {
+  const file = join(dir, 'llllllll.jsonl');
+  const before = new Date(windowStart - 5 * 86400000);
+  const inside = new Date(windowStart + 86400000);
+  const records = [];
+  for (let i = 0; i < 300; i++) {
+    const at = new Date((i < 150 ? before : inside).getTime() + i * 1000).toISOString();
+    records.push(user(`turn-${String(i).padStart(3, '0')} ${'w'.repeat(900)}`, { promptSource: 'typed', timestamp: at }));
+  }
+  writeJsonl(file, records);
+  return file;
+}
+
+test('buildDigest drops turns at or before the window start', async (t) => {
+  const since = Date.parse('2026-11-07T00:00:00Z');
+  const file = longSession(tempDir(t), since);
+  const d = await buildDigest({ files: [file], repoDir: REPO, maxBytes: 2000000, since });
+  assert.equal(d.truncated, false);
+  assert.equal(d.sessionsLeftOut, 0);
+  const turns = [...d.text.matchAll(/turn-(\d{3})/g)].map((m) => Number(m[1]));
+  assert.equal(turns.length, 150);
+  assert.equal(Math.min(...turns), 150);
+  assert.match(d.text, /^=== session llllllll, 2026-11-08T/m);
+  const edge = join(tempDir(t), 'eeeeeeee.jsonl');
+  writeJsonl(edge, [
+    user('at the start', { promptSource: 'typed', timestamp: new Date(since).toISOString() }),
+    user('no time', { promptSource: 'typed' }),
+  ]);
+  const e = await buildDigest({ files: [edge], repoDir: REPO, maxBytes: 100000, since });
+  assert.ok(!e.text.includes('at the start'));
+  assert.match(e.text, /no time/);
+});
+
+test('buildDigest keeps the newest turns of the window when it must cut, in order', async (t) => {
+  const since = Date.parse('2026-11-07T00:00:00Z');
+  const file = longSession(tempDir(t), since);
+  const d = await buildDigest({ files: [file], repoDir: REPO, maxBytes: 50000, since });
+  assert.equal(d.truncated, true);
+  assert.equal(d.sessions, 1);
+  const turns = [...d.text.matchAll(/turn-(\d{3})/g)].map((m) => Number(m[1]));
+  assert.ok(turns.length > 10 && turns.length < 150);
+  assert.equal(turns.at(-1), 299);
+  assert.deepEqual(turns, [...turns].sort((a, b) => a - b));
+  assert.equal(turns[0], 300 - turns.length);
+});
+
+test('a session whose turns all lie before the window is not a session for this run', async (t) => {
+  const since = Date.parse('2026-11-07T00:00:00Z');
+  const file = join(tempDir(t), 'oooooooo.jsonl');
+  writeJsonl(file, [user('old', { promptSource: 'typed', timestamp: '2026-11-01T00:00:00Z' }), agent('reply', { timestamp: '2026-11-01T00:00:05Z' })]);
+  assert.deepEqual(await buildDigest({ files: [file], repoDir: REPO, maxBytes: 100000, since }),
+    { text: '', sessions: 0, truncated: false, sessionsLeftOut: 0 });
+});
+
+test('buildDigest includes a first session that alone is too large, keeping its newest turns', async (t) => {
   const dir = tempDir(t);
   const file = sessionFile(dir, 'aaaaaaaa.jsonl', '2026-11-09T00:00:00Z', 'q'.repeat(100));
   const whole = await buildDigest({ files: [file], repoDir: REPO, maxBytes: 100000 });
@@ -240,9 +301,10 @@ test('buildDigest includes a first session that alone is too large, cut at a tur
   const d = await buildDigest({ files: [file], repoDir: REPO, maxBytes: limit });
   assert.equal(d.sessions, 1);
   assert.equal(d.truncated, true);
+  assert.equal(d.sessionsLeftOut, 0);
   assert.ok(Buffer.byteLength(d.text, 'utf8') <= limit);
-  assert.match(d.text, /USER/);
-  assert.ok(!d.text.includes('AGENT'));
+  assert.match(d.text, /AGENT/);
+  assert.ok(!d.text.includes('USER'));
 });
 
 test('buildDigest with nothing qualifying returns an empty digest', async (t) => {
@@ -250,9 +312,9 @@ test('buildDigest with nothing qualifying returns an empty digest', async (t) =>
   const headless = join(dir, 'h.jsonl');
   writeJsonl(headless, [user('batch', { promptSource: 'sdk' }), agent('result')]);
   assert.deepEqual(await buildDigest({ files: [headless], repoDir: REPO, maxBytes: 1000 }),
-    { text: '', sessions: 0, truncated: false });
+    { text: '', sessions: 0, truncated: false, sessionsLeftOut: 0 });
   assert.deepEqual(await buildDigest({ files: [], repoDir: REPO, maxBytes: 1000 }),
-    { text: '', sessions: 0, truncated: false });
+    { text: '', sessions: 0, truncated: false, sessionsLeftOut: 0 });
 });
 
 test('projectSessionDirs lists every folder linked to a project and ignores the rest', (t) => {

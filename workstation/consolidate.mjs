@@ -27,6 +27,8 @@ const INDEX_MAX_LINES = 200;
 const INDEX_MAX_BYTES = 25000;
 const DAY_MS = 24 * 3600 * 1000;
 const EXTRACT_LOOKBACK_MS = 7 * DAY_MS;
+// The session window of a project that was extracted before never reaches back further than this.
+const EXTRACT_MAX_WINDOW_MS = 28 * DAY_MS;
 const REPORT_KEEP_DAYS = 90;
 const REVISIT_MS = 28 * DAY_MS;
 const KEEP_MARKER = '.keep';
@@ -193,6 +195,25 @@ function shown(text) {
   return scanText(String(text)).length > 0 ? '(file name withheld)' : String(text);
 }
 
+// What reached the model of an Extract run: whether the digest was cut, how large it is, and how
+// many qualifying sessions it left out entirely. Passed to the apply step as one argument.
+function conversationOf(digest) {
+  return { truncated: digest.truncated, bytes: Buffer.byteLength(digest.text, 'utf8'), sessionsLeftOut: digest.sessionsLeftOut };
+}
+
+function conversationArg(conversation) {
+  if (!conversation) return 'none';
+  return conversation.truncated ? `cut,${conversation.bytes},${conversation.sessionsLeftOut}` : 'complete';
+}
+
+function parseConversationArg(value) {
+  if (value === 'none') return null;
+  if (value === 'complete') return { truncated: false, bytes: null, sessionsLeftOut: 0 };
+  const m = /^cut,(\d{1,12}),(\d{1,9})$/.exec(value ?? '');
+  if (!m) throw new Error('invalid --conversation');
+  return { truncated: true, bytes: Number(m[1]), sessionsLeftOut: Number(m[2]) };
+}
+
 // ---- Locked steps ----
 
 function parseStepArgs(rest, valued, flags = []) {
@@ -307,7 +328,7 @@ function cleanDescription(text) {
   return d.length > 200 ? `${d.slice(0, 200)}…` : d;
 }
 
-function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, pairs, snap, ev, descriptions }) {
+function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, pairs, snap, ev, descriptions, conversation }) {
   const title = `${kind[0].toUpperCase()}${kind.slice(1)}`;
   const suffix = (label) => (label === GLOBAL ? ' (global/)' : '');
   const changed = (label) => ev.changes.some((c) => c.label === label);
@@ -315,6 +336,11 @@ function buildReport({ config, kind, scope, date, model, stopReason, costUsd, tu
   const shownLabels = labels.filter((l) => l === 'notes' || changed(l));
   const lines = [`# ${title} ${scope} — ${date} on ${config.host}`, ''];
   lines.push(`- Model: ${model}; turns: ${turns ?? 'unknown'}; cost: ${usd(costUsd)}; stopped: ${stopReason}`);
+  if (conversation) {
+    lines.push(conversation.truncated
+      ? `- Conversation text: cut to ${conversation.bytes} bytes; ${conversation.sessionsLeftOut} session(s) left out`
+      : '- Conversation text: complete');
+  }
   for (const l of shownLabels) {
     const { indexBefore: b, indexAfter: a } = ev.stats[l];
     lines.push(`- Index${suffix(l)}: ${b.lines} lines, ${b.bytes} bytes → ${a.lines} lines, ${a.bytes} bytes`);
@@ -383,7 +409,7 @@ function pruneReports(config, now) {
 
 function stepApply(config, rest) {
   const a = parseStepArgs(rest,
-    ['--work', '--plan-sha256', '--stop-reason', '--cost', '--turns', '--model', '--min-retention'], ['--dry-run']);
+    ['--work', '--plan-sha256', '--stop-reason', '--cost', '--turns', '--model', '--min-retention', '--conversation'], ['--dry-run']);
   const dryRun = a['--dry-run'] === true;
   const minRetention = a['--min-retention'] === 'default' ? undefined : parseRetention(a['--min-retention']);
   if (minRetention === null) throw new Error('invalid --min-retention');
@@ -391,6 +417,7 @@ function stepApply(config, rest) {
   const costUsd = /^\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(a['--cost']) ? Number(a['--cost']) : null;
   const turns = /^\d{1,9}$/.test(a['--turns']) ? Number(a['--turns']) : null;
   const model = a['--model'];
+  const conversation = parseConversationArg(a['--conversation']);
   const work = checkWork(config, a['--work']);
   const empty = { errors: [], changes: [], ignored: [], stats: {}, liveChanged: [] };
 
@@ -442,7 +469,7 @@ function stepApply(config, rest) {
     if (buf && sha256(buf) === c.hash) descriptions.set(`${c.label}/${c.file}`, cleanDescription(parseNote(buf.toString('utf8')).description));
   }
   const report = () => buildReport({
-    config, kind, scope, date, model, stopReason, costUsd, turns, pairs, snap, ev, descriptions,
+    config, kind, scope, date, model, stopReason, costUsd, turns, pairs, snap, ev, descriptions, conversation,
   });
 
   let outcome;
@@ -603,7 +630,15 @@ const timeOf = (iso) => {
   return Number.isFinite(t) ? t : null;
 };
 
-// Extract: projects with a session file changed since their last extract. The one whose model
+// Where a project's session window starts: at its last extract, but never more than
+// EXTRACT_MAX_WINDOW_MS back (a run that stopped early keeps lastExtract, and the window must not
+// grow without end); EXTRACT_LOOKBACK_MS back when it was never extracted.
+function windowStart(entry, now) {
+  const last = timeOf(entry?.lastExtract);
+  return last === null ? now - EXTRACT_LOOKBACK_MS : Math.max(last, now - EXTRACT_MAX_WINDOW_MS);
+}
+
+// Extract: projects with a session file changed since their window start. The one whose model
 // run was tried longest ago goes first (never tried first, which includes state written before
 // `lastExtractTried` existed), so every project gets its turn across runs even when one is
 // rejected every time; then the oldest session window, then the newest session.
@@ -614,7 +649,8 @@ function extractScopes(scan, state, opts, now) {
   for (const scope of names) {
     const tried = timeOf(state.projects[scope]?.lastExtractTried) ?? -Infinity;
     const last = timeOf(state.projects[scope]?.lastExtract);
-    const files = sessionFilesSince(dirs.get(scope) ?? [], last ?? now - EXTRACT_LOOKBACK_MS);
+    const since = windowStart(state.projects[scope], now);
+    const files = sessionFilesSince(dirs.get(scope) ?? [], since);
     if (opts.projects.length === 0 && files.length === 0) continue;
     let newest = 0;
     for (const file of files) {
@@ -624,7 +660,7 @@ function extractScopes(scan, state, opts, now) {
         // Vanished: does not count.
       }
     }
-    list.push({ scope, files, newest, tried, last: last ?? -Infinity });
+    list.push({ scope, files, since, newest, tried, last: last ?? -Infinity });
   }
   const older = (a, b) => (a === b ? 0 : a - b);
   if (opts.projects.length === 0) {
@@ -799,6 +835,7 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
       'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', stopReason,
       '--cost', costUsd === null ? 'unknown' : String(costUsd), '--turns', Number.isInteger(m.turns) ? String(m.turns) : 'unknown',
       '--model', model, '--min-retention', opts.minRetention === undefined ? 'default' : String(opts.minRetention),
+      '--conversation', conversationArg(digest ? conversationOf(digest) : null),
     ];
     if (opts.dryRun) args.push('--dry-run');
     const applyStep = runStep(args);
@@ -880,6 +917,10 @@ function record(config, state, { kind, scope, res, started, dryRun }) {
     kind, at: new Date().toISOString(), outcome: res.outcome,
     stopReason: res.model?.stopReason ?? null, costUsd: res.model?.costUsd ?? null,
   };
+  if (res.conversation) {
+    entry.lastOutcome.truncated = res.conversation.truncated;
+    entry.lastOutcome.sessionsLeftOut = res.conversation.sessionsLeftOut;
+  }
   writeState(config, state);
 }
 
@@ -893,6 +934,7 @@ function headline(kind, scope, res) {
   else what = `${res.outcome}, ${res.changes?.length ?? 0} change(s)`;
   let line = `${kind} ${scope}: ${what}, ${usd(res.model ? res.model.costUsd : 0)}`;
   if (res.model) line += `, stopped: ${res.model.stopReason}`;
+  if (res.conversation?.truncated) line += ', conversation text cut';
   return line;
 }
 
@@ -986,10 +1028,10 @@ async function driverMain(argv) {
       }
       let digest = null;
       if (opts.kind === 'extract') {
-        digest = await buildDigest({ files: item.files, repoDir: config.repoDir, maxBytes: c.maxTranscriptBytes });
+        digest = await buildDigest({ files: item.files, repoDir: config.repoDir, maxBytes: c.maxTranscriptBytes, since: item.since });
         if (interrupted) break;
         if (digest.sessions === 0) {
-          const res = { outcome: 'no-session' };
+          const res = { outcome: 'no-session', conversation: conversationOf(digest) };
           record(config, state, { kind: opts.kind, scope: item.scope, res, started, dryRun: opts.dryRun });
           printScope(opts.kind, item.scope, res, opts);
           continue;
@@ -998,6 +1040,7 @@ async function driverMain(argv) {
       runDir ??= makeRunDir(config, started, opts.keep);
       calls += 1;
       const res = await runScope({ config, opts, model, runDir, scope: item.scope, digest });
+      if (digest) res.conversation = conversationOf(digest);
       digest = null;
       spent += spentBy(res, c);
       record(config, state, { kind: opts.kind, scope: item.scope, res, started, dryRun: opts.dryRun });
