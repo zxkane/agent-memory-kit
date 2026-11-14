@@ -512,3 +512,51 @@ test('organize prompt: global/ is a destination only in a project run; a split n
   assert.ok(on.includes(split));
   assert.ok(off.includes(split));
 });
+
+// T1: tuning of the organize prompt.
+const OVER = { overLimit: true, indexLines: 127, indexBytes: 31900 };
+
+test('T1: the over-limit block with the current numbers is shown only when the index is over a limit', () => {
+  for (const hasGlobal of [true, false]) {
+    const over = renderPrompt('organize', { hasGlobal, ...OVER });
+    assert.ok(over.includes('MEMORY.md is over its limit now: 127 lines and 31900 bytes, where at most 200 lines and 25,000 bytes are allowed. Bring it within the limit first.'));
+    assert.ok(over.includes('Start by shortening the hooks: an index line is `- [Title](file-name.md) — hook`, and the hook is a short phrase that says when to open the note, not a summary of it. Aim for lines of about 120 bytes; text in a non-Latin script takes about three bytes per character.'));
+    assert.ok(over.includes('Only when shorter hooks are not enough, merge closely related notes into one topic note, keeping every fact. Never drop a note from the index.'));
+    assert.ok(!over.includes('{{'));
+    for (const vars of [{ hasGlobal }, { hasGlobal, overLimit: false, indexLines: 12, indexBytes: 900 }]) {
+      const within = renderPrompt('organize', vars);
+      assert.ok(!within.includes('over its limit now'));
+      assert.ok(!within.includes('{{'));
+    }
+  }
+  assert.ok(!renderPrompt('organize', { hasGlobal: false, ...OVER }).includes('global/'));
+});
+
+test('T1: the organize prompt leaves frontmatter alone, never translates, and gives an order of work', () => {
+  const on = renderPrompt('organize', { hasGlobal: true });
+  const off = renderPrompt('organize', { hasGlobal: false });
+  for (const text of [on, off]) {
+    assert.ok(text.includes('  name: <a short name for the note>'));
+    assert.ok(text.includes('The name need not equal the file name. Leave frontmatter that is complete and accurate alone: repair only what is missing or broken, and a description that no longer matches its note counts as broken. Do not rewrite a note only to restyle its frontmatter.'));
+    assert.ok(text.includes('In [[…]] links and in MOVED TO lines, a note is named by its file name without .md, not by the name in its frontmatter.'));
+    assert.ok(text.includes('Keep every fact in the language it is written in; never translate it, also not when you merge it into a note written in another language. A note may hold more than one language.'));
+    assert.ok(text.includes('Work in this order, most important first, so that a run that stops early has finished the earlier items: first, when the index is over its limit, bring it within the limit; then merge .conflict- copies and duplicate notes;'));
+    assert.ok(text.includes('last, repair frontmatter and turn relative dates into absolute ones.'));
+    assert.ok(!text.includes('name: <the file name without .md>'));
+  }
+  assert.ok(on.includes('then move the notes that belong in global/;'));
+  assert.ok(!off.includes('then move the notes'));
+});
+
+test('T2: the repair prompt carries the problems, the reference folder and the whole first task', () => {
+  const task = renderPrompt('organize', { hasGlobal: false });
+  const text = renderPrompt('repair', { problems: '- notes/b.md: a problem', original: '/w/p/original', task, hasGlobal: false });
+  assert.ok(text.includes('- notes/b.md: a problem'));
+  assert.ok(text.includes('/w/p/original holds the notes of notes/ as they were before your previous run. It is for reading only'));
+  assert.ok(text.endsWith(`${task}\n`) || text.endsWith(task));
+  assert.ok(!text.includes('global/'));
+  assert.ok(!text.includes('{{'));
+  assert.ok(renderPrompt('repair', { problems: 'x', original: 'o', task: 't', hasGlobal: true }).includes('global/ the copy of the global folder'));
+  const raw = readFileSync(join(promptsDir, 'repair.md'), 'utf8');
+  assert.ok(!raw.includes('/home/') && !raw.includes('@'));
+});
