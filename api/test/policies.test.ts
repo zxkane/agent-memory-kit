@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { bucketPolicy, functionPolicy, logsPolicy } from '../infra/policies.ts';
+import { bucketPolicy, functionPolicy, logsPolicy, trustPolicy } from '../infra/policies.ts';
 
 const BUCKET = 'arn:aws:s3:::example-bucket';
 const ROLE_A = 'arn:aws:iam::123456789012:role/bridge-a';
@@ -140,5 +140,27 @@ describe('logsPolicy', () => {
     for (const s of statements) {
       for (const r of asList(s.Resource)) assert.notEqual(r, '*');
     }
+  });
+});
+
+describe('trustPolicy', () => {
+  const policy = trustPolicy();
+  const statements = policy.Statement as Statement[];
+
+  it('has exactly one statement', () => {
+    assert.equal(statements.length, 1);
+    assert.equal(statements[0].Effect, 'Allow');
+  });
+
+  it('trusts only the Lambda service, with no AWS key and no wildcard', () => {
+    assert.deepEqual(statements[0].Principal, { Service: 'lambda.amazonaws.com' });
+    const text = JSON.stringify(policy);
+    assert.ok(!text.includes('"AWS"'));
+    assert.ok(!text.includes('*'));
+    assert.ok(!text.includes(':root'));
+  });
+
+  it('allows only sts:AssumeRole', () => {
+    assert.deepEqual(asList(statements[0].Action), ['sts:AssumeRole']);
   });
 });

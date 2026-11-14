@@ -56,6 +56,23 @@ export function logsPolicy(logGroupArn: string): PolicyDocument {
   };
 }
 
+/**
+ * The function role's trust policy: the Lambda service and nothing else. SST would otherwise
+ * also trust the whole account, so the deployment sets this explicitly.
+ */
+export function trustPolicy() {
+  return {
+    Version: '2012-10-17' as const,
+    Statement: [
+      {
+        Effect: 'Allow' as const,
+        Principal: { Service: 'lambda.amazonaws.com' },
+        Action: 'sts:AssumeRole',
+      },
+    ],
+  };
+}
+
 /** TLS-only deny, plus the workstation bridge roles when given. */
 export function bucketPolicy(bucketArn: string, workstationRoleArns: string[]): PolicyDocument {
   for (const arn of workstationRoleArns) {

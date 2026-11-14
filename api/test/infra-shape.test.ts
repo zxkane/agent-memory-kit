@@ -71,6 +71,18 @@ describe('infrastructure source', () => {
     assert.match(src, /retentionInDays:30/);
   });
 
+  it('sets the function role trust policy explicitly from trustPolicy()', () => {
+    const src = squash('infra/api.ts');
+    assert.match(src, /role:\(?\w*(:[\w.]+)?\)?(:[\w.]+)?=>\{[^]*args\.assumeRolePolicy=JSON\.stringify\(trustPolicy\(\)\)/);
+    assert.match(src, /import\{[^}]*\btrustPolicy\b[^}]*\}from/);
+  });
+
+  it('has no :root principal in the SST program files', () => {
+    for (const f of files) {
+      assert.doesNotMatch(read(f), /:root\b/, f);
+    }
+  });
+
   it('makes the probe client scopes depend on the stage', () => {
     const src = squash('infra/auth.ts');
     assert.match(src, /name:"probe"[\s\S]*allowedOauthScopes:\$app\.stage===/);
