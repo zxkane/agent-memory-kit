@@ -34,7 +34,7 @@ test('the tool definitions are the five operations in the order of ROUTES', () =
 test('each description is the summary followed by the description of the operation', () => {
   for (const tool of tools) {
     const op = operation(tool.name);
-    assert.equal(tool.description, `${op.summary} ${op.description}`, tool.name);
+    assert.equal(tool.description, [op.summary, op.description].filter(Boolean).join(' '), tool.name);
   }
 });
 

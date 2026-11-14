@@ -12,6 +12,9 @@ import { onlyParams, parseNotePath, parseScope, scopeName } from './validate.ts'
 // What both entry points (HTTP API event, gateway invocation) share: running one operation, the
 // error answer, and the log line.
 
+/** The most bytes the JSON of a write request may have, on either entry. */
+export const MAX_BODY_BYTES = 100_000;
+
 export type Query = Record<string, string | undefined>;
 export type Line = {
   op: string | null;

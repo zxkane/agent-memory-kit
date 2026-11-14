@@ -150,6 +150,8 @@ test('every refusal of the HTTP path is the same on the gateway path', async () 
     { tool: 'memory_write', route: 'POST /v1/notes', args: {}, body: { ...WRITE, extra: 'x' } },
     { tool: 'memory_write', route: 'POST /v1/notes', args: {}, body: { ...WRITE, content: long } },
     { tool: 'memory_write', route: 'POST /v1/notes', args: {}, body: { ...WRITE, type: 'bogus' } },
+    // Within every field limit, but more than 100000 bytes once serialised.
+    { tool: 'memory_write', route: 'POST /v1/notes', args: {}, body: { ...WRITE, content: '\n'.repeat(50_000) } },
     { tool: 'memory_write', route: 'POST /v1/notes', args: {}, body: { ...WRITE, name: 'memory' } },
   ];
   for (const c of cases) {
@@ -162,8 +164,8 @@ test('every refusal of the HTTP path is the same on the gateway path', async () 
           : { query: Object.fromEntries(Object.entries(c.args).map(([k, v]) => [k, String(v)])) },
       ),
     );
-    assert.ok((http.statusCode ?? 0) >= 400, JSON.stringify(c));
-    assert.deepEqual(gateway, JSON.parse(http.body ?? ''), JSON.stringify(c));
+    assert.ok((http.statusCode ?? 0) >= 400, JSON.stringify(c).slice(0, 150));
+    assert.deepEqual(gateway, JSON.parse(http.body ?? ''), JSON.stringify(c).slice(0, 150));
   }
 });
 
@@ -317,4 +319,87 @@ test('the log line of a refused or failed invocation carries the status the HTTP
   await call('nothing', {});
   assert.deepEqual(lines.map((l) => l.status), [400, 400, 404]);
   assert.equal(lines[1]?.scope, 'global');
+});
+
+test('a write over the body size limit is refused and writes nothing', async () => {
+  const { call, store } = setup();
+  const res = await call('memory_write', { ...WRITE, content: '\n'.repeat(50_000) });
+  assert.deepEqual(res, { error: { code: 'invalid_request', message: 'the request body is too large' } });
+  assert.deepEqual([...store.objects.keys()].sort(), Object.keys(SEED).sort());
+});
+
+test('the client context custom values may arrive as custom or as Custom', async () => {
+  const keys = ['custom', 'Custom'];
+  for (const key of keys) {
+    const context = { clientContext: { [key]: { bedrockAgentCoreToolName: 't___memory_scopes', bedrockAgentCoreGatewayId: 'gw-9', bedrockAgentCoreTargetId: 'T9' } } };
+    const on = setup();
+    const res = (await on.handler({}, context as Ctx)) as any;
+    assert.ok(Array.isArray(res.scopes), key);
+    assert.equal(on.lines[0]?.via, 'gateway', key);
+    assert.equal(on.lines[0]?.gateway, 'gw-9', key);
+    assert.equal(on.lines[0]?.target, 'T9', key);
+    const off = setup(SEED, false);
+    assert.deepEqual(await off.handler({}, context as Ctx), { error: { code: 'forbidden', message: 'direct invocation is not enabled' } }, key);
+    assert.deepEqual(off.store.gets, []);
+  }
+  const { handler } = setup();
+  const neither = (await handler(httpEvent('GET /v1/scopes'), { clientContext: { Custom: {}, custom: {} } } as Ctx)) as any;
+  assert.equal(neither.statusCode, 200);
+});
+
+test('without a gateway context, an event that is not an object is an unknown route and does not throw', async () => {
+  for (const event of [null, undefined, 'text', 5, []]) {
+    const { handler, lines } = setup();
+    const res = (await handler(event as never, { clientContext: { custom: { bedrockAgentCoreToolName: 5 } } } as Ctx)) as any;
+    assert.equal(res.statusCode, 404);
+    assert.equal(JSON.parse(res.body).error.message, 'unknown route');
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0]?.op, null);
+    assert.equal(lines[0]?.status, 404);
+    assert.equal('via' in lines[0]!, false);
+  }
+});
+
+test('an unknown tool is reported before a non-object event', async () => {
+  const { handler } = setup();
+  const res = await handler(null, gatewayContext('nothing'));
+  assert.deepEqual(res, { error: { code: 'not_found', message: 'unknown tool' } });
+});
+
+test('a refused argument still leaves the valid scope and path in the log line', async () => {
+  const { call, lines, handler } = setup();
+  await call('memory_search', { q: 5, scope: 'global' });
+  await call('memory_read', { path: 'global/n.md', extra: 5 });
+  await handler(httpEvent('GET /v1/search', { query: { q: 'x', scope: 'global', limit: '99' } }));
+  assert.equal(lines[0]?.status, 400);
+  assert.equal(lines[0]?.scope, 'global');
+  assert.equal(lines[1]?.scope, 'global');
+  assert.equal(lines[1]?.path, 'global/n.md');
+  assert.equal(lines[2]?.scope, 'global');
+});
+
+test('the exported handler enables direct invocation only for DIRECT_INVOCATION=on', async () => {
+  const saved = { bucket: process.env.BUCKET, direct: process.env.DIRECT_INVOCATION };
+  const refused = { error: { code: 'forbidden', message: 'direct invocation is not enabled' } };
+  const log = console.log;
+  console.log = () => {};
+  // The handler reads the variable when it is first used, so each case loads a fresh copy of the module.
+  const load = async (n: number) => ((await import(`../src/handler.ts?case=${n}`)) as typeof import('../src/handler.ts')).handler;
+  try {
+    process.env.BUCKET = 'placeholder-bucket';
+    let n = 0;
+    for (const value of ['ON', 'true', '', 'off', undefined]) {
+      if (value === undefined) delete process.env.DIRECT_INVOCATION;
+      else process.env.DIRECT_INVOCATION = value;
+      assert.deepEqual(await (await load(++n))({}, gatewayContext('memory_scopes')), refused, String(value));
+    }
+    process.env.DIRECT_INVOCATION = 'on';
+    assert.deepEqual(await (await load(++n))({}, gatewayContext('nothing')), { error: { code: 'not_found', message: 'unknown tool' } });
+  } finally {
+    console.log = log;
+    for (const [name, value] of [['BUCKET', saved.bucket], ['DIRECT_INVOCATION', saved.direct]] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });

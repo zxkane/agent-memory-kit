@@ -1,15 +1,13 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
 import { ApiError } from './errors.ts';
-import { handleGateway, isGatewayInvocation } from './gateway.ts';
+import { handleGateway, isGatewayInvocation, isObject } from './gateway.ts';
 import type { GatewayContext } from './gateway.ts';
-import { failure, runOperation, writeLine } from './run.ts';
+import { MAX_BODY_BYTES, failure, runOperation, writeLine } from './run.ts';
 import type { Line, Query } from './run.ts';
 import { RESOURCE_SERVER, ROUTES } from './routes.ts';
 import { createSnapshots } from './snapshot.ts';
 import { s3Store } from './store.ts';
 import type { Store } from './store.ts';
-
-const MAX_BODY_BYTES = 100_000;
 
 type HttpHandler = (event: APIGatewayProxyEventV2WithJWTAuthorizer) => Promise<APIGatewayProxyStructuredResultV2>;
 // The first signature is the HTTP API event; the second is what Lambda passes in general, which
@@ -79,7 +77,7 @@ export function createHandler(deps: { store: Store; log?: (line: object) => void
   return ((event: unknown, context?: GatewayContext) =>
     isGatewayInvocation(context)
       ? handleGateway({ ops, log, direct: deps.direct === true }, event, context)
-      : http(event as APIGatewayProxyEventV2WithJWTAuthorizer)) as Handler;
+      : http((isObject(event) ? event : {}) as unknown as APIGatewayProxyEventV2WithJWTAuthorizer)) as Handler;
 }
 
 // Built on first use, so importing this module needs neither the BUCKET variable nor AWS.
