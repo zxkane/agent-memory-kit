@@ -2,11 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { HOOK_MARKER, LAUNCHER_REL, install, kiroHookDocument, mergeCodexHooks, mergeHooks, removeHooks, toolCommand } from '../install.mjs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { HOOK_MARKER, LAUNCHER_REL, checkInstall, install, kiroHookDocument, mergeCodexHooks, mergeHooks, planInstall, removeHooks, toolCommand } from '../install.mjs';
 import { tempDir } from './helpers.mjs';
 
 const RUN = '/srv/kit/workstation/run.sh';
+const INSTALL_MJS = join(dirname(fileURLToPath(import.meta.url)), '..', 'install.mjs');
+const LINKED = 'is a symbolic link or lies in a linked folder, so it was left unchanged.';
 
 function fixture(t) {
   const base = tempDir(t);
@@ -163,9 +166,24 @@ test('launcher is written, executable, and runs the kit launcher', async (t) => 
     assert.equal(lstatSync(file).isFile(), true);
     assert.equal(statSync(file).mode & 0o777, 0o755);
     assert.ok(readFileSync(file, 'utf8').startsWith('#!/bin/sh\n'));
-    assert.ok(readFileSync(file, 'utf8').includes(`exec "${kitDir}/workstation/run.sh" "$@"\n`));
+    assert.equal(readFileSync(file, 'utf8'), `#!/bin/sh\n# Written by agent-memory-kit setup. A stable path to the kit's launcher.\n[ -x "${kitDir}/workstation/run.sh" ] || exit 0\nexec "${kitDir}/workstation/run.sh" "$@"\n`);
   }
   assert.equal(statSync(join(home, '.config/agent-memory')).mode & 0o777, 0o700);
+});
+
+test('launcher: passes its arguments to the kit launcher, and is silent when the kit is gone', async (t) => {
+  const { home, kitDir } = fixture(t);
+  writeFileSync(join(kitDir, 'workstation/run.sh'), '#!/bin/sh\nprintf "%s" "$*"\n', { mode: 0o755 });
+  await install({ home, kitDir });
+  const env = { PATH: process.env.PATH, HOME: home };
+  const ran = spawnSync(join(home, LAUNCHER_REL), ['session-start', 'codex', HOOK_MARKER], { env, encoding: 'utf8' });
+  assert.equal(ran.status, 0);
+  assert.equal(ran.stdout, `session-start codex ${HOOK_MARKER}`);
+  rmSync(kitDir, { recursive: true });
+  const gone = spawnSync(join(home, LAUNCHER_REL), ['session-start', 'codex'], { env, encoding: 'utf8' });
+  assert.equal(gone.status, 0);
+  assert.equal(gone.stdout, '');
+  assert.equal(gone.stderr, '');
 });
 
 test('launcher: an existing directory keeps its mode', async (t) => {
@@ -247,7 +265,7 @@ test('codex: a symbolic link is never written', async (t) => {
   assert.equal(lstatSync(codexFile).isSymbolicLink(), true);
   assert.equal(notices.length, 2);
   assert.equal(notices[1], 'Codex: start a session and run /hooks to trust the new hook; Codex skips it until then.');
-  assert.ok(notices[0].startsWith(`Codex: ${codexFile} is a symbolic link and was left unchanged. Add this hook to the file it points to:\n`));
+  assert.ok(notices[0].startsWith(`Codex: ${codexFile} ${LINKED} Add this hook to it:\n`));
   assert.deepEqual(JSON.parse(notices[0].slice(notices[0].indexOf('\n') + 1)), { hooks: { SessionStart: [OWN_ENTRY] } });
   assert.ok(notices[0].includes('\n{\n  "hooks": {'));
 
@@ -258,7 +276,7 @@ test('codex: a symbolic link is never written', async (t) => {
   // With hooks off and the entry present the removal notice is returned.
   const present = readFileSync(target, 'utf8');
   const off = await install({ home, kitDir, hooks: false });
-  assert.deepEqual(off.notices, [`Codex: ${codexFile} is a symbolic link and was left unchanged. Remove the agent-memory-kit hook from the file it points to.`]);
+  assert.deepEqual(off.notices, [`Codex: ${codexFile} ${LINKED} Remove the agent-memory-kit hook from it.`]);
   assert.equal(readFileSync(target, 'utf8'), present);
 
   // With hooks off and no entry there is nothing to say.
@@ -271,7 +289,7 @@ test('codex: a dangling or unparsable symbolic link does not throw', async (t) =
   symlinkSync(join(base, 'missing.json'), codexFile);
   const dangling = await install({ home, kitDir });
   assert.equal(dangling.notices.length, 2);
-  assert.ok(dangling.notices[0].includes('is a symbolic link and was left unchanged. Add this hook'));
+  assert.ok(dangling.notices[0].includes(`${LINKED} Add this hook`));
   const target = join(base, 'bad.json');
   writeFileSync(target, '{ nope');
   rmSync(codexFile);
@@ -370,6 +388,239 @@ test('codex: a symbolic link to an unexpected shape gets the add-by-hand notice'
   writeFileSync(target, '{"hooks": {"SessionStart": "x"}}');
   symlinkSync(target, codexFile);
   const { notices } = await install({ home, kitDir });
-  assert.ok(notices[0].includes('is a symbolic link and was left unchanged. Add this hook'));
+  assert.ok(notices[0].includes(`${LINKED} Add this hook`));
   assert.equal(readFileSync(target, 'utf8'), '{"hooks": {"SessionStart": "x"}}');
+});
+
+// A folder that is a symbolic link is never written through.
+
+const TRUST = 'Codex: start a session and run /hooks to trust the new hook; Codex skips it until then.';
+const documentOf = (notice) => JSON.parse(notice.slice(notice.indexOf('\n') + 1));
+const files = (dir) => readdirSync(dir, { recursive: true }).sort();
+
+test('codex: a linked ~/.codex folder is never written', async (t) => {
+  const { base, kitDir, home, codexFile } = agentFixture(t);
+  const managed = join(base, 'dotfiles', 'codex');
+  mkdirSync(managed, { recursive: true });
+  symlinkSync(managed, join(home, '.codex'));
+
+  const created = await install({ home, kitDir });
+  assert.deepEqual(files(managed), []);
+  assert.equal(created.notices.length, 2);
+  assert.ok(created.notices[0].startsWith(`Codex: ${codexFile} ${LINKED} Add this hook to it:\n`));
+  assert.deepEqual(documentOf(created.notices[0]), { hooks: { SessionStart: [OWN_ENTRY] } });
+  assert.equal(created.notices[1], TRUST);
+  assert.deepEqual((await install({ home, kitDir, hooks: false })).notices, []);
+  assert.deepEqual(files(managed), []);
+
+  // An existing file in the linked folder is read, never written.
+  const target = join(managed, 'hooks.json');
+  const without = JSON.stringify({ hooks: { Stop: [] } });
+  writeFileSync(target, without);
+  const old = new Date(2020, 0, 1);
+  utimesSync(target, old, old);
+  assert.equal((await install({ home, kitDir })).notices.length, 2);
+  assert.deepEqual((await install({ home, kitDir, hooks: false })).notices, []);
+  assert.equal(readFileSync(target, 'utf8'), without);
+
+  const withEntry = JSON.stringify(mergeCodexHooks({}));
+  writeFileSync(target, withEntry);
+  utimesSync(target, old, old);
+  assert.deepEqual((await install({ home, kitDir })).notices, []);
+  assert.deepEqual((await install({ home, kitDir, hooks: false })).notices, [`Codex: ${codexFile} ${LINKED} Remove the agent-memory-kit hook from it.`]);
+  assert.equal(readFileSync(target, 'utf8'), withEntry);
+  assert.equal(statSync(target).mtimeMs, old.getTime());
+
+  // Content that could not be used as a regular file does not throw either.
+  writeFileSync(target, '{ nope');
+  assert.equal((await install({ home, kitDir })).notices.length, 2);
+  assert.equal(readFileSync(target, 'utf8'), '{ nope');
+  assert.deepEqual(files(managed), ['hooks.json']);
+});
+
+test('kiro: a linked ~/.kiro or ~/.kiro/hooks folder is never written', async (t) => {
+  for (const linkedFolder of ['.kiro', '.kiro/hooks']) {
+    const { base, kitDir, home, kiroFile } = agentFixture(t);
+    const managed = join(base, 'dotfiles');
+    mkdirSync(managed);
+    if (linkedFolder === '.kiro') {
+      symlinkSync(managed, join(home, '.kiro'));
+    } else {
+      mkdirSync(join(home, '.kiro'));
+      symlinkSync(managed, join(home, '.kiro/hooks'));
+    }
+    const inManaged = linkedFolder === '.kiro' ? join(managed, 'hooks/agent-memory-kit.json') : join(managed, 'agent-memory-kit.json');
+    const label = `linked ${linkedFolder}`;
+
+    const first = await install({ home, kitDir });
+    assert.deepEqual(files(managed), [], label);
+    assert.equal(first.notices.length, 1, label);
+    assert.ok(first.notices[0].includes(join(home, '.kiro/hooks')), label);
+    assert.ok(first.notices[0].includes('left unchanged'), label);
+    assert.ok(first.notices[0].includes('regular file named agent-memory-kit.json'), label);
+    assert.deepEqual(documentOf(first.notices[0]), kiroHookDocument(), label);
+    assert.deepEqual((await install({ home, kitDir, hooks: false })).notices, [], label);
+    assert.deepEqual(files(managed), [], label);
+
+    // A file that holds another document gets the same notice and is not changed.
+    mkdirSync(dirname(inManaged), { recursive: true });
+    writeFileSync(inManaged, '{"version":"v1","hooks":[]}');
+    assert.equal((await install({ home, kitDir })).notices.length, 1, label);
+    assert.equal(readFileSync(inManaged, 'utf8'), '{"version":"v1","hooks":[]}', label);
+
+    // The right document in place: nothing to say. With hooks off it is not deleted.
+    const right = `${JSON.stringify(kiroHookDocument(), null, 2)}\n`;
+    writeFileSync(inManaged, right);
+    assert.deepEqual((await install({ home, kitDir })).notices, [], label);
+    const off = await install({ home, kitDir, hooks: false });
+    assert.equal(off.notices.length, 1, label);
+    assert.ok(off.notices[0].includes(kiroFile) && off.notices[0].includes('Remove it by hand'), label);
+    assert.equal(readFileSync(inManaged, 'utf8'), right, label);
+  }
+});
+
+test('a home directory reached through a symbolic link does not count as linked', async (t) => {
+  const { base, kitDir, home, codexFile, kiroFile } = agentFixture(t, { codex: true, kiro: true });
+  const alias = join(base, 'home-alias');
+  symlinkSync(home, alias);
+  const { notices } = await install({ home: alias, kitDir });
+  assert.deepEqual(notices, [TRUST]);
+  assert.deepEqual(JSON.parse(readFileSync(codexFile, 'utf8')), mergeCodexHooks({}));
+  assert.deepEqual(JSON.parse(readFileSync(kiroFile, 'utf8')), kiroHookDocument());
+  assert.equal(lstatSync(codexFile).isFile(), true);
+});
+
+test('kiro: a file that already has the right content is not rewritten', async (t) => {
+  const { kitDir, home, kiroFile } = agentFixture(t, { kiro: true });
+  await install({ home, kitDir });
+  const old = new Date(2020, 0, 1);
+  utimesSync(kiroFile, old, old);
+  await install({ home, kitDir });
+  assert.equal(statSync(kiroFile).mtimeMs, old.getTime());
+  writeFileSync(kiroFile, '{}');
+  await install({ home, kitDir });
+  assert.deepEqual(JSON.parse(readFileSync(kiroFile, 'utf8')), kiroHookDocument());
+});
+
+test('codex: null shapes in a regular hooks.json are refused, naming the part that is wrong', async (t) => {
+  const { kitDir, home, codexFile } = agentFixture(t, { codex: true });
+  for (const [text, part] of [
+    ['{"hooks": null}', '"hooks"'],
+    ['{"hooks": []}', '"hooks"'],
+    ['{"hooks": {"SessionStart": null}}', '"hooks.SessionStart"'],
+    ['{"hooks": {"SessionStart": {}}}', '"hooks.SessionStart"'],
+  ]) {
+    writeFileSync(codexFile, text);
+    await assert.rejects(install({ home, kitDir }), (err) => err.message.includes(codexFile) && err.message.includes(part), text);
+    assert.equal(readFileSync(codexFile, 'utf8'), text);
+  }
+});
+
+// checkInstall: every validation install can fail on, before anything is written.
+
+test('checkInstall refuses what install refuses and writes nothing', async (t) => {
+  const bad = [
+    ['.claude/settings.json', '{ nope'],
+    ['.claude/settings.json', '[1]'],
+    ['.codex/hooks.json', '{ nope'],
+    ['.codex/hooks.json', 'null'],
+    ['.codex/hooks.json', '{"hooks": null}'],
+    ['.codex/hooks.json', '{"hooks": {"SessionStart": "x"}}'],
+  ];
+  for (const [rel, text] of bad) {
+    const { kitDir, home } = agentFixture(t, { codex: true, kiro: true });
+    const file = join(home, rel);
+    writeFileSync(file, text);
+    const before = files(home);
+    assert.throws(() => checkInstall({ home }), (err) => err.message.includes(file), `${rel} ${text}`);
+    await assert.rejects(install({ home, kitDir }), (err) => err.message.includes(file));
+    assert.deepEqual(files(home), before);
+    assert.equal(existsSync(join(kitDir, 'workstation/node.local.path')), false);
+    assert.equal(existsSync(join(home, '.config')), false);
+    assert.equal(readFileSync(file, 'utf8'), text);
+  }
+});
+
+test('checkInstall accepts good input, a missing or linked file, and shapes that hooks=false ignores', (t) => {
+  const { base, home, codexFile } = agentFixture(t, { codex: true });
+  assert.doesNotThrow(() => checkInstall({ home }));
+  writeFileSync(codexFile, '{"hooks": {"SessionStart": "x"}}');
+  assert.doesNotThrow(() => checkInstall({ home, hooks: false }));
+  assert.throws(() => checkInstall({ home, hooks: true }), /hooks\.SessionStart/);
+  rmSync(codexFile);
+  const target = join(base, 'bad.json');
+  writeFileSync(target, '{ nope');
+  symlinkSync(target, codexFile);
+  assert.doesNotThrow(() => checkInstall({ home }));
+  assert.throws(() => checkInstall({ home: 'relative' }), /absolute/);
+});
+
+test('checkInstall does not look at a Codex file in a linked folder', (t) => {
+  const { base, home } = agentFixture(t);
+  const managed = join(base, 'dotfiles');
+  mkdirSync(managed);
+  writeFileSync(join(managed, 'hooks.json'), '{ nope');
+  symlinkSync(managed, join(home, '.codex'));
+  assert.doesNotThrow(() => checkInstall({ home }));
+});
+
+test('install.mjs --check exits non-zero with the message on stderr and writes nothing', (t) => {
+  const { home } = agentFixture(t, { codex: true });
+  const env = { PATH: process.env.PATH, HOME: home };
+  const ok = spawnSync(process.execPath, [INSTALL_MJS, '--check'], { env, encoding: 'utf8' });
+  assert.equal(ok.status, 0);
+  assert.equal(ok.stdout + ok.stderr, '');
+  const codexFile = join(home, '.codex/hooks.json');
+  writeFileSync(codexFile, '{"hooks": {"SessionStart": 1}}');
+  const bad = spawnSync(process.execPath, [INSTALL_MJS, '--check'], { env, encoding: 'utf8' });
+  assert.notEqual(bad.status, 0);
+  assert.equal(bad.stdout, '');
+  assert.ok(bad.stderr.includes(codexFile));
+  const off = spawnSync(process.execPath, [INSTALL_MJS, '--check', '--no-hooks'], { env, encoding: 'utf8' });
+  assert.equal(off.status, 0);
+  assert.equal(existsSync(join(home, '.config')), false);
+  const usage = spawnSync(process.execPath, [INSTALL_MJS, '--bogus'], { env, encoding: 'utf8' });
+  assert.notEqual(usage.status, 0);
+});
+
+// planInstall: what a dry run reports, decided by the rules install uses.
+
+test('planInstall says what install would do for Codex and Kiro', (t) => {
+  const { base, home, codexFile, kiroFile } = agentFixture(t, { codex: true, kiro: true });
+  const kiroDir = join(home, '.kiro/hooks');
+  assert.deepEqual(planInstall({ home }), [
+    `would register the Codex session-start hook (${codexFile})`,
+    `would write ${kiroFile}`,
+  ]);
+  assert.deepEqual(planInstall({ home, hooks: false }), []);
+
+  // With the kit's files present, --no-hooks says what it would remove.
+  mkdirSync(kiroDir);
+  writeFileSync(codexFile, JSON.stringify(mergeCodexHooks({})));
+  writeFileSync(kiroFile, `${JSON.stringify(kiroHookDocument())}\n`);
+  assert.deepEqual(planInstall({ home, hooks: false }), [
+    `would remove the Codex session-start hook from ${codexFile}`,
+    `would remove ${kiroFile}`,
+  ]);
+
+  // Linked folders: left unchanged, and what is printed instead.
+  const managed = join(base, 'dotfiles');
+  mkdirSync(join(managed, 'codex'), { recursive: true });
+  mkdirSync(join(managed, 'kiro-hooks'));
+  rmSync(join(home, '.codex'), { recursive: true });
+  rmSync(kiroDir, { recursive: true });
+  symlinkSync(join(managed, 'codex'), join(home, '.codex'));
+  symlinkSync(join(managed, 'kiro-hooks'), kiroDir);
+  const plan = planInstall({ home });
+  assert.equal(plan.length, 2);
+  assert.ok(plan[0].startsWith(`would leave ${codexFile} unchanged`) && plan[0].includes('print the hook entry to add'));
+  assert.ok(plan[1].startsWith(`would leave ${kiroDir} unchanged`) && plan[1].includes('print the hook document to save there'));
+  assert.deepEqual(planInstall({ home, hooks: false }), []);
+  writeFileSync(join(managed, 'codex/hooks.json'), JSON.stringify(mergeCodexHooks({})));
+  writeFileSync(join(managed, 'kiro-hooks/agent-memory-kit.json'), `${JSON.stringify(kiroHookDocument())}\n`);
+  const off = planInstall({ home, hooks: false });
+  assert.equal(off.length, 2);
+  assert.ok(off[0].startsWith(`would leave ${codexFile} unchanged`) && off[0].includes('remove'));
+  assert.ok(off[1].startsWith(`would leave ${kiroFile} unchanged`) && off[1].includes('remove'));
+  assert.deepEqual(files(managed), ['codex', 'codex/hooks.json', 'kiro-hooks', 'kiro-hooks/agent-memory-kit.json']);
 });
