@@ -145,10 +145,13 @@ export function canaryRolePolicy(parameterArns: string[]): PolicyDocument {
   };
 }
 
-const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:ref:refs\/heads\/[A-Za-z0-9._\/-]+$/;
-/** True for a GitHub Actions subject of exactly one branch of one repository. */
+const SUBJECT_RE = /^repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:ref:refs\/heads\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+// The immutable form: the owner and the repository each carry their numeric ID.
+const IMMUTABLE_SUBJECT_RE =
+  /^repo:[A-Za-z0-9_.-]+@[0-9]{1,20}\/[A-Za-z0-9_.-]+@[0-9]{1,20}:ref:refs\/heads\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+/** True for a GitHub Actions subject of exactly one branch of one repository, in the classic or the immutable form. */
 export function isGithubSubject(value: string): boolean {
-  return SUBJECT_RE.test(value);
+  return SUBJECT_RE.test(value) || IMMUTABLE_SUBJECT_RE.test(value);
 }
 
 const GITHUB_PROVIDER_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/;
@@ -172,7 +175,7 @@ export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: str
   }
   for (const subject of githubSubjects) {
     if (!isGithubSubject(subject)) {
-      throw new Error('Each GitHub subject must be repo:<owner>/<repository>:ref:refs/heads/<branch>.');
+      throw new Error('Each GitHub subject must be repo:<owner>/<repository>:ref:refs/heads/<branch> or repo:<owner>@<owner-id>/<repository>@<repository-id>:ref:refs/heads/<branch>.');
     }
   }
   if (githubSubjects.length > 0 && (githubProviderArn === undefined || !GITHUB_PROVIDER_ARN_RE.test(githubProviderArn))) {

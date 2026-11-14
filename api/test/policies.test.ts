@@ -297,6 +297,68 @@ describe('isGithubSubject', () => {
   });
 });
 
+describe('immutable GitHub subjects', () => {
+  const PROVIDER = 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com';
+  const IMMUTABLE = 'repo:example-owner@100/example-repository@200:ref:refs/heads/main';
+  const CLASSIC = 'repo:example-owner/example-repository:ref:refs/heads/main';
+  const REFUSED = [
+    'repo:o@1/r:ref:refs/heads/main',
+    'repo:o/r@2:ref:refs/heads/main',
+    'repo:o@/r@2:ref:refs/heads/main',
+    'repo:o@1/r@:ref:refs/heads/main',
+    'repo:o@x/r@2:ref:refs/heads/main',
+    'repo:o@1/r@y:ref:refs/heads/main',
+    'repo:o@1@2/r@3:ref:refs/heads/main',
+    'repo:o@1/r@2@3:ref:refs/heads/main',
+    'repo:o@1/r@2:environment:production',
+    'repo:o@1/r@2:pull_request',
+    'repo:o@1/r@2:ref:refs/tags/v1',
+    'repo:o@1/r@2:ref:refs/heads/*',
+    'repo:o@*/r@2:ref:refs/heads/main',
+    'repo:o@1/r@2?:ref:refs/heads/main',
+    'repo:o@123456789012345678901/r@2:ref:refs/heads/main',
+    '*',
+    'repo:o@1/r@2:ref:refs/heads/ma?n',
+    'repo:o@1/r@2:ref:refs/heads//main',
+    'repo:o@1/r@2:ref:refs/heads/a//b',
+    'repo:o@1/r@2:ref:refs/heads/main/',
+    'repo:o/r:ref:refs/heads//main',
+    'repo:o/r:ref:refs/heads/a//b',
+    'repo:o/r:ref:refs/heads/main/',
+    '\nrepo:o@1/r@2:ref:refs/heads/main',
+    'repo:o@1/r@2:ref:refs/heads/main\n',
+    'repo:o@1/r@2:ref:refs/heads/main\nrepo:o@1/r@2:ref:refs/heads/dev',
+    '\nrepo:o/r:ref:refs/heads/main',
+    'repo:o/r:ref:refs/heads/main\n',
+    'repo:o/r:ref:refs/heads/main\nrepo:o/r:ref:refs/heads/dev',
+  ];
+
+  it('isGithubSubject accepts the immutable form and refuses every other variant', () => {
+    assert.equal(isGithubSubject(IMMUTABLE), true);
+    for (const prefix of ['repo:o/r', 'repo:o@1/r@2']) {
+      for (const branch of ['main', 'release/1.0', 'feature/a-b_c.d']) {
+        assert.equal(isGithubSubject(`${prefix}:ref:refs/heads/${branch}`), true, `${prefix} ${branch}`);
+      }
+    }
+    assert.equal(isGithubSubject('repo:o@1/r@2:ref:refs/heads/release/1.0'), true);
+    assert.equal(isGithubSubject(CLASSIC), true);
+    for (const bad of REFUSED) assert.equal(isGithubSubject(bad), false, bad);
+  });
+
+  it('jobsTrustPolicy carries the immutable subject verbatim, mixed with a classic one', () => {
+    const doc = jobsTrustPolicy({ roleArns: [], githubSubjects: [CLASSIC, IMMUTABLE], githubProviderArn: PROVIDER });
+    const statement = (doc.Statement as Array<Record<string, any>>)[0];
+    assert.deepEqual(statement.Condition.StringEquals['token.actions.githubusercontent.com:sub'], [CLASSIC, IMMUTABLE]);
+    for (const bad of REFUSED) {
+      assert.throws(
+        () => jobsTrustPolicy({ roleArns: [], githubSubjects: [IMMUTABLE, bad], githubProviderArn: PROVIDER }),
+        /subject/i,
+        bad,
+      );
+    }
+  });
+});
+
 describe('logsPolicy', () => {
   const LOG_GROUP = 'arn:aws:logs:region-x:123456789012:log-group:/aws/lambda/example';
   const policy = logsPolicy(LOG_GROUP);

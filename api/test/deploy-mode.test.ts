@@ -51,6 +51,35 @@ describe('parseDeployMode', () => {
     assert.equal(mode.direct, false);
   });
 
+  it('reads immutable GitHub subjects, alone or mixed with a classic one', () => {
+    const immutable = 'repo:example-owner@100/example-repository@200:ref:refs/heads/main';
+    const classic = 'repo:example-owner/example-repo:ref:refs/heads/main';
+    const mode = parseDeployMode({ AGENT_MEMORY_GITHUB_SUBJECTS: `${classic}, ${immutable}` });
+    assert.deepEqual(mode.githubSubjects, [classic, immutable]);
+  });
+
+  it('refuses a half-immutable or malformed immutable GitHub subject', () => {
+    for (const bad of [
+      'repo:o@1/r:ref:refs/heads/main',
+      'repo:o/r@2:ref:refs/heads/main',
+      'repo:o@/r@2:ref:refs/heads/main',
+      'repo:o@1/r@2:environment:production',
+      'repo:o@1/r@2:ref:refs/heads/ma?n',
+      'repo:o@1/r@2:ref:refs/heads//main',
+      'repo:o@1/r@2:ref:refs/heads/a//b',
+      'repo:o@1/r@2:ref:refs/heads/main/',
+      'repo:o/r:ref:refs/heads//main',
+      'repo:o/r:ref:refs/heads/a//b',
+      'repo:o/r:ref:refs/heads/main/',
+    ]) {
+      assert.throws(
+        () => parseDeployMode({ AGENT_MEMORY_GITHUB_SUBJECTS: bad }),
+        (error: Error) => error.message.includes('AGENT_MEMORY_GITHUB_SUBJECTS') && !error.message.includes(bad),
+        bad,
+      );
+    }
+  });
+
   it('refuses a malformed workstation role or GitHub subject before anything is declared, without repeating it', () => {
     const cases: Array<[string, string]> = [
       ['AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'arn:aws:iam::123456789012:user/someone'],
