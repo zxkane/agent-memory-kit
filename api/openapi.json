@@ -37,6 +37,38 @@
                             "type": "integer",
                             "description": "Number of notes in the scope."
                           }
+                        },
+                        "required": [
+                          "scope",
+                          "notes"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "scopes"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid_request: the request has an unknown query parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
                         }
                       }
                     }
@@ -47,6 +79,31 @@
           },
           "403": {
             "description": "forbidden: the token lacks the scope this operation needs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal: the service failed and the request was not completed. Retry later; the error body has the same shape as the other errors.",
             "content": {
               "application/json": {
                 "schema": {
@@ -109,7 +166,12 @@
                       "type": "boolean",
                       "description": "True when the index was cut at 25000 bytes."
                     }
-                  }
+                  },
+                  "required": [
+                    "scope",
+                    "index",
+                    "truncated"
+                  ]
                 }
               }
             }
@@ -166,6 +228,31 @@
           },
           "404": {
             "description": "not_found: the scope index or note does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal: the service failed and the request was not completed. Retry later; the error body has the same shape as the other errors.",
             "content": {
               "application/json": {
                 "schema": {
@@ -265,14 +352,26 @@
                             "type": "integer",
                             "description": "Relevance score; higher is better."
                           }
-                        }
+                        },
+                        "required": [
+                          "path",
+                          "scope",
+                          "name",
+                          "description",
+                          "snippet",
+                          "score"
+                        ]
                       }
                     },
                     "total": {
                       "type": "integer",
                       "description": "Number of notes that matched, which may exceed the results returned."
                     }
-                  }
+                  },
+                  "required": [
+                    "results",
+                    "total"
+                  ]
                 }
               }
             }
@@ -304,6 +403,31 @@
           },
           "403": {
             "description": "forbidden: the token lacks the scope this operation needs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal: the service failed and the request was not completed. Retry later; the error body has the same shape as the other errors.",
             "content": {
               "application/json": {
                 "schema": {
@@ -366,7 +490,12 @@
                       "type": "boolean",
                       "description": "True when the note was cut at 100000 bytes."
                     }
-                  }
+                  },
+                  "required": [
+                    "path",
+                    "content",
+                    "truncated"
+                  ]
                 }
               }
             }
@@ -423,6 +552,31 @@
           },
           "404": {
             "description": "not_found: the scope index or note does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal: the service failed and the request was not completed. Retry later; the error body has the same shape as the other errors.",
             "content": {
               "application/json": {
                 "schema": {
@@ -515,13 +669,17 @@
                       "type": "boolean",
                       "description": "True when the note is new, false when it replaced an existing note."
                     }
-                  }
+                  },
+                  "required": [
+                    "path",
+                    "created"
+                  ]
                 }
               }
             }
           },
           "400": {
-            "description": "The request was refused: invalid_request (bad or unknown field, bad JSON, body over 100000 bytes), secret_detected (the text looks like a credential), scope_full (200 notes in this agent scope) or store_full (the agent store is full).",
+            "description": "The request was refused: invalid_request (bad or unknown field, bad JSON, body over 100000 bytes), secret_detected (the text looks like a credential), scope_full (this agent scope reached its limit of 200 notes or about 240 KB of note text) or store_full (the store reached its limit of 16 agent scopes or its total size).",
             "content": {
               "application/json": {
                 "schema": {
@@ -572,6 +730,31 @@
           },
           "409": {
             "description": "conflict: a concurrent write kept the update from applying. Retry the same request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "description": "One of invalid_request, secret_detected, scope_full, store_full, forbidden, not_found, conflict, internal."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Short human-readable explanation."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal: the service failed and the request was not completed. Retry later; the error body has the same shape as the other errors.",
             "content": {
               "application/json": {
                 "schema": {

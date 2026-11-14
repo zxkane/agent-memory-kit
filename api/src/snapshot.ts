@@ -4,13 +4,18 @@ import { parseNotePath } from './validate.ts';
 
 export type Note = { path: string; name: string; description: string; type: string; body: string };
 
-const SNAPSHOT_KEYS = ['index/mem.json', 'index/agents.json'];
+// Each snapshot holds its own kinds of scope; entries outside them are skipped like malformed ones.
+const MEM_SNAPSHOT = { key: 'index/mem.json', prefixes: ['global/', 'projects/'] };
+const AGENTS_SNAPSHOT = { key: 'index/agents.json', prefixes: ['agents/'] };
+// The write path reads only index/agents.json and applies no prefix rule of its own.
+const ANY = [''];
+const SNAPSHOTS = [MEM_SNAPSHOT, AGENTS_SNAPSHOT];
 
 function unreadable(): ApiError {
   return new ApiError(500, 'internal', 'the search snapshot is unreadable');
 }
 
-function isNote(value: unknown): value is Note {
+function isNote(value: unknown, prefixes: string[]): value is Note {
   if (typeof value !== 'object' || value === null) return false;
   const o = value as Record<string, unknown>;
   if (
@@ -22,6 +27,7 @@ function isNote(value: unknown): value is Note {
   ) {
     return false;
   }
+  if (!prefixes.some((p) => (o.path as string).startsWith(p))) return false;
   try {
     parseNotePath(o.path);
   } catch {
@@ -30,7 +36,7 @@ function isNote(value: unknown): value is Note {
   return true;
 }
 
-function parseSnapshot(text: string): Note[] {
+function parseSnapshot(text: string, prefixes: string[]): Note[] {
   let doc: unknown;
   try {
     doc = JSON.parse(text);
@@ -39,7 +45,7 @@ function parseSnapshot(text: string): Note[] {
   }
   const notes = (doc as { notes?: unknown } | null)?.notes;
   if (!Array.isArray(notes)) throw unreadable();
-  return notes.filter(isNote).map((n) => ({
+  return notes.filter((n): n is Note => isNote(n, prefixes)).map((n) => ({
     path: n.path,
     name: n.name,
     description: n.description,
@@ -51,7 +57,7 @@ function parseSnapshot(text: string): Note[] {
 export function createSnapshots(store: Store): { load(): Promise<Note[]> } {
   const cache = new Map<string, { etag: string; notes: Note[] }>();
 
-  async function loadOne(key: string): Promise<Note[]> {
+  async function loadOne({ key, prefixes }: { key: string; prefixes: string[] }): Promise<Note[]> {
     const cached = cache.get(key);
     const res = await store.get(key, cached?.etag);
     if (res.status === 'missing') {
@@ -63,18 +69,18 @@ export function createSnapshots(store: Store): { load(): Promise<Note[]> } {
       // Not-modified without a cached copy cannot be served; fetch unconditionally.
       const fresh = await store.get(key);
       if (fresh.status !== 'ok') return [];
-      const notes = parseSnapshot(fresh.body);
+      const notes = parseSnapshot(fresh.body, prefixes);
       cache.set(key, { etag: fresh.etag, notes });
       return notes;
     }
-    const notes = parseSnapshot(res.body);
+    const notes = parseSnapshot(res.body, prefixes);
     cache.set(key, { etag: res.etag, notes });
     return notes;
   }
 
   return {
     async load() {
-      const lists = await Promise.all(SNAPSHOT_KEYS.map(loadOne));
+      const lists = await Promise.all(SNAPSHOTS.map(loadOne));
       return lists.flat();
     },
   };
@@ -100,7 +106,7 @@ function readSnapshot(snapshotText: string | null): { doc: Record<string, unknow
   }
   const doc = parsed as Record<string, unknown>;
   const entries = doc.notes as unknown[];
-  return { doc, entries, notes: entries.filter(isNote) };
+  return { doc, entries, notes: entries.filter((e): e is Note => isNote(e, ANY)) };
 }
 
 export function listNotes(snapshotText: string | null): Note[] {
@@ -113,6 +119,6 @@ export function upsertNote(snapshotText: string | null, note: Note): string {
   const merged = notes.filter((n) => n.path !== note.path);
   merged.push(note);
   merged.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  const kept = entries.filter((e) => !isNote(e));
+  const kept = entries.filter((e) => !isNote(e, ANY));
   return JSON.stringify({ ...doc, version: 1, notes: [...merged, ...kept] });
 }

@@ -16,20 +16,20 @@ const DESCRIPTION_WEIGHT = 4;
 const BODY_CAP = 5;
 const SNIPPET_SIDE = 120;
 
-type Lowered = { name: string; description: string; body: string };
+type Folded = { name: string; description: string; body: string };
 
-// Snapshots are cached between requests, so cache the lower-cased text per note object.
-const loweredCache = new WeakMap<Note, Lowered>();
+// Snapshots are cached between requests, so cache the case-folded text per note object.
+const foldedCache = new WeakMap<Note, Folded>();
 
-function lowered(note: Note): Lowered {
-  let found = loweredCache.get(note);
+function folded(note: Note): Folded {
+  let found = foldedCache.get(note);
   if (!found) {
     found = {
       name: foldCase(note.name),
       description: foldCase(note.description),
       body: foldCase(note.body),
     };
-    loweredCache.set(note, found);
+    foldedCache.set(note, found);
   }
   return found;
 }
@@ -54,7 +54,7 @@ function isHigh(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
 }
 
-function makeSnippet(note: Note, low: Lowered, terms: string[]): string {
+function makeSnippet(note: Note, low: Folded, terms: string[]): string {
   for (const term of terms) {
     const at = low.body.indexOf(term);
     if (at < 0) continue;
@@ -78,11 +78,11 @@ export async function memorySearch(
   const scope = query.scope === undefined ? undefined : scopeName(parseScope(query.scope));
   const limit = parseLimit(query.limit);
 
-  const candidates: Array<{ note: Note; scope: string; low: Lowered; distinct: number; score: number }> = [];
+  const candidates: Array<{ note: Note; scope: string; low: Folded; distinct: number; score: number }> = [];
   for (const note of await deps.snapshots.load()) {
     const noteScope = note.path.slice(0, note.path.lastIndexOf('/'));
     if (scope !== undefined && noteScope !== scope) continue;
-    const low = lowered(note);
+    const low = folded(note);
     let distinct = 0;
     let score = 0;
     for (const term of terms) {

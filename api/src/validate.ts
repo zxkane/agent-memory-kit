@@ -7,7 +7,7 @@ const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,79}$/;
 
 const NOTE_TYPES = ['user', 'feedback', 'project', 'reference'] as const;
-const WRITE_KEYS = ['agent', 'name', 'description', 'type', 'content'];
+export const WRITE_KEYS = ['agent', 'name', 'description', 'type', 'content'];
 
 export type Scope = { kind: 'global' } | { kind: 'project'; project: string } | { kind: 'agent'; agent: string };
 export type NoteType = (typeof NOTE_TYPES)[number];

@@ -286,3 +286,89 @@ test('the token scope is checked per route (fail closed, store untouched on 403)
     assert.ok(lines.every((l) => l.status === 403 && l.op === route.operationId));
   }
 });
+
+test('a suffix lookalike scope and tab-separated scopes are judged token by token', async () => {
+  const read = ROUTE_EVENTS['GET /v1/note']!;
+  const { handler } = setup({ 'mem/global/n.md': 'x' });
+  for (const scope of ['agent-memory/readx', 'xagent-memory/read', 'agent-memory/readx\tagent-memory/writex']) {
+    const res = await handler(event('GET /v1/note', { ...read, scope }));
+    assert.equal(res.statusCode, 403, JSON.stringify(scope));
+  }
+  for (const scope of ['agent-memory/write\tagent-memory/read', 'agent-memory/read\tagent-memory/write']) {
+    const res = await handler(event('GET /v1/note', { ...read, scope }));
+    assert.equal(res.statusCode, 200, JSON.stringify(scope));
+  }
+});
+
+// The store as a role without s3:ListBucket sees it: a missing key answers 403.
+test('without list permission a first write and a scopes call end as 500 internal; with it they succeed', async () => {
+  const lines: Line[] = [];
+  const noList = fakeStore({}, { noList: true });
+  const denied = createHandler({ store: noList, log: (l) => lines.push(l as Line) });
+  for (const [route, opts] of [
+    ['POST /v1/notes', { body: writeBody() }],
+    ['GET /v1/scopes', {}],
+  ] as const) {
+    const res = await denied(event(route, opts));
+    assert.equal(res.statusCode, 500, route);
+    assert.equal(json(res).error.code, 'internal', route);
+  }
+  assert.equal(noList.objects.size, 0);
+  assert.ok(lines.every((l) => l.error === 'AccessDenied'));
+
+  const { handler } = setup();
+  assert.equal((await handler(event('POST /v1/notes', { body: writeBody() }))).statusCode, 200);
+  assert.equal((await handler(event('GET /v1/scopes'))).statusCode, 200);
+});
+
+const credential = () => 'sk-' + 'a1b2c3d4e5'.repeat(4).slice(0, 34);
+
+test('a refused name, agent or path never reaches the log line', async () => {
+  const secret = credential();
+  const cases: Array<[string, Parameters<typeof event>[1]]> = [
+    ['POST /v1/notes', { body: writeBody({ name: secret }) }],
+    ['POST /v1/notes', { body: writeBody({ agent: secret }) }],
+    ['GET /v1/note', { query: { path: `global/${secret}.md` } }],
+    ['GET /v1/note', { query: { path: `projects/${secret}/n.md` } }],
+    ['GET /v1/index', { query: { scope: `projects/${secret}` } }],
+    ['GET /v1/search', { query: { q: 'hello', scope: `projects/${secret}` } }],
+  ];
+  for (const [route, opts] of cases) {
+    const { handler, lines, store } = setup();
+    const res = await handler(event(route, opts));
+    assert.ok(res.statusCode < 500, `${route} ${res.statusCode}`);
+    if (route === 'POST /v1/notes') assert.equal(json(res).error.code, 'secret_detected');
+    assert.equal(store.objects.size, 0);
+    assert.equal(lines.length, 1);
+    assert.ok(!JSON.stringify(lines).includes(secret.slice(3)), route);
+    assert.equal(lines[0]?.scope, null);
+    assert.equal(lines[0]?.path, null);
+  }
+});
+
+test('unknown query parameters are refused on the scopes and write routes', async () => {
+  const { handler, store } = setup();
+  const scopes = await handler(event('GET /v1/scopes', { query: { junk: '1' } }));
+  assert.equal(scopes.statusCode, 400);
+  assert.equal(json(scopes).error.code, 'invalid_request');
+  const write = await handler(event('POST /v1/notes', { query: { junk: '1' }, body: writeBody() }));
+  assert.equal(write.statusCode, 400);
+  assert.equal(json(write).error.code, 'invalid_request');
+  assert.equal(store.objects.size, 0);
+});
+
+test('a write is visible to search and read through the same handler', async () => {
+  const { handler } = setup();
+  const empty = await handler(event('GET /v1/search', { query: { q: 'zebrafish' } }));
+  assert.equal(json(empty).total, 0);
+  const put = await handler(
+    event('POST /v1/notes', { body: writeBody({ name: 'fish', content: 'Notes about a zebrafish tank.' }) }),
+  );
+  assert.equal(put.statusCode, 200);
+  const found = json(await handler(event('GET /v1/search', { query: { q: 'zebrafish' } })));
+  assert.equal(found.total, 1);
+  assert.equal(found.results[0].path, 'agents/hermes/fish.md');
+  assert.match(JSON.stringify(found.results[0]), /zebrafish/);
+  const read = json(await handler(event('GET /v1/note', { query: { path: 'agents/hermes/fish.md' } })));
+  assert.match(read.content, /zebrafish tank/);
+});

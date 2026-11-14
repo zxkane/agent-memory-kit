@@ -127,3 +127,12 @@ test('upsertNote: preserves extra top-level fields', () => {
   const text = upsertNote(doc([], { commit: 'abc' }), note('global/a.md'));
   assert.equal((JSON.parse(text) as { commit: string }).commit, 'abc');
 });
+
+test('load: each snapshot keeps only its own scope kinds', async () => {
+  const s = fakeStore({
+    'index/mem.json': doc([note('global/a.md'), note('projects/x/b.md'), note('agents/bot/evil.md')]),
+    'index/agents.json': doc([note('agents/bot/c.md'), note('global/evil.md'), note('projects/x/evil.md')]),
+  });
+  const paths = (await createSnapshots(s).load()).map((n) => n.path).sort();
+  assert.deepEqual(paths, ['agents/bot/c.md', 'global/a.md', 'projects/x/b.md']);
+});

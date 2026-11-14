@@ -1,4 +1,5 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
+import { scanText } from '../../workstation/lib/secret-scan.mjs';
 import { ApiError } from './errors.ts';
 import { memoryIndex } from './ops/index.ts';
 import { memoryRead } from './ops/read.ts';
@@ -9,7 +10,7 @@ import { RESOURCE_SERVER, ROUTES } from './routes.ts';
 import { createSnapshots } from './snapshot.ts';
 import { s3Store } from './store.ts';
 import type { Store } from './store.ts';
-import { parseNotePath, parseScope, scopeName } from './validate.ts';
+import { onlyParams, parseNotePath, parseScope, scopeName } from './validate.ts';
 
 const MAX_BODY_BYTES = 100_000;
 
@@ -61,6 +62,9 @@ function logTargets(operationId: string | null, query: Query, body: unknown): { 
   } catch {
     // Invalid input is simply not logged.
   }
+  // A value the credential scan flags is not logged either, whichever route it came in on.
+  const flagged = (value: string | null) => value !== null && (scanText(value) as unknown[]).length > 0;
+  if (flagged(scope) || flagged(path)) return { scope: null, path: null };
   return { scope, path };
 }
 
@@ -95,6 +99,7 @@ export function createHandler(deps: { store: Store; log?: (line: object) => void
       let result: unknown;
       switch (route.operationId) {
         case 'memory_scopes':
+          onlyParams(query, []);
           result = await memoryScopes({ snapshots });
           break;
         case 'memory_index':
@@ -107,6 +112,7 @@ export function createHandler(deps: { store: Store; log?: (line: object) => void
           result = await memoryRead({ store: deps.store }, query);
           break;
         case 'memory_write':
+          onlyParams(query, []);
           body = parseBody(event);
           result = await memoryWrite({ store: deps.store }, body);
           break;

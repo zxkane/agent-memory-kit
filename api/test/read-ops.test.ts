@@ -23,13 +23,13 @@ function rejects(status: number, code: string) {
 test('scopes are counted across both snapshots and sorted', async () => {
   const store = fakeStore({
     'index/mem.json': snap('projects/x/a.md', 'global/a.md', 'projects/x/b.md'),
-    'index/agents.json': snap('agents/h/a.md', 'global/c.md'),
+    'index/agents.json': snap('agents/h/a.md', 'agents/h/b.md'),
   });
   const result = await memoryScopes({ snapshots: createSnapshots(store) });
   assert.deepEqual(result, {
     scopes: [
-      { scope: 'agents/h', notes: 1 },
-      { scope: 'global', notes: 2 },
+      { scope: 'agents/h', notes: 2 },
+      { scope: 'global', notes: 1 },
       { scope: 'projects/x', notes: 2 },
     ],
   });

@@ -6,6 +6,11 @@
 // search may return a path that reads as 404 until the same request is retried. The retry repairs
 // it (every step is idempotent), but it reports created: false, because the snapshot already
 // listed the note.
+//
+// Known limit: two writes of the same note name at the same moment can leave the note file and
+// the snapshot holding different text (the file from one request, the snapshot from the other).
+// The difference lasts until the next write of that note. Nothing else is lost and S3 keeps the
+// earlier versions; there is deliberately no re-sync step.
 import { scanText } from '../../../workstation/lib/secret-scan.mjs';
 import { ApiError } from '../errors.ts';
 import { composeNote, upsertIndexLine } from '../note-file.ts';
@@ -68,7 +73,10 @@ export async function memoryWrite(deps: { store: Store }, body: unknown): Promis
     return next;
   });
 
-  await store.put(path, composeNote(req), null);
+  const put = await store.put(path, composeNote(req), null);
+  if (put.status !== 'ok') {
+    throw new ApiError(409, 'conflict', 'The note was changed concurrently; retry the request.');
+  }
   await update(store, `${scopePrefix}MEMORY.md`, (current) => upsertIndexLine(current, req.name, req.description));
   return { path, created };
 }

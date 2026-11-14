@@ -8,7 +8,7 @@ import { memoryRead } from '../src/ops/read.ts';
 import { memorySearch } from '../src/ops/search.ts';
 import { ROUTES } from '../src/routes.ts';
 import { createSnapshots } from '../src/snapshot.ts';
-import { parseWrite } from '../src/validate.ts';
+import { WRITE_KEYS, parseWrite } from '../src/validate.ts';
 import { fakeStore } from './fake-store.ts';
 
 const DOC_URL = new URL('../openapi.json', import.meta.url);
@@ -129,6 +129,7 @@ test('write request body behaves as the document says', () => {
   const schema = op.requestBody.content['application/json'].schema;
   assert.equal(schema.additionalProperties, false);
   const names: string[] = Object.keys(schema.properties);
+  assert.deepEqual([...names].sort(), [...WRITE_KEYS].sort(), 'document properties and accepted keys');
   for (const n of names) assert.ok(n in SAMPLE, `no sample for ${n}`);
   const full = Object.fromEntries(names.map((n) => [n, SAMPLE[n]]));
   assert.ok(accepts(() => parseWrite(full)), 'full body');
@@ -205,16 +206,42 @@ test('every operation documents 403 forbidden with the error body', () => {
   assert.match(text, /forbidden/);
 });
 
-test('memory_scopes has no 400 and memory_write says it cannot delete', () => {
+test('memory_write says it cannot delete and explains both quota codes', () => {
   const by = (id: string) => operations().find((o) => o.op.operationId === id)!.op;
-  assert.equal(by('memory_scopes').responses['400'], undefined);
   assert.match(by('memory_write').description, /cannot delete/);
+  const refused = by('memory_write').responses['400'].description;
+  assert.match(refused, /scope_full \(this agent scope reached its limit of 200 notes or about 240 KB/);
+  assert.match(refused, /store_full \(the store reached its limit of 16 agent scopes or its total size\)/);
+});
+
+test('every operation documents 400 and 500 with the error body', () => {
+  for (const { op } of operations()) {
+    for (const code of ['400', '500']) {
+      const res = op.responses[code];
+      assert.ok(res, `${op.operationId} ${code}`);
+      assert.deepEqual(Object.keys(res.content['application/json'].schema.properties), ['error']);
+    }
+  }
+});
+
+test('200 schemas list every returned field as required', () => {
+  const by = (id: string) => operations().find((o) => o.op.operationId === id)!.op;
+  const schema = (id: string) => by(id).responses['200'].content['application/json'].schema;
+  for (const { op } of operations()) {
+    const s = op.responses['200'].content['application/json'].schema;
+    assert.deepEqual([...s.required].sort(), Object.keys(s.properties).sort(), op.operationId);
+  }
+  const item = (s: any) => s.items;
+  const scopes = item(schema('memory_scopes').properties.scopes);
+  assert.deepEqual([...scopes.required].sort(), Object.keys(scopes.properties).sort());
+  const results = item(schema('memory_search').properties.results);
+  assert.deepEqual([...results.required].sort(), Object.keys(results.properties).sort());
 });
 
 test('responses list 200 and the documented errors', () => {
   for (const { op } of operations()) {
     assert.ok(op.responses['200']);
-    if (op.operationId !== 'memory_scopes') assert.ok(op.responses['400']);
+    assert.ok(op.responses['400']);
   }
   const by = (id: string) => operations().find((o) => o.op.operationId === id)!.op;
   assert.ok(by('memory_index').responses['404']);

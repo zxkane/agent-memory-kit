@@ -389,6 +389,25 @@ test('the 17th scope is refused; an existing scope still works with 16', async (
   assert.deepEqual(res, { path: 'agents/s3/two.md', created: true });
 });
 
+test('the 16th scope is accepted and the 17th is refused', async () => {
+  const entries = Array.from({ length: 15 }, (_, i) => entry(`s${i}`, 'one', 'b'));
+  const store = fakeStore({ [SNAP_KEY]: snap(entries) });
+  const sixteenth = await memoryWrite({ store }, body());
+  assert.deepEqual(sixteenth, { path: NOTE_KEY, created: true });
+  await assert.rejects(memoryWrite({ store }, body({ agent: 'other' })), (e: unknown) => {
+    return e instanceof ApiError && e.status === 400 && e.code === 'store_full';
+  });
+});
+
+test('a note put that is not ok ends as 409 conflict', async () => {
+  const store = fakeStore();
+  const put = store.put.bind(store);
+  store.put = async (key, text, cond) => (key === NOTE_KEY ? { status: 'precondition-failed' } : put(key, text, cond));
+  await assert.rejects(memoryWrite({ store }, body()), (e: unknown) => {
+    return e instanceof ApiError && e.status === 409 && e.code === 'conflict';
+  });
+});
+
 test('an unreadable snapshot is never rewritten', async () => {
   for (const text of ['{"version":1,"notes":[{"path":', '{"notes": 5}', 'null']) {
     const store = fakeStore({ [SNAP_KEY]: text });
