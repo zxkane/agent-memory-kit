@@ -257,11 +257,20 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
   const stats = {};
   const work = {};
   const live = {};
+  // Per folder, the entries that are not notes at all: a name that is not a note file name (a
+  // scratch file, a sub-folder, anything else). The snapshot holds note files only, so such an
+  // entry has no counterpart there: it is neither applied nor an error, only counted (never named).
+  // An entry with a note file name that is not a regular note file (a link, a folder, a file that
+  // cannot be read) is still an error.
+  const ignoredEntries = {};
   for (const { label, liveDir } of pairs) live[label] = scanDir(liveDir).files;
   for (const { label, workDir } of pairs) {
     const { files, other } = scanDir(workDir);
     work[label] = files;
-    for (const name of other) errors.push(`${loc(label, name)}: not a regular note file`);
+    for (const name of other) {
+      if (NOTE_NAME_RE.test(name)) errors.push(`${loc(label, name)}: not a regular note file`);
+      else ignoredEntries[label] = (ignoredEntries[label] ?? 0) + 1;
+    }
   }
 
   for (const { label } of pairs) {
@@ -444,7 +453,7 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     errors.push(`the run would drop too much of the touched notes' content (kept ${Math.floor(share * 100)}% of their distinct terms, at least ${Math.round(minRetention * 100)}% required)`);
   }
   const liveChanged = liveDiffers(watchedPairs(pairs, changes), snap, addedNames(changes));
-  return { ok: errors.length === 0 && liveChanged.length === 0, errors, changes, ignored, stats, liveChanged };
+  return { ok: errors.length === 0 && liveChanged.length === 0, errors, changes, ignored, ignoredEntries, stats, liveChanged };
 }
 
 function writeAtomic(dir, name, buf, mode) {

@@ -560,3 +560,10 @@ test('T2: the repair prompt carries the problems, the reference folder and the w
   const raw = readFileSync(join(promptsDir, 'repair.md'), 'utf8');
   assert.ok(!raw.includes('/home/') && !raw.includes('@'));
 });
+
+test('S2: the organize and extract prompts say not to create working files', () => {
+  const sentence = 'so do not create working files: write only notes and MEMORY.md.';
+  assert.ok(renderPrompt('organize', { hasGlobal: true }).includes(`You cannot delete or rename files, ${sentence}`));
+  assert.ok(renderPrompt('organize', { hasGlobal: false }).includes(`You cannot delete or rename files, ${sentence}`));
+  assert.ok(renderPrompt('extract', { digest: 'd' }).includes(`You cannot delete files, ${sentence}`));
+});

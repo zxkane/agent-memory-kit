@@ -1226,15 +1226,18 @@ test('a project folder named global is reported and never used', (t) => {
   assert.deepEqual(f.calls().map((c) => c.scope), ['p']);
 });
 
-test('a model-chosen name of a non-note file is not printed', (t) => {
+test('a model-chosen name of a non-note file is ignored and never printed', (t) => {
   const f = fixture(t);
   duplicateProject(f);
-  f.instruct({ p: { writes: { [`notes/${SESSION_PHRASE}.txt`]: 'x', [`notes/${SESSION_PHRASE}-2.txt`]: 'y' } } });
+  const instruction = mergeInstruction();
+  Object.assign(instruction.p.writes, { [`notes/${SESSION_PHRASE}.txt`]: 'x', [`notes/${SESSION_PHRASE}-2.txt`]: 'y' });
+  f.instruct(instruction);
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /^organize p: rejected, nothing applied \(1 rule violation\(s\)\)/m);
-  assert.match(r.stdout, /^ {2}- notes\/\(2 entries that are not note files\): not a regular note file$/m);
-  assert.doesNotMatch(r.stdout + r.stderr, /UNIQUE-SESSION-PHRASE/);
+  assert.match(r.stdout, /^organize p: applied, 3 change\(s\)/m);
+  const text = readFileSync(join(f.repo, `_reports/${today()}-alpha-organize-p.md`), 'utf8');
+  assert.match(text, /^- \(2 entries that are not note files\): ignored$/m);
+  assert.doesNotMatch(r.stdout + r.stderr + text + treeText(f.repo), /UNIQUE-SESSION-PHRASE/);
 });
 
 test('a work folder replaced by a link is rejected', (t) => {
@@ -1947,4 +1950,20 @@ test('m1: an original/ that the model made gets no repair run without the driver
     assert.doesNotMatch(r.stdout, /repair run/);
     assert.equal(existsSync(join(f.repo, 'projects/p/x.md')), false);
   }
+});
+
+test('S1: a scratch file beside a good result in notes/ and global/ is ignored, counted, never applied', (t) => {
+  const f = fixture(t);
+  duplicateProjectWithGlobal(f);
+  const instruction = mergeInstruction();
+  Object.assign(instruction.p.writes, { 'notes/a.md.tmp': 'half-written', 'notes/sub/x.txt': 'x', 'global/scratch.tmp': 'y' });
+  f.instruct(instruction);
+  const r = f.run('organize', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied, 3 change\(s\)/m);
+  const text = readFileSync(join(f.repo, `_reports/${today()}-alpha-organize-p.md`), 'utf8');
+  assert.match(text, /^- \(2 entries that are not note files\): ignored$/m);
+  assert.match(text, /^- global\/\(1 entry that is not a note file\): ignored$/m);
+  assert.ok(!f.remoteFiles().some((x) => /\.tmp$|sub\//.test(x)));
+  assert.equal(existsSync(join(f.repo, 'projects/p/a.md.tmp')), false);
 });

@@ -20,7 +20,7 @@ Notes:
   ---
 - Write current understanding in plain statements ("Integration tests need FOO=1"), not the story of a session. Use absolute dates; the digest gives each message's date.
 - Link related notes with [[name]].
-- You cannot delete files, and this pass does not retire notes; a later pass tidies the folder.
+- You cannot delete files, so do not create working files: write only notes and MEMORY.md. This pass does not retire notes; a later pass tidies the folder.
 
 Changing nothing is the right result when the conversations add nothing lasting.
 

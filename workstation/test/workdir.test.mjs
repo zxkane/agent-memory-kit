@@ -141,7 +141,7 @@ test('an existing unlisted note does not block an unrelated change', (t) => {
   assert.equal(r.stats.notes.unlistedAfter, 1);
 });
 
-test('rule 1: a subfolder, a symbolic link and a foreign name are errors', (t) => {
+test('rule 1: a symbolic link named like a note is an error; a subfolder and a foreign name are ignored', (t) => {
   const s = setup(t, { notes: BASE_NOTES });
   mkdirSync(s.workPath('notes', 'sub'));
   writeFileSync(join(s.base, 'out.md'), 'out');
@@ -149,9 +149,8 @@ test('rule 1: a subfolder, a symbolic link and a foreign name are errors', (t) =
   s.work('notes', 'notes.json', '{}');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
   assert.equal(r.ok, false);
-  for (const name of ['sub', 'link.md', 'notes.json']) {
-    assert.ok(r.errors.some((e) => e.startsWith(`notes/${name}:`) || e.startsWith(`notes/${JSON.stringify(name)}:`)), `missing error for ${name}: ${r.errors}`);
-  }
+  assert.deepEqual(r.errors, ['notes/link.md: not a regular note file']);
+  assert.deepEqual(r.ignoredEntries, { notes: 2 });
 });
 
 test('a symbolic link replacing a snapshot note is an error, not a change', (t) => {
@@ -595,14 +594,14 @@ test('rule 6: a malformed retirement line in a new note is an error', (t) => {
   assert.deepEqual(r.errors, ['notes/n.md: malformed retirement line']);
 });
 
-test('M-2: a work file name with a newline cannot forge a second error line', (t) => {
+test('M-2: a work file name with a newline cannot forge an error line', (t) => {
+  // Not a note file name: the entry is ignored and counted, so it yields no line at all.
   const s = setup(t, { notes: BASE_NOTES });
   writeFileSync(join(s.pairs[0].workDir, 'x.md\nforged rule: x'), 'x');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.equal(r.ok, false);
-  assert.equal(r.errors.length, 1);
-  assert.ok(!r.errors[0].includes('\n'));
-  assert.ok(r.errors[0].startsWith('notes/"'));
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.ignoredEntries, { notes: 1 });
+  assert.ok(!JSON.stringify(r).includes('forged rule'));
 });
 
 test('M-3: a credential-shaped file name is an error and is not repeated in errors', (t) => {
@@ -749,11 +748,12 @@ test('N3: liveDiffers lists a snapshot note that became a link or a folder, and 
   assert.deepEqual(liveDiffers(s.pairs, s.snap, ['notes/w.md']).sort(), ['notes/a.md', 'notes/b.md', 'notes/w.md']);
 });
 
-test('N4: a credential-shaped name that is not a note name is withheld from errors', (t) => {
+test('N4: a credential-shaped name that is not a note name is ignored and never named', (t) => {
   const s = setup(t, { notes: BASE_NOTES });
   writeFileSync(join(s.pairs[0].workDir, `${FAKE_KEY}.txt`), 'x');
   const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
-  assert.deepEqual(r.errors, ['notes/"(file name withheld)": not a regular note file']);
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.ignoredEntries, { notes: 1 });
   assert.ok(!JSON.stringify(r).includes(FAKE_KEY));
 });
 
@@ -1562,4 +1562,38 @@ test('global loss: a short global note may only have text added after its existi
   s = globalNote(t, former);
   s.work('global', 'tone.md', `${former}\n`);
   assert.deepEqual(judge(s, 0).errors, []);
+});
+
+// S1: entries that are not notes (no note file name, nothing in the snapshot) are ignored and counted.
+test('S1: scratch files, files without a note name and sub-folders are ignored and never applied', (t) => {
+  const s = setup(t, { notes: BASE_NOTES, global: { 'MEMORY.md': '- [G](g.md) — g\n', 'g.md': 'general' } });
+  s.work('notes', 'a.md', 'note a, edited\n');
+  for (const label of ['notes', 'global']) {
+    s.work(label, 'scratch.tmp', 'half-written');
+    s.work(label, 'NOEXT', 'x');
+    s.work(label, 'data.json', '{}');
+    mkdirSync(s.workPath(label, 'sub'));
+    writeFileSync(join(s.workPath(label, 'sub'), 'inner.txt'), 'y');
+  }
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.ignoredEntries, { notes: 4, global: 4 });
+  assert.deepEqual(r.changes.map((c) => `${c.label}/${c.file}`), ['notes/a.md']);
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(s.readLive('notes', 'a.md'), 'note a, edited\n');
+  for (const label of ['notes', 'global']) {
+    for (const name of ['scratch.tmp', 'NOEXT', 'data.json', 'sub']) assert.equal(existsSync(s.live(label, name)), false, `${label}/${name}`);
+  }
+});
+
+test('S1: a symbolic link or a folder named like a note is still refused', (t) => {
+  const s = setup(t, { notes: BASE_NOTES });
+  writeFileSync(join(s.base, 'out.md'), 'out');
+  symlinkSync(join(s.base, 'out.md'), s.workPath('notes', 'x.md'));
+  mkdirSync(s.workPath('notes', 'y.md'));
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.errors.sort(), ['notes/x.md: not a regular note file', 'notes/y.md: not a regular note file']);
+  assert.deepEqual(r.ignoredEntries, {});
 });
