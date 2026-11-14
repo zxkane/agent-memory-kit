@@ -195,6 +195,101 @@ On each machine:
 
 Your notes stay in `~/agent-memory` and in the remote repository.
 
+## Memory API
+
+The `api/` directory holds an optional HTTP API for tools that cannot reach your machines, such as an MCP gateway (a service that turns an HTTP API into tools for agents). It lets such a tool list, search and read the notes, and lets agents write notes of their own. It is separate from the workstation sync above: nothing on a workstation needs it, and the sync does not need it.
+
+```
+  workstation sync ---->  S3 bucket (replica of the notes)  <----  Memory API  <----  MCP gateway
+  (one-way copy)                  agents/<agent>/  <-----------  memory_write
+```
+
+The notes in the bucket are a replica of the workstation notes. The API reads the replica and writes only under `agents/<agent>/`. Those agent scopes are not part of the clone on your machines.
+
+### Operations
+
+| Operation | Request | What it does | Token scope |
+|---|---|---|---|
+| `memory_scopes` | `GET /v1/scopes` | Lists the scopes that hold notes, with a note count each. | `agent-memory/read` |
+| `memory_index` | `GET /v1/index?scope=<scope>` | Returns the `MEMORY.md` index of one scope. | `agent-memory/read` |
+| `memory_search` | `GET /v1/search?q=<words>` | Keyword search over note names, descriptions and text. | `agent-memory/read` |
+| `memory_read` | `GET /v1/note?path=<path>` | Returns one note. | `agent-memory/read` |
+| `memory_write` | `POST /v1/notes` | Creates or replaces a note in `agents/<agent>/`. | `agent-memory/write` |
+
+`api/openapi.json` describes the operations, including the text the gateway shows to the model. Errors are `{ "error": { "code", "message" } }`.
+
+### Limits and trust
+
+- The API reads a replica of the workstation notes and can write only under `agents/<agent>/`. It has no delete operation.
+- The API cannot tell callers apart. The gateway presents one machine identity, so any caller the gateway lets use `memory_write` can write to any agent's scope, including replacing another agent's note. Which callers may use which tool is the gateway's job. Earlier versions of a replaced note remain available through the bucket's object versions for 90 days.
+- Each agent scope holds at most 200 notes and about 240 KB of text, and there are at most 16 agent scopes. A write that would exceed the first two limits fails with `scope_full`; a write that would exceed the number of scopes or the total size of the agent store fails with `store_full`. There is no way to free space through the API, because it cannot delete. An operator removes notes in the bucket directly.
+- Credentials: a note, a name or a description that looks like a credential is refused with `secret_detected`. This is a safety net with a fixed list of patterns, like the scan above, not a guarantee.
+- Notes are data, not instructions. Anything an agent reads through the API was written by a person or an agent and may be wrong or hostile.
+- API Gateway checks the token and the scope of each route. The function checks the token's scope again, so a route deployed without a scope requirement still refuses a token that lacks it.
+
+### Deploy
+
+Run from `api/`. You need AWS credentials that may create the resources of the stack (a bucket, a user pool with a token endpoint, an HTTP API, one function, parameters and log groups) and the bootstrap resources that SST keeps for itself in the account. Create that role before the first deploy; the deploy does not create it.
+
+```
+cd api
+npm install
+AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>
+```
+
+`AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of IAM role ARNs that may write the replica (the `mem/` and `index/` prefixes) and read the agent scopes, for the job that copies the workstation notes into the bucket. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
+
+The deployment creates:
+
+- a versioned bucket that holds the replica and the agent scopes; superseded versions expire after 90 days;
+- a token issuer with two clients that use the client-credentials flow: `hub` (for the gateway) and `probe` (for the checks, with tokens that last 5 minutes), and two scopes, `agent-memory/read` and `agent-memory/write`;
+- an HTTP API with one route per operation and a function behind it;
+- SSM parameters under `/agent-memory/<stage>/mcp/`: `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string) and `bucket/name`.
+
+### Check a deployment
+
+After a deploy, from `api/`:
+
+```
+node scripts/verify-deployed.ts --stage <stage> [--region <region>] [--expired]
+```
+
+The script reads the `probe` client's parameters, asks the token endpoint for tokens with HTTP Basic authentication and prints one `PASS` or `FAIL` line per check. It exits non-zero when a check fails. It keeps the secret and the tokens in memory and prints neither. The checks:
+
+1. Every route refuses a request without a token (401).
+2. Every route refuses a malformed token (401).
+3. Every route refuses a well-formed token signed by another issuer (401). The script makes the key for it.
+4. A token with only `agent-memory/read` gets 403 on `POST /v1/notes`.
+5. A token with both scopes writes a note `deployed-check` in agent `probe`, then reads it, finds it in the index and in the list of scopes, and searches. If the write is refused (for example because the store is full), these steps are skipped and the output says so.
+6. Each response has the fields that `openapi.json` documents.
+7. An unknown path (`GET /v1/nope`) answers 404 or 401, never 200.
+8. With `--expired`, the script waits about five minutes until a probe token has expired and expects 401.
+
+The check note stays in the bucket as `agents/probe/deployed-check.md` and is replaced by the next run.
+
+### Register the API with an MCP gateway
+
+A gateway that turns an OpenAPI description into tools can use `api/openapi.json`. Print the document with the stage's URL filled in:
+
+```
+node scripts/render-openapi.ts "$(aws ssm get-parameter --name /agent-memory/<stage>/mcp/gateway/url --query Parameter.Value --output text)"
+```
+
+Register the output as the gateway target, with the OAuth client-credentials flow, the stage's `cognito/token-endpoint`, the `hub` client's ID and secret, and the scopes `agent-memory/read agent-memory/write`. To give some callers read access only, request only `agent-memory/read` for them or leave `memory_write` out of their tools at the gateway.
+
+### Cost
+
+You pay per request: API Gateway requests, function invocations and run time, and bucket requests and storage, plus the log storage. A stage that gets no requests costs nothing for the API and the function. The bucket's storage and the token issuer's own charges depend on current AWS pricing; check it rather than relying on a figure written here. The API Gateway stage limits traffic to a small burst, so a runaway caller is throttled.
+
+### Remove
+
+```
+cd api
+AGENT_MEMORY_REGION=<region> npx sst remove --stage <stage>
+```
+
+This deletes every resource of a non-`prod` stage, including the bucket and the notes in it. The `prod` stage is protected and its resources are retained: SST does not remove them, and the bucket is not emptied for you. To retire `prod`, turn off `protect` and `removal: "retain"` in `api/sst.config.ts`, empty the bucket yourself (all object versions), and then remove the stage.
+
 ## Development
 
 ```
