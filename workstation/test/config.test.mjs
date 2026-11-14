@@ -33,7 +33,7 @@ test('applies defaults', (t) => {
   assert.deepEqual(loadConfig(env), {
     host: 'alpha', repoDir: '/home/u/agent-memory', repoUrl: null,
     stateDir: join(dir, '.local/state/agent-memory'), claudeDir: join(dir, '.claude'),
-    staleAfterSeconds: 600, consolidate: null,
+    staleAfterSeconds: 600, consolidate: null, consolidateProblem: null,
   });
 });
 
@@ -46,7 +46,7 @@ test('reads the default path under HOME and honors explicit values', (t) => {
   }));
   assert.deepEqual(loadConfig({ HOME: dir }), {
     host: 'beta', repoDir: '/r', repoUrl: 'git@example.com:u/m.git',
-    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30, consolidate: null,
+    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30, consolidate: null, consolidateProblem: null,
   });
 });
 
@@ -132,4 +132,41 @@ test('an invalid consolidate block gives null without disabling the config', (t)
     assert.equal(cfg.repoDir, '/home/u/agent-memory');
     assert.equal(cfg.consolidate, null);
   }
+});
+
+test('F4: an invalid consolidate block names the first field that failed; absent or valid gives null', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  const cases = [
+    [{ ...ok, command: 'rel/m' }, 'command'],
+    [{ ...ok, command: undefined }, 'command'],
+    [{ ...ok, command: '/bin/m\nx' }, 'command'],
+    [{ ...ok, model: '' }, 'model'],
+    [{ ...ok, model: 'a b' }, 'model'],
+    [{ ...ok, env: { lower: 'x' } }, 'env'],
+    [{ ...ok, env: { FOO: 1 } }, 'env'],
+    [{ ...ok, env: [] }, 'env'],
+    [{ ...ok, extract: 'Mon; rm' }, 'extract'],
+    [{ ...ok, organize: '   ' }, 'organize'],
+    [{ ...ok, maxProjects: 51 }, 'maxProjects'],
+    [{ ...ok, maxTranscriptBytes: 9999 }, 'maxTranscriptBytes'],
+    [{ ...ok, maxTurns: 2000 }, 'maxTurns'],
+    [{ ...ok, maxBudgetUsd: 200 }, 'maxBudgetUsd'],
+    [{ ...ok, timeoutMinutes: 1000 }, 'timeoutMinutes'],
+    [{ ...ok, model: 'a b', maxTurns: 2000 }, 'model'],
+    ['text', 'consolidate'],
+    [[], 'consolidate'],
+  ];
+  for (const [block, field] of cases) {
+    write({ ...BASE, consolidate: block });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.consolidate, null, field);
+    assert.equal(cfg.consolidateProblem, field, JSON.stringify(block));
+  }
+  write(BASE);
+  assert.equal(loadConfig(env).consolidateProblem, null);
+  write({ ...BASE, consolidate: null });
+  assert.equal(loadConfig(env).consolidateProblem, null);
+  write({ ...BASE, consolidate: ok });
+  assert.equal(loadConfig(env).consolidateProblem, null);
 });

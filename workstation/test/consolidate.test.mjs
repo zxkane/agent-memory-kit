@@ -705,6 +705,19 @@ test('--dry-run calls the model, commits nothing and prints the report', (t) => 
   assert.equal(entry.lastOutcome.outcome, 'dry-run');
 });
 
+test('F4: an invalid consolidate block prints one line naming the field and exits 1', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.setConfig({ maxTurns: 2000 });
+  for (const args of [['organize'], ['extract', '--dry-run']]) {
+    const r = f.run(...args);
+    assert.equal(r.status, 1);
+    assert.equal(r.stdout, `agent-memory: the consolidate block in ${f.configFile} is invalid (maxTurns); nothing was run.\n`);
+  }
+  assert.deepEqual(f.calls(), []);
+  assert.equal(existsSync(f.state), false);
+});
+
 test('without a consolidate block, or without a config, one line and exit 0', (t) => {
   const f = fixture(t, { block: false });
   duplicateProject(f);

@@ -30,6 +30,7 @@ repo_url_arg=""
 init=0
 extract_cal=""
 organize_cal=""
+consolidate_problem=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
@@ -116,13 +117,19 @@ else
         const { loadConfig } = await import(process.argv[1]);
         const c = loadConfig({ HOME: process.env.HOME });
         if (!c) process.exit(3);
-        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? "", c.consolidate?.extract ?? "", c.consolidate?.organize ?? ""]));
+        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? "", c.consolidate?.extract ?? "", c.consolidate?.organize ?? "", c.consolidateProblem ?? ""]));
     ' "file://$kit_dir/workstation/lib/config.mjs")" || die "$config_file is not a valid, enabled configuration."
     repo_dir="$(node -p 'JSON.parse(process.argv[1])[0]' "$cfg")"
     repo_url="$(node -p 'JSON.parse(process.argv[1])[1]' "$cfg")"
     extract_cal="$(node -p 'JSON.parse(process.argv[1])[2]' "$cfg")"
     organize_cal="$(node -p 'JSON.parse(process.argv[1])[3]' "$cfg")"
+    consolidate_problem="$(node -p 'JSON.parse(process.argv[1])[4]' "$cfg")"
 fi
+# A consolidate block that is present but invalid leaves the consolidation units as they are:
+# reading it as "no schedule" would remove timers that the person did not ask to remove.
+invalid_block_line() {
+    printf 'the consolidate block in %s is invalid (%s); the consolidation units were left as they are.\n' "$config_file" "$consolidate_problem"
+}
 
 # 4. The notes clone: an existing directory must already be a clone on main.
 clone_needed=0
@@ -171,7 +178,9 @@ if [[ $dry_run -eq 1 ]]; then
     node "$kit_dir/workstation/install.mjs" --plan ${install_flags[@]+"${install_flags[@]}"}
     printf 'would write %s/agent-memory-sync.service and agent-memory-sync.timer\n' "$unit_dir"
     timers_on=""
+    [[ -z "$consolidate_problem" ]] || invalid_block_line
     for scope in extract organize; do
+        [[ -z "$consolidate_problem" ]] || break
         cal_var="${scope}_cal"
         if [[ -n "${!cal_var}" ]]; then
             printf 'would write %s/agent-memory-%s.service and agent-memory-%s.timer\n' "$unit_dir" "$scope" "$scope"
@@ -282,7 +291,9 @@ WantedBy=timers.target
 UNIT
     timers_on+=("agent-memory-$1.timer")
 }
+[[ -z "$consolidate_problem" ]] || invalid_block_line
 for scope in extract organize; do
+    [[ -z "$consolidate_problem" ]] || break
     cal_var="${scope}_cal"
     if [[ -n "${!cal_var}" ]]; then
         write_consolidate_units "$scope" "${!cal_var}"

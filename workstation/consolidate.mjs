@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig } from './lib/config.mjs';
+import { configPath, loadConfig } from './lib/config.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
@@ -976,6 +976,12 @@ async function driverMain(argv) {
     return 2;
   }
   const config = loadConfig();
+  // A block that is present but invalid is an error, not "not configured": the weekly unit fails
+  // instead of staying green while it does nothing.
+  if (config?.consolidateProblem) {
+    process.stdout.write(`agent-memory: the consolidate block in ${configPath()} is invalid (${config.consolidateProblem}); nothing was run.\n`);
+    return 1;
+  }
   if (!config || !config.consolidate) {
     process.stdout.write(`${NOT_CONFIGURED}\n`);
     return 0;

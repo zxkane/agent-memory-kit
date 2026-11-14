@@ -362,6 +362,28 @@ check 'removing the block keeps the sync units' test -f "$svc" -a -f "$tim"
 set_consolidate '{"command":"relative/claude","model":"model-id","extract":"Sat *-*-* 03:00"}'
 run_setup --no-enable
 check 'an invalid block writes no unit' test ! -e "$udir/agent-memory-extract.timer"
+# F4: an invalid block leaves existing consolidation units alone and says which field failed.
+set_consolidate "$both"
+run_setup --no-enable
+set_consolidate '{"command":"/path/to/claude","model":"model-id","extract":"Sat *-*-* 03:00","maxTurns":2000}'
+cp "$udir/agent-memory-organize.timer" "$tmp/organize.timer.before"
+rm -f "$calls"
+run_setup --dry-run
+invalid_line="the consolidate block in $cfg is invalid (maxTurns); the consolidation units were left as they are."
+check 'invalid block dry run exits 0' test "$status" -eq 0
+check 'invalid block dry run names the field' has_text "$out" "$invalid_line"
+check 'invalid block dry run would write no consolidation unit' bash -c '! grep -qE "would (write|remove) .*agent-memory-(extract|organize)" <<< "$1"' _ "$out"
+check 'invalid block dry run still names the sync units' has_text "$out" "would write $udir/agent-memory-sync.service"
+run_setup
+check 'invalid block run exits 0' test "$status" -eq 0
+check 'invalid block run names the field' has_text "$out" "$invalid_line"
+check 'invalid block keeps the organize units' cmp -s "$udir/agent-memory-organize.timer" "$tmp/organize.timer.before"
+check 'invalid block keeps the extract units' test -f "$udir/agent-memory-extract.service" -a -f "$udir/agent-memory-extract.timer"
+check 'invalid block does not disable a consolidation timer' bash -c '! grep -qE "disable.*agent-memory-(extract|organize)" "$1"' _ "$calls"
+check 'invalid block does not enable a consolidation timer' bash -c '! grep -qE "enable --now agent-memory-(extract|organize)" "$1"' _ "$calls"
+check 'invalid block still enables the sync timer' has_line "$calls" '--user enable --now agent-memory-sync.timer'
+set_consolidate none
+run_setup --no-enable
 
 # A failing daemon-reload after a removal under --no-enable does not abort setup.
 set_consolidate "$both"
