@@ -28,8 +28,7 @@ import { join, resolve, sep } from 'node:path';
 import { AwsError } from './aws.mjs';
 import { TIMEOUT_CODE, git } from './git.mjs';
 import { scanText } from './secret-scan.mjs';
-import { removeStaleLocks } from './sync-engine.mjs';
-import { identity } from './sync-engine.mjs';
+import { identity, removeStaleLocks } from './sync-engine.mjs';
 
 // The API's path rules (api/src/validate.ts), copied character for character; a test compares them.
 export const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
