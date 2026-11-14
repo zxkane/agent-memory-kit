@@ -54,8 +54,11 @@ function writeInPlace(to, write) {
   }
 }
 
+const COPY_TRIES = 3;
+
 // Returns false when `from` was deleted meanwhile (a session removing a note while we copy).
-function copyKeepingTime(from, to) {
+// A note deleted and written again during the copy is tried again a few times.
+function copyKeepingTime(from, to, tries = COPY_TRIES) {
   try {
     writeInPlace(to, (tmp) => {
       copyFileSync(from, tmp);
@@ -64,7 +67,9 @@ function copyKeepingTime(from, to) {
     });
     return true;
   } catch (err) {
-    if (err.code === 'ENOENT' && lstatOrNull(from) === null) return false;
+    if (err.code !== 'ENOENT') throw err;
+    if (lstatOrNull(from) === null) return false;
+    if (tries > 1 && lstatOrNull(dirname(to))?.isDirectory()) return copyKeepingTime(from, to, tries - 1);
     throw err;
   }
 }
@@ -198,7 +203,6 @@ function freeBackupName(linkPath, now) {
 // Adopts the real directory at linkPath under the lock. Returns null when the
 // state changed under us and the caller should look again.
 function adoptUnderLock({ linkPath, targetDir, host, now, skip }, steps) {
-  steps.afterLock?.();
   if (!lstatOrNull(linkPath)?.isDirectory()) return null;
   // The folder can still vanish or change type here (a session removing it); then look again.
   let first;
@@ -223,8 +227,14 @@ function adoptUnderLock({ linkPath, targetDir, host, now, skip }, steps) {
     second = adoptDir(backupDir, targetDir, host, { skip });
   } catch (err) {
     // A non-directory took the path just before our rename and was moved aside with it.
-    if (!GONE.has(err.code) || lstatOrNull(backupDir)?.isDirectory()) throw err;
-    return null; // look again: the path is free now
+    const moved = GONE.has(err.code) ? lstatOrNull(backupDir) : undefined;
+    if (moved === undefined || moved?.isDirectory()) throw err;
+    if (moved === null) return null;
+    if (lstatOrNull(linkPath) !== null) {
+      return result('skipped', { reason: 'link-path-taken', copied: first.copied, renamed: first.renamed, backupDir });
+    }
+    renameSync(backupDir, linkPath); // put it back; the next look reports it
+    return null;
   }
   const copied = first.copied + second.copied;
   const renamed = [...first.renamed, ...second.renamed];
@@ -268,7 +278,11 @@ export function ensureLink({ linkPath, targetDir, host, now = new Date(), lockWa
     if (!st.isDirectory()) return result('skipped', { reason: 'not-a-directory' });
     steps.beforeNestedCheck?.();
     try {
-      if (hasNestedEntries(linkPath)) return result('skipped', { reason: 'nested-entries' });
+      if (hasNestedEntries(linkPath)) {
+        // readdir follows a link another process just made; only a real folder is skipped.
+        if (lstatOrNull(linkPath)?.isDirectory()) return result('skipped', { reason: 'nested-entries' });
+        continue;
+      }
     } catch (err) {
       if (GONE.has(err.code)) continue; // another process changed the path; look at it again
       throw err;
