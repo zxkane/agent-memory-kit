@@ -572,3 +572,60 @@ test('the token request maps invalid_scope to ScopeNotAllowedError', async () =>
   });
   await assert.rejects(mint(['agent-memory/write']), ScopeNotAllowedError);
 });
+
+test('the token request maps invalid_grant, the answer of Amazon Cognito, to ScopeNotAllowedError', async () => {
+  const mint = makeMintToken({
+    fetch: async () => new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 }),
+    tokenEndpoint: TOKEN_ENDPOINT,
+    clientId: 'c',
+    clientSecret: 's',
+    timeoutMs: 1000,
+  });
+  await assert.rejects(mint(['agent-memory/write']), ScopeNotAllowedError);
+});
+
+test('the token request keeps invalid_client, 401 and 500 as the generic error', async () => {
+  for (const [status, error] of [[400, 'invalid_client'], [401, 'invalid_grant'], [500, 'invalid_grant']] as const) {
+    const mint = makeMintToken({
+      fetch: async () => new Response(JSON.stringify({ error }), { status }),
+      tokenEndpoint: TOKEN_ENDPOINT,
+      clientId: 'c',
+      clientSecret: 's',
+      timeoutMs: 1000,
+    });
+    await assert.rejects(mint(['agent-memory/write']), (err: Error) => !(err instanceof ScopeNotAllowedError) && /token request/.test(err.message), `${status} ${error}`);
+  }
+});
+
+for (const refusal of ['invalid_grant', 'invalid_scope']) {
+  test(`on prod a token endpoint refusing the write scope with ${refusal} skips 5b and nothing fails`, async () => {
+    const valid = new Set<string>();
+    const fake = fakeApi(valid);
+    const mintToken = makeMintToken({
+      fetch: async (_url, init) => {
+        const scope = new URLSearchParams(String(init?.body)).get('scope') ?? '';
+        if (scope.includes('agent-memory/write')) return new Response(JSON.stringify({ error: refusal }), { status: 400 });
+        const token = makeToken(scope.split(' '), 2_000_000_000);
+        valid.add(token);
+        return new Response(JSON.stringify({ access_token: token }), { status: 200 });
+      },
+      tokenEndpoint: TOKEN_ENDPOINT,
+      clientId: 'c',
+      clientSecret: 's',
+      timeoutMs: 1000,
+    });
+    const results = await runChecks({
+      fetch: fake.fetch,
+      config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+      mintToken,
+      now: () => fake.clock.value,
+      sleep: async () => {},
+      openapi: OPENAPI,
+      stage: 'prod',
+    });
+    assert.deepEqual(results.filter((r) => !r.ok), []);
+    const skipped = results.filter((r) => r.skipped);
+    assert.equal(skipped.length, 1);
+    assert.ok(skipped[0]!.name.startsWith('5b.'));
+  });
+}

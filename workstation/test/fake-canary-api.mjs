@@ -64,7 +64,7 @@ export function makeFakeFetch(scenario) {
   function mint(init) {
     if (mode === 'token-error') return json(500, { error: 'server_error' });
     const scope = new URLSearchParams(String(init.body)).get('scope') ?? '';
-    if (scope.includes('agent-memory/write') && scenario.writeScope !== true) return json(400, { error: 'invalid_scope' });
+    if (scope.includes('agent-memory/write') && scenario.writeScope !== true) return json(400, { error: 'invalid_grant' });
     counter += 1;
     const token = `eyJhbGciOiJSUzI1NiJ9.${b64({ sub: 'probe', scope, exp: Math.floor(Date.now() / 1000) + 3600 })}.sig${counter}-${process.pid}`;
     valid.set(token, scope);
