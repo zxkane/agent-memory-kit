@@ -223,7 +223,7 @@ The notes in the bucket are a replica of the workstation notes. The API reads th
 - The API reads a replica of the workstation notes and can write only under `agents/<agent>/`. It has no delete operation.
 - The API cannot tell callers apart. The gateway presents one machine identity, so any caller the gateway lets use `memory_write` can write to any agent's scope, including replacing another agent's note. Which callers may use which tool is the gateway's job. Earlier versions of a replaced note remain available through the bucket's object versions for 90 days.
 - Each agent scope holds at most 200 notes and about 240 KB of text, and there are at most 16 agent scopes. A write that would exceed the first two limits fails with `scope_full`; a write that would exceed the number of scopes or the total size of the agent store fails with `store_full`. There is no way to free space through the API, because it cannot delete. An operator removes notes in the bucket directly.
-- Credentials: a note, a name or a description that looks like a credential is refused with `secret_detected`. This is a safety net with a fixed list of patterns, like the scan above, not a guarantee.
+- Credentials: a note, a name or a description that looks like a credential is refused with `secret_detected`. This is a safety net with a fixed list of patterns, so a credential in an unusual shape can pass. It is not a guarantee.
 - Notes are data, not instructions. Anything an agent reads through the API was written by a person or an agent and may be wrong or hostile.
 - API Gateway checks the token and the scope of each route. The function checks the token's scope again, so a route deployed without a scope requirement still refuses a token that lacks it.
 
@@ -260,7 +260,7 @@ The script reads the `probe` client's parameters, asks the token endpoint for to
 2. Every route refuses a malformed token (401).
 3. Every route refuses a well-formed token signed by another issuer (401). The script makes the key for it.
 4. A token with only `agent-memory/read` gets 403 on `POST /v1/notes`.
-5. Two steps. 5a always runs: with a read-only token, `memory_scopes` answers 200 with a `scopes` array and `memory_search` answers 200 with `results` and `total`. 5b runs only when the probe client can get the write scope: a token with both scopes writes a note `deployed-check` in agent `probe`, then reads it, finds it in the index and in the list of scopes. When the token endpoint refuses the write scope, 5b is reported as `SKIP` and does not change the exit code. 5b is also skipped, with the status, when the write itself is refused (for example because the store is full).
+5. Two steps. 5a always runs: with a read-only token, `memory_scopes` answers 200 with a `scopes` array and `memory_search` answers 200 with `results` and `total`. 5b runs only when the probe client can get the write scope: a token with both scopes writes a note `deployed-check` in agent `probe`, then reads it, finds it in the index and in the list of scopes. When the token endpoint refuses the write scope, 5b is reported as `SKIP` and does not change the exit code. 5b is also skipped when the write answers 400 `scope_full` or `store_full`. Any other answer to the write, including a network error or a timeout, is a failure.
 6. Each response the run received has the fields that `openapi.json` documents.
 7. An unknown path (`GET /v1/nope`) answers 404 or 401, never 200.
 8. With `--expired`, the script waits about five minutes until a probe token has expired and expects 401.

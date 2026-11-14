@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { runChecks, ScopeNotAllowedError } from '../scripts/verify-deployed.ts';
+import { ChecksStoppedError, formatResult, makeMintToken, runChecks, ScopeNotAllowedError } from '../scripts/verify-deployed.ts';
+import { composeNote } from '../src/note-file.ts';
 import type { CheckResult } from '../scripts/verify-deployed.ts';
 
 const BASE = 'https://api.example.com';
@@ -37,6 +38,9 @@ type Quirks = {
   rejectWrite?: boolean;
   unknownPathStatus?: number;
   expiredStatus?: number;
+  writeReply?: { status: number; code?: string } | 'network';
+  // A value that every response body carries, to prove it is never copied into output.
+  bodyMarker?: string;
 };
 
 // A fake API that follows the real one's behaviour unless a quirk changes it.
@@ -65,6 +69,7 @@ function fakeApi(valid: Set<string>, quirks: Quirks = {}) {
     const reply = (path: string, body: Record<string, unknown>) => {
       const o = quirks.omit;
       if (o !== undefined && o.path === path) delete body[o.field];
+      if (quirks.bodyMarker !== undefined) body.extra = quirks.bodyMarker;
       return json(200, body);
     };
     switch (`${method} ${url.pathname}`) {
@@ -86,10 +91,12 @@ function fakeApi(valid: Set<string>, quirks: Quirks = {}) {
           return json(403, { error: { code: 'forbidden', message: 'x' } });
         }
         if (quirks.rejectWrite) return json(400, { error: { code: 'store_full', message: 'x' } });
+        if (quirks.writeReply === 'network') throw new TypeError(`connect failed ${quirks.bodyMarker ?? ''}`);
+        if (quirks.writeReply) return json(quirks.writeReply.status, { error: { code: quirks.writeReply.code ?? 'internal', message: 'x' } });
         const body = JSON.parse(String(init?.body));
         const path = `agents/${body.agent}/${body.name}.md`;
         const created = !notes.has(path);
-        notes.set(path, body.content);
+        notes.set(path, composeNote({ name: body.name, description: body.description, type: body.type ?? 'reference', content: body.content }));
         return reply('/v1/notes', { path, created });
       }
       default:
@@ -198,7 +205,7 @@ test('a mint failure other than a refused scope is an error', async () => {
       sleep: async () => {},
       openapi: OPENAPI,
     }),
-    /token endpoint down/,
+    (err: unknown) => err instanceof ChecksStoppedError && !err.message.includes('token endpoint down'),
   );
 });
 
@@ -294,4 +301,177 @@ test('the command line refuses a missing stage before touching AWS', () => {
   const run = spawnSync(process.execPath, [new URL('../scripts/verify-deployed.ts', import.meta.url).pathname], { encoding: 'utf8' });
   assert.equal(run.status, 2);
   assert.match(run.stderr, /Usage/);
+});
+
+const writeCases: Array<[string, Quirks['writeReply'], boolean]> = [
+  ['500', { status: 500, code: 'internal' }, false],
+  ['403 with a write-scope token', { status: 403, code: 'forbidden' }, false],
+  ['401', { status: 401 }, false],
+  ['400 invalid_request', { status: 400, code: 'invalid_request' }, false],
+  ['400 secret_detected', { status: 400, code: 'secret_detected' }, false],
+  ['a network error', 'network', false],
+  ['400 scope_full', { status: 400, code: 'scope_full' }, true],
+  ['400 store_full', { status: 400, code: 'store_full' }, true],
+];
+for (const [label, writeReply, skips] of writeCases) {
+  test(`5b: a write answering ${label} ${skips ? 'is skipped' : 'fails'}`, async () => {
+    const { run } = setup({ writeReply });
+    const results = await run();
+    const five = results.filter((r) => r.name.startsWith('5b.'));
+    if (skips) {
+      assert.deepEqual(results.filter((r) => !r.ok), []);
+      assert.ok(five.length === 1 && five[0]!.skipped === true);
+    } else {
+      assert.ok(five.some((r) => !r.ok && !r.skipped), JSON.stringify(five));
+    }
+  });
+}
+
+test('5b: the read-back accepts the stored file with front matter and rejects a wrong body', async () => {
+  const { run, fake } = setup();
+  const results = await run();
+  const read = results.find((r) => r.name.startsWith('5b. memory_read'))!;
+  assert.ok(read.ok);
+  assert.match(fake.notes.get('agents/probe/deployed-check.md')!, /^---\nname: deployed-check\n/);
+});
+
+test('5b: a read-back without the body text fails', async () => {
+  const valid = new Set<string>();
+  const fake = fakeApi(valid);
+  const inner = fake.fetch;
+  const results = await runChecks({
+    fetch: async (input, init) => {
+      const res = await inner(input, init);
+      if (new URL(String(input)).pathname !== '/v1/note') return res;
+      const body = await res.json();
+      return new Response(JSON.stringify({ ...body, content: '---\nname: other\n---\n\nsomething else\n' }), { status: 200 });
+    },
+    config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+    mintToken: async (scopes) => {
+      const token = makeToken(scopes, 2_000_000_000);
+      valid.add(token);
+      return token;
+    },
+    now: () => fake.clock.value,
+    sleep: async () => {},
+    openapi: OPENAPI,
+  });
+  assert.ok(results.some((r) => r.name.startsWith('5b. memory_read') && !r.ok));
+});
+
+test('markers carried by the token, the client secret and a response body never reach the output', async () => {
+  const bodyMarker = ['body', 'marker', String(process.pid)].join('-');
+  const lines: string[] = [];
+  const valid = new Set<string>();
+  const api = fakeApi(valid, { bodyMarker });
+  const tokenCalls: RequestInit[] = [];
+  const mint = makeMintToken({
+    fetch: async (_url, init) => {
+      tokenCalls.push(init!);
+      const token = makeToken(String(init!.body).includes('write') ? ['agent-memory/read', 'agent-memory/write'] : ['agent-memory/read'], 2_000_000_000);
+      valid.add(token);
+      return new Response(JSON.stringify({ access_token: token }), { status: 200 });
+    },
+    tokenEndpoint: TOKEN_ENDPOINT,
+    clientId: 'probe-client',
+    clientSecret: SECRET_MARKER,
+    timeoutMs: 1000,
+  });
+  const results = await runChecks({
+    fetch: api.fetch,
+    config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+    mintToken: mint,
+    now: () => api.clock.value,
+    sleep: async () => {},
+    openapi: OPENAPI,
+    onResult: (r) => lines.push(formatResult(r)),
+  });
+  assert.ok(tokenCalls.length >= 2);
+  const secretSent = Buffer.from(String(new Headers(tokenCalls[0]!.headers).get('authorization')).replace('Basic ', ''), 'base64').toString();
+  assert.ok(secretSent.includes(SECRET_MARKER), 'the secret is used for the token request');
+  const everything = JSON.stringify(results) + lines.join('\n');
+  for (const marker of [SIGNATURE_MARKER, SECRET_MARKER, bodyMarker]) assert.ok(!everything.includes(marker), marker);
+  assert.equal(lines.length, results.length);
+});
+
+test('runChecks reports each result as produced and names the stage of a failure without the message', async () => {
+  const valid = new Set<string>();
+  const fake = fakeApi(valid);
+  const lines: string[] = [];
+  const leaky = ['leaky', SECRET_MARKER].join('-');
+  let mints = 0;
+  await assert.rejects(
+    runChecks({
+      fetch: fake.fetch,
+      config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+      mintToken: async (scopes) => {
+        if (++mints === 2) throw new Error(leaky);
+        const token = makeToken(scopes, 2_000_000_000);
+        valid.add(token);
+        return token;
+      },
+      now: () => fake.clock.value,
+      sleep: async () => {},
+      openapi: OPENAPI,
+      onResult: (r) => lines.push(formatResult(r)),
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof ChecksStoppedError);
+      assert.ok(!err.message.includes(SECRET_MARKER));
+      assert.match(err.message, /Error/);
+      assert.ok(err.step.length > 0);
+      return true;
+    },
+  );
+  assert.ok(lines.length >= 3, 'checks 1-3 were reported before the failure');
+});
+
+test('a request that never answers fails its check without a real wait', async () => {
+  const valid = new Set<string>();
+  const fake = fakeApi(valid);
+  const hang = async (_input: string, init?: RequestInit): Promise<Response> =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+    });
+  const started = Date.now();
+  const results = await runChecks({
+    fetch: hang,
+    config: { apiUrl: BASE, tokenEndpoint: TOKEN_ENDPOINT },
+    mintToken: async (scopes) => {
+      const token = makeToken(scopes, 2_000_000_000);
+      valid.add(token);
+      return token;
+    },
+    now: () => fake.clock.value,
+    sleep: async () => {},
+    openapi: OPENAPI,
+    timeoutMs: 5,
+  });
+  assert.ok(Date.now() - started < 5000);
+  assert.ok(results.some((r) => r.name.startsWith('1.') && !r.ok && r.detail.includes('TimeoutError')));
+});
+
+test('a token request that never answers is aborted', async () => {
+  const mint = makeMintToken({
+    fetch: (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+      }),
+    tokenEndpoint: TOKEN_ENDPOINT,
+    clientId: 'c',
+    clientSecret: 's',
+    timeoutMs: 5,
+  });
+  await assert.rejects(mint(['agent-memory/read']), (err: Error) => err.name === 'TimeoutError');
+});
+
+test('the token request maps invalid_scope to ScopeNotAllowedError', async () => {
+  const mint = makeMintToken({
+    fetch: async () => new Response(JSON.stringify({ error: 'invalid_scope' }), { status: 400 }),
+    tokenEndpoint: TOKEN_ENDPOINT,
+    clientId: 'c',
+    clientSecret: 's',
+    timeoutMs: 1000,
+  });
+  await assert.rejects(mint(['agent-memory/write']), ScopeNotAllowedError);
 });

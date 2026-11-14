@@ -15,6 +15,51 @@ export type CheckResult = { name: string; ok: boolean; detail: string; skipped?:
 // token request with HTTP 400 and invalid_scope). runChecks treats it as a skip, not an error.
 export class ScopeNotAllowedError extends Error {}
 
+// Thrown by runChecks when it cannot continue. It names the step and the error class only, never
+// the original message, which could hold a token or a response body.
+export class ChecksStoppedError extends Error {
+  step: string;
+  constructor(step: string, errorName: string) {
+    super(`checks stopped during ${step} (${errorName})`);
+    this.name = 'ChecksStoppedError';
+    this.step = step;
+  }
+}
+
+export function formatResult(r: CheckResult): string {
+  return `${r.skipped ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'}  ${r.name} - ${r.detail}`;
+}
+
+const REQUEST_TIMEOUT_MS = 15_000;
+
+// Requests the probe client's access tokens. A refused scope becomes ScopeNotAllowedError. The
+// client secret stays in this closure.
+export function makeMintToken(options: {
+  fetch: (input: string, init?: RequestInit) => Promise<Response>;
+  tokenEndpoint: string;
+  clientId: string;
+  clientSecret: string;
+  timeoutMs?: number;
+}): (scopes: string[]) => Promise<string> {
+  const basic = Buffer.from(`${options.clientId}:${options.clientSecret}`).toString('base64');
+  return async (scopes) => {
+    const res = await options.fetch(options.tokenEndpoint, {
+      method: 'POST',
+      headers: { authorization: `Basic ${basic}`, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'client_credentials', scope: scopes.join(' ') }),
+      signal: AbortSignal.timeout(options.timeoutMs ?? REQUEST_TIMEOUT_MS),
+    });
+    const body: any = await res.json().catch(() => null);
+    if (res.status === 400 && body?.error === 'invalid_scope') {
+      throw new ScopeNotAllowedError(`scope not allowed for the probe client: ${scopes.join(' ')}`);
+    }
+    if (!res.ok || typeof body?.access_token !== 'string') {
+      throw new Error(`token request for ${scopes.join(' ')} failed with status ${res.status}`);
+    }
+    return body.access_token;
+  };
+}
+
 export type Config = { apiUrl: string; tokenEndpoint: string };
 
 type Reply = { status: number; body: unknown };
@@ -29,6 +74,10 @@ export type Deps = {
   openapi?: any;
   // Check 8: wait for a probe token to expire and expect 401.
   expired?: boolean;
+  // Called with each result as it is produced.
+  onResult?: (result: CheckResult) => void;
+  // Timeout of each request, in milliseconds. Default 15000.
+  timeoutMs?: number;
 };
 
 const READ = `${RESOURCE_SERVER}/read`;
@@ -83,11 +132,24 @@ function requiredFields(openapi: any, method: string, path: string): string[] {
 }
 
 export async function runChecks(deps: Deps): Promise<CheckResult[]> {
+  const progress = { step: 'start' };
+  try {
+    return await runSteps(deps, progress);
+  } catch (err) {
+    throw new ChecksStoppedError(progress.step, err instanceof Error ? err.name : 'unknown');
+  }
+}
+
+async function runSteps(deps: Deps, progress: { step: string }): Promise<CheckResult[]> {
   const { config, mintToken, now, sleep } = deps;
   const openapi = deps.openapi ?? JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8'));
   const base = config.apiUrl.replace(/\/+$/, '');
   const results: CheckResult[] = [];
-  const add = (name: string, ok: boolean, detail: string, skipped = false) => results.push(skipped ? { name, ok, detail, skipped } : { name, ok, detail });
+  const add = (name: string, ok: boolean, detail: string, skipped = false) => {
+    const result: CheckResult = skipped ? { name, ok, detail, skipped } : { name, ok, detail };
+    results.push(result);
+    deps.onResult?.(result);
+  };
 
   async function call(method: string, path: string, options: { token?: string; body?: unknown; query?: Record<string, string> } = {}): Promise<Reply | { error: string }> {
     const url = new URL(base + path);
@@ -100,6 +162,7 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
         method,
         headers,
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: AbortSignal.timeout(deps.timeoutMs ?? REQUEST_TIMEOUT_MS),
       });
       const text = await res.text();
       let body: unknown = null;
@@ -134,11 +197,13 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
   }
 
   const forged = forgeToken(now());
+  progress.step = 'checks 1-3';
   await everyRoute('1. no Authorization header is refused', undefined, [401], 'expect 401');
   await everyRoute('2. a malformed token is refused', 'not-a-token', [401], 'expect 401');
   await everyRoute('3. a token from another issuer is refused', forged, [401], 'expect 401');
 
   // Mint first so that the expiry wait of check 8 starts as early as possible.
+  progress.step = 'requesting a probe token';
   const expiryToken = deps.expired === true ? await mintToken([READ]) : undefined;
 
   const probeNote = {
@@ -149,6 +214,7 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
   };
 
   // Check 4
+  progress.step = 'check 4';
   const readToken = await mintToken([READ]);
   const forbidden = await call('POST', '/v1/notes', { token: readToken, body: probeNote });
   add('4. a read-only token cannot write', !('error' in forbidden) && forbidden.status === 403, `POST /v1/notes with only ${READ}: ${describe(forbidden)}, expect 403`);
@@ -160,6 +226,7 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
     if (!('error' in reply)) replies.set(operation, reply);
     return reply;
   };
+  progress.step = 'check 5a';
   const scopes0 = await fetched(readToken, 'memory_scopes', 'GET', '/v1/scopes', {});
   const scopesOk = !('error' in scopes0) && scopes0.status === 200 && Array.isArray((scopes0.body as any)?.scopes);
   add('5a. memory_scopes answers with a scopes array', scopesOk, `status ${describe(scopes0)}`);
@@ -169,6 +236,7 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
 
   // Check 5b: write, then read it back. Needs a token with the write scope, which the probe client
   // does not have on every stage.
+  progress.step = 'check 5b';
   let bothToken: string | undefined;
   try {
     bothToken = await mintToken([READ, WRITE]);
@@ -182,7 +250,13 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
     if (!('error' in write) && write.status === 200) {
       add('5b. memory_write stores the note', true, `status ${describe(write)}`);
       const read = await fetched(bothToken, 'memory_read', 'GET', '/v1/note', { query: { path: PROBE_PATH } });
-      const readContent = !('error' in read) && read.status === 200 && (read.body as any)?.content === probeNote.content;
+      const content = !('error' in read) && read.status === 200 ? (read.body as any)?.content : undefined;
+      // memory_read returns the whole file, front matter included.
+      const readContent =
+        typeof content === 'string' &&
+        content.includes(probeNote.content.trim()) &&
+        content.includes(`name: ${PROBE_NAME}`) &&
+        content.includes(probeNote.description);
       add('5b. memory_read returns the note', readContent, `status ${describe(read)}, content ${readContent ? 'matches' : 'differs'}`);
       const index = await fetched(bothToken, 'memory_index', 'GET', '/v1/index', { query: { scope: `agents/${PROBE_AGENT}` } });
       const indexed = !('error' in index) && index.status === 200 && String((index.body as any)?.index ?? '').includes(PROBE_NAME);
@@ -191,10 +265,18 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
       const listed = !('error' in scopes) && scopes.status === 200 && ((scopes.body as any)?.scopes ?? []).some((s: any) => s?.scope === `agents/${PROBE_AGENT}`);
       add('5b. memory_scopes includes the agent scope', listed, `status ${describe(scopes)}, ${listed ? 'included' : 'missing'}`);
     } else {
-      add('5b. write and read back a note', true, `SKIP: memory_write answered ${describe(write)}`, true);
+      // Only a full scope or a full store is an expected refusal; anything else is a failure.
+      const code = !('error' in write) && write.status === 400 ? (write.body as any)?.error?.code : undefined;
+      if (code === 'scope_full' || code === 'store_full') {
+        add('5b. write and read back a note', true, `SKIP: memory_write answered 400 ${code}`, true);
+      } else {
+        const shown = typeof code === 'string' && /^[a-z_]{1,30}$/.test(code) ? ` ${code}` : '';
+        add('5b. memory_write stores the note', false, `memory_write answered ${describe(write)}${shown}, expect 200`);
+      }
     }
   }
 
+  progress.step = 'check 6';
   // Check 6: every response that was received has the documented fields.
   const missing: string[] = [];
   const checked: string[] = [];
@@ -215,10 +297,12 @@ export async function runChecks(deps: Deps): Promise<CheckResult[]> {
   );
 
   // Check 7
+  progress.step = 'check 7';
   const unknown = await call('GET', '/v1/nope', { token: readToken });
   add('7. an unknown path is not served', !('error' in unknown) && (unknown.status === 404 || unknown.status === 401), `GET /v1/nope: ${describe(unknown)}, expect 404 or 401`);
 
   // Check 8
+  progress.step = 'check 8';
   if (expiryToken !== undefined) {
     const expiry = tokenExpiry(expiryToken);
     if (expiry === null) {
@@ -282,41 +366,24 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  const mintToken = async (scopes: string[]): Promise<string> => {
-    const res = await fetch(config.tokenEndpoint, {
-      method: 'POST',
-      headers: {
-        authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`,
-        'content-type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({ grant_type: 'client_credentials', scope: scopes.join(' ') }),
-    });
-    const body: any = await res.json().catch(() => null);
-    if (res.status === 400 && body?.error === 'invalid_scope') {
-      throw new ScopeNotAllowedError(`scope not allowed for the probe client: ${scopes.join(' ')}`);
-    }
-    if (!res.ok || typeof body?.access_token !== 'string') {
-      throw new Error(`token request for ${scopes.join(' ')} failed with status ${res.status}`);
-    }
-    return body.access_token;
-  };
+  const mintToken = makeMintToken({ fetch: (input, init) => fetch(input, init), tokenEndpoint: config.tokenEndpoint, clientId, clientSecret });
 
-  let results: CheckResult[];
   try {
-    results = await runChecks({
+    const results = await runChecks({
       fetch: (input, init) => fetch(input, init),
       config,
       mintToken,
       now: () => Date.now(),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       expired: args.expired,
+      onResult: (r) => console.log(formatResult(r)),
     });
+    return results.some((r) => !r.ok) ? 1 : 0;
   } catch (err) {
-    console.error(`FAIL  checks stopped: ${err instanceof Error ? err.message : 'error'}`);
+    // The results so far were printed as they were produced. Only the step and the error class.
+    console.error(`FAIL  ${err instanceof ChecksStoppedError ? err.message : 'checks stopped'}`);
     return 1;
   }
-  for (const r of results) console.log(`${r.skipped ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'}  ${r.name} - ${r.detail}`);
-  return results.some((r) => !r.ok) ? 1 : 0;
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
