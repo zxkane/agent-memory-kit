@@ -17,6 +17,7 @@ const EMPTY = Buffer.alloc(0);
 const NOTE_MIN_TERMS = 15;
 const RUN_MIN_TERMS = 60;
 const GLOBAL = 'global';
+const GLOBAL_ONLY = 'notes in the global folder are organized only by a run on the global scope';
 const HASH_RE = /^[0-9a-f]{64}$/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -269,6 +270,11 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
           errors.push(`${where}: the index may not be retired`);
           continue;
         }
+        // A `global` pair exists only in a project run, where global/ is a destination only.
+        if (label === GLOBAL) {
+          errors.push(`${where}: ${GLOBAL_ONLY} (an existing global note may not be retired in a project run)`);
+          continue;
+        }
         if (!allowRetire) {
           ignored.push(where);
           continue;
@@ -277,8 +283,7 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
         const targetFile = `${stub.name}.md`;
         const targetBuf = work[targetLabel]?.get(targetFile);
         let problem = null;
-        if (stub.folder === 'global' && label === GLOBAL) problem = 'a global note cannot move to global';
-        else if (!work[targetLabel]) problem = 'the target folder is not available';
+        if (!work[targetLabel]) problem = 'the target folder is not available';
         else if (targetFile === INDEX) problem = 'the target is the index';
         else if (targetLabel === label && targetFile === name) problem = 'the note names itself as target';
         else if (!targetBuf) problem = 'the target note does not exist';
@@ -293,6 +298,18 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
       const problem = contentProblem(name, buf, live[label].get(name));
       if (problem) errors.push(`${where}: ${problem}`);
       else changes.push({ label, file: name, kind: isNew ? 'add' : 'change', hash });
+    }
+  }
+
+  // In a project run (the only kind with a `global` pair) an existing global note keeps its line in
+  // global/MEMORY.md: the notes of global/ are organized only by a run on the global scope.
+  if (work[GLOBAL] && changes.some((c) => c.label === GLOBAL && c.file === INDEX)) {
+    const listedBefore = indexRefs(text(live[GLOBAL].get(INDEX) ?? EMPTY));
+    const listedAfter = indexRefs(text(work[GLOBAL].get(INDEX)));
+    for (const name of Object.keys(snap[GLOBAL] ?? {})) {
+      if (listedBefore.has(name) && !listedAfter.has(name)) {
+        errors.push(`${loc(GLOBAL, name)}: ${GLOBAL_ONLY} (an existing global note may not lose its line in global/MEMORY.md in a project run)`);
+      }
     }
   }
 
@@ -332,9 +349,11 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     }
   }
   // Each retired or changed note is judged on its own, by the terms of its body: how many of them
-  // are still somewhere they belong. A retired note must find them in its target. A changed note
-  // keeps a term that is in its own new body, or that another note written in this run newly
-  // contains (an added note, or a changed note whose body did not have the term before).
+  // are still somewhere they belong. A retired note keeps a term that is in the body of the note it
+  // was retired into; a changed note, one that is in its own new body. Either also keeps a term that
+  // another note written in this run newly contains (an added note, or a changed note whose body
+  // did not have the term before), so a note split across several notes is judged by all of them,
+  // while terms that other notes already held before the run never count.
   const termCache = new WeakMap();
   const termsOf = (buf) => {
     let set = termCache.get(buf);
@@ -360,9 +379,9 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
     const beforeBuf = live[c.label].get(c.file);
     if (!beforeBuf) continue;
     const beforeTerms = termsOf(beforeBuf);
-    const isKept = (t) => (c.kind === 'retire'
+    const isKept = (t) => newlyWritten.has(t) || (c.kind === 'retire'
       ? termsOf(afterOf[c.target.label]?.get(c.target.file) ?? EMPTY).has(t)
-      : termsOf(work[c.label].get(c.file)).has(t) || newlyWritten.has(t));
+      : termsOf(work[c.label].get(c.file)).has(t));
     let kept = 0;
     for (const t of beforeTerms) if (isKept(t)) kept += 1;
     termsBefore += beforeTerms.size;

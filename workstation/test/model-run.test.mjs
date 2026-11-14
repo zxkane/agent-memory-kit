@@ -478,3 +478,14 @@ test('runModel with a command that cannot start, a tiny time limit or an abort s
   assert.ok(['spawn-failed', 'aborted'].includes(aborted.stopReason), aborted.stopReason);
   assert.equal(aborted.ran, false);
 });
+
+test('organize prompt: global/ is a destination only in a project run; a split note names its main target', () => {
+  const off = renderPrompt('organize', { hasGlobal: false });
+  const on = renderPrompt('organize', { hasGlobal: true });
+  const destination = "global/ is a destination only: add a note there, or add to a note that is already there, only for a fact from notes/ that plainly applies to all of the person's projects. Do not retire, split, rename or re-list a note that was already in global/, and do not move a note out of global/; those notes are organized in their own run.";
+  assert.ok(on.includes(destination));
+  assert.ok(!off.includes('destination only'));
+  const split = "When a note's content went to several notes, name in its MOVED TO line the note that received the largest part; the other notes need no pointer.";
+  assert.ok(on.includes(split));
+  assert.ok(off.includes(split));
+});

@@ -1212,3 +1212,114 @@ test('m8: readRegular and noteFiles are exported', (t) => {
   assert.equal(readRegular(join(dir, 'link.md')), null);
   assert.equal(noteFiles(join(dir, 'missing')).size, 0);
 });
+
+// C1: a retired note keeps a term that is in its target, or that another note written in this run
+// newly contains (an added note, or a changed note whose body did not have it).
+function splitScope(t) {
+  const big = [terms('roster', 0, 15), terms('backup', 0, 20), terms('invoice', 0, 20), terms('pager', 0, 20)].join('\n\n');
+  return setup(t, {
+    notes: {
+      'MEMORY.md': '- [Big](big.md) — big\n- [Ops](ops.md) — ops\n- [Other](other.md) — other\n',
+      'big.md': `${big}\n`,
+      'ops.md': `${terms('opsnote', 0, 30)}\n`,
+      'other.md': `${terms('unrelated', 0, 30)} ${terms('shared', 0, 20)}\n`,
+    },
+  });
+}
+
+test('C1: a note split across added notes and one existing note, retired into one of them, passes', (t) => {
+  const s = splitScope(t);
+  s.work('notes', 'roster.md', `${terms('roster', 0, 15)}\n`);
+  s.work('notes', 'backup.md', `${terms('backup', 0, 20)}\n`);
+  s.work('notes', 'invoice.md', `${terms('invoice', 0, 20)}\n`);
+  // Half of the last section went into an existing note; the other half was dropped.
+  s.work('notes', 'ops.md', `${terms('opsnote', 0, 30)} ${terms('pager', 0, 10)}\n`);
+  s.work('notes', 'big.md', 'MOVED TO [[roster]]\n');
+  s.work('notes', 'MEMORY.md', '- [Ops](ops.md) — ops\n- [Other](other.md) — other\n- [Roster](roster.md) — r\n'
+    + '- [Backup](backup.md) — b\n- [Invoice](invoice.md) — i\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  // big.md: its target alone holds 15 of its 75 terms (20%); with the notes newly written in this
+  // run, 65 of them are kept. ops.md keeps all 30.
+  assert.deepEqual(r.stats.retention, { termsBefore: 105, termsKept: 95, share: 95 / 105, checked: 2, lowest: 65 / 75 });
+});
+
+test('C1: a note retired into an unrelated note while the run adds nothing still fails', (t) => {
+  const s = splitScope(t);
+  s.work('notes', 'big.md', 'MOVED TO [[other]]\n');
+  s.work('notes', 'MEMORY.md', '- [Ops](ops.md) — ops\n- [Other](other.md) — other\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.match(r.errors[0], PER_NOTE('big.md'));
+});
+
+test('C1: trivial edits to notes that already held the retired note\'s words do not count', (t) => {
+  const s = setup(t, {
+    notes: {
+      'MEMORY.md': '- [A](a.md) — a\n- [B](b.md) — b\n- [C](c.md) — c\n',
+      'a.md': `${terms('common', 0, 40)} ${terms('aonly', 0, 10)}\n`,
+      'b.md': `${terms('common', 0, 40)} ${terms('bonly', 0, 20)}\n`,
+      'c.md': `${terms('conly', 0, 20)}\n`,
+    },
+  });
+  s.work('notes', 'b.md', `${terms('common', 0, 40)} ${terms('bonly', 0, 20)} extraword\n`);
+  s.work('notes', 'a.md', 'MOVED TO [[c]]\n');
+  s.work('notes', 'MEMORY.md', '- [B](b.md) — b\n- [C](c.md) — c\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.match(r.errors[0], PER_NOTE('a.md'));
+});
+
+// C2: in a project run, global/ is a destination only: what was already there may be added to
+// and changed, but not retired or dropped from global/MEMORY.md.
+const GLOBAL_ONLY = /^global\/(\w+)\.md: notes in the global folder are organized only by a run on the global scope \((.+)\)$/;
+const GLOBAL_NOTES = { 'MEMORY.md': '- [Tone](tone.md) — t\n- [Tools](tools.md) — u\n', 'tone.md': 'prefers short answers\n', 'tools.md': 'uses the terminal\n' };
+
+test('C2: a project run may not retire a note that was already in global/', (t) => {
+  for (const stub of ['MOVED TO [[tools]]\n', 'MOVED TO [[global:tools]]\n']) {
+    const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
+    s.work('global', 'tools.md', 'uses the terminal; prefers short answers\n');
+    s.work('global', 'tone.md', stub);
+    s.work('global', 'MEMORY.md', '- [Tools](tools.md) — u\n');
+    const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+    assert.equal(r.ok, false, stub);
+    const mine = r.errors.filter((e) => GLOBAL_ONLY.test(e));
+    assert.deepEqual(mine.map((e) => GLOBAL_ONLY.exec(e)[1]), ['tone', 'tone'], stub);
+    assert.match(mine[0], /may not be retired/);
+    assert.match(mine[1], /may not lose its line in global\/MEMORY\.md/);
+    assert.ok(!r.changes.some((c) => c.label === 'global' && c.kind === 'retire'), stub);
+  }
+});
+
+test('C2: a project run may not drop an existing global note from global/MEMORY.md', (t) => {
+  const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
+  s.work('global', 'MEMORY.md', '- [Tone](tone.md) — t\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => GLOBAL_ONLY.test(e) && e.startsWith('global/tools.md: ')));
+});
+
+test('C2: a project run may still add a global note and add to an existing one', (t) => {
+  const s = setup(t, { notes: BASE_NOTES, global: GLOBAL_NOTES });
+  s.work('global', 'editor.md', 'edits with a modal editor\n');
+  s.work('global', 'tone.md', 'prefers short answers, without filler\n');
+  s.work('global', 'MEMORY.md', '- [Tone](tone.md) — t\n- [Tools](tools.md) — u\n- [Editor](editor.md) — e\n');
+  s.work('notes', 'b.md', 'MOVED TO [[global:editor]]\n');
+  s.work('notes', 'MEMORY.md', '- [A](a.md) — a\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(existsSync(s.live('notes', 'b.md')), false);
+  assert.equal(readFileSync(s.live('global', 'editor.md'), 'utf8'), 'edits with a modal editor\n');
+});
+
+test('C2: a run on the global scope may merge two global notes', (t) => {
+  // The global scope's own folder is its only pair, labelled notes.
+  const s = setup(t, { notes: GLOBAL_NOTES });
+  s.work('notes', 'tools.md', 'uses the terminal; prefers short answers\n');
+  s.work('notes', 'tone.md', 'MOVED TO [[tools]]\n');
+  s.work('notes', 'MEMORY.md', '- [Tools](tools.md) — u\n');
+  const r = evaluate({ pairs: s.pairs, snap: s.snap, allowRetire: true });
+  assert.deepEqual(r.errors, []);
+  apply({ pairs: s.pairs, changes: r.changes, snap: s.snap });
+  assert.equal(existsSync(s.live('notes', 'tone.md')), false);
+});

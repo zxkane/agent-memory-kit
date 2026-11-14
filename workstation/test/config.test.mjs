@@ -202,3 +202,18 @@ test('item 4: a key the consolidate block does not know makes it invalid, naming
   assert.deepEqual(loadConfig(env).consolidate, every);
   assert.equal(loadConfig(env).consolidateProblem, null);
 });
+
+test('C4: an unknown key that looks like a credential is not echoed', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  const gitHostToken = 'gh' + 'p_' + 'a'.repeat(36);
+  const accessKeyId = 'AK' + 'IA' + 'ABCDEFGHIJKLMNOP';
+  for (const key of [gitHostToken, accessKeyId]) {
+    write({ ...BASE, consolidate: { ...ok, [key]: 'x' } });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.consolidate, null);
+    assert.equal(cfg.consolidateProblem, '(an unknown key)');
+  }
+  write({ ...BASE, consolidate: { ...ok, organise: 'x' } });
+  assert.equal(loadConfig(env).consolidateProblem, 'organise');
+});
