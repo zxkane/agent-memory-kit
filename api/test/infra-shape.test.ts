@@ -172,8 +172,8 @@ describe('infrastructure source', () => {
   });
 
   describe('deployment switches', () => {
-    it('parses the three variables in mode.ts only, before any resource', () => {
-      for (const name of ['AGENT_MEMORY_INVOKER_ROLE_ARNS', 'AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'AGENT_MEMORY_GITHUB_SUBJECTS']) {
+    it('parses the four variables in mode.ts only, before any resource', () => {
+      for (const name of ['AGENT_MEMORY_INVOKER_ROLE_ARNS', 'AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'AGENT_MEMORY_GITHUB_SUBJECTS', 'AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN']) {
         assert.match(read('infra/mode.ts'), new RegExp(name));
         for (const f of files.filter((f) => f !== 'infra/mode.ts')) {
           assert.doesNotMatch(read(f), new RegExp(`process\\.env\\.${name}`), f);
@@ -268,6 +268,34 @@ describe('infrastructure source', () => {
       assert.match(body, /canary\/role-arn/);
       assert.doesNotMatch(src.replace(body, ''), /Canary/);
       assert.match(src, /newaws\.iam\.Role\("WorkstationBridgeRole"/);
+    });
+
+    it('puts the optional permissions boundary on every role the deployment creates, and nowhere else', () => {
+      const boundary = 'permissionsBoundaryArgs(mode.permissionsBoundaryArn)';
+      // The function's role, through the component's role transform.
+      const api = squash('infra/api.ts');
+      assert.equal((api.match(/newsst\.aws\.Function\(/g) ?? []).length, 1);
+      const transform = api.match(/role:\(args:aws\.iam\.RoleArgs\)=>\{(.*?)\},\},\}\);/);
+      assert.ok(transform, 'the role transform of the function');
+      assert.ok((transform[1] as string).includes(`Object.assign(args,${boundary});`), 'the function role');
+      // Each role declared directly: the bridge role and the canary role, and no other.
+      const declared = files.flatMap((f) =>
+        [...squash(f).matchAll(/newaws\.iam\.Role\("(\w+)",\{(.*?)\}\);/g)].map((m) => [f, m[1], m[2]] as const),
+      );
+      assert.deepEqual(
+        declared.map(([f, name]) => `${f} ${name}`),
+        ['infra/workstation.ts WorkstationBridgeRole', 'infra/workstation.ts WorkstationCanaryRole'],
+      );
+      for (const [, name, body] of declared) {
+        assert.ok((body as string).includes(`...${boundary},`), name);
+      }
+      // The only other place that names the key is the helper in policies.ts.
+      for (const f of files.filter((f) => f !== 'infra/policies.ts')) {
+        assert.doesNotMatch(read(f), /permissionsBoundary\s*[:=]/, f);
+      }
+      for (const f of ['infra/api.ts', 'infra/workstation.ts']) {
+        assert.match(read(f), /import\s*\{[^}]*\bpermissionsBoundaryArgs\b[^}]*\}\s*from\s*"\.\/policies\.ts"/, f);
+      }
     });
 
     it('returns the outputs of the mode', () => {

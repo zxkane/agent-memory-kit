@@ -22,6 +22,23 @@ export function isRoleArn(value: string): boolean {
   return ROLE_ARN_RE.test(value);
 }
 
+// A customer-managed policy: twelve digits where an AWS-managed policy has "aws". Every path
+// segment and the policy name must be non-empty.
+const MANAGED_POLICY_ARN_RE = /^arn:aws(-cn|-us-gov)?:iam::\d{12}:policy\/([\w+=,.@-]+\/)*[\w+=,.@-]+$/;
+
+/** Whether the value is the ARN of one customer-managed IAM policy (no wildcard, no AWS-managed policy). */
+export function isManagedPolicyArn(value: string): boolean {
+  return MANAGED_POLICY_ARN_RE.test(value);
+}
+
+/**
+ * The permissions-boundary argument of an IAM role: the policy ARN when one is given, and no key
+ * at all without one, so that a deployment without a boundary declares its roles unchanged.
+ */
+export function permissionsBoundaryArgs(policyArn: string | null): { permissionsBoundary?: string } {
+  return policyArn === null ? {} : { permissionsBoundary: policyArn };
+}
+
 /**
  * The function's whole permission set. No delete and no list: without s3:ListBucket S3 answers a
  * get of a missing key with 403, which s3Store.get reads as missing (see store.ts).

@@ -7,8 +7,10 @@ import {
   functionPolicy,
   logsPolicy,
   isGithubSubject,
+  isManagedPolicyArn,
   isRoleArn,
   jobsTrustPolicy,
+  permissionsBoundaryArgs,
   trustPolicy,
   workstationTrustPolicy,
 } from '../infra/policies.ts';
@@ -415,5 +417,59 @@ describe('isRoleArn', () => {
     for (const bad of ['', '*', 'arn:aws:iam::123456789012:root', 'arn:aws:iam::123456789012:role/', 'arn:aws:iam::123456789012:role/a/', 'arn:aws:iam::*:role/a']) {
       assert.equal(isRoleArn(bad), false, bad);
     }
+  });
+});
+
+describe('isManagedPolicyArn', () => {
+  it('accepts a customer-managed policy ARN in each partition, with and without a path', () => {
+    for (const ok of [
+      'arn:aws:iam::111122223333:policy/agent-memory-boundary',
+      'arn:aws:iam::111122223333:policy/boundaries/team/agent_memory+=,.@-boundary',
+      'arn:aws-cn:iam::111122223333:policy/boundary',
+      'arn:aws-us-gov:iam::111122223333:policy/path/boundary',
+    ]) {
+      assert.equal(isManagedPolicyArn(ok), true, ok);
+    }
+  });
+
+  it('refuses an AWS-managed policy, another kind of ARN, a wildcard and a malformed ARN', () => {
+    for (const bad of [
+      '',
+      '*',
+      'boundary',
+      'arn:aws:iam::aws:policy/AdministratorAccess',
+      'arn:aws:iam::aws:policy/job-function/ViewOnlyAccess',
+      'arn:aws:iam::111122223333:role/boundary',
+      'arn:aws:iam::111122223333:root',
+      'arn:aws:iam::111122223333:policy/',
+      'arn:aws:iam::111122223333:policy/*',
+      'arn:aws:iam::111122223333:policy/a/',
+      'arn:aws:iam::111122223333:policy//boundary',
+      'arn:aws:iam::111122223333:policy/a//b',
+      'arn:aws:iam::111122223333:policy/a b',
+      'arn:aws:iam::111122223333:policy/a\nb',
+      'arn:aws:iam::111122223333:policy/a,arn:aws:iam::111122223333:policy/b',
+      'arn:aws:iam::11112222333:policy/boundary',
+      'arn:aws:iam::*:policy/boundary',
+      'arn:aws-iso:iam::111122223333:policy/boundary',
+      'arn:aws:s3:::example-bucket',
+      ' arn:aws:iam::111122223333:policy/boundary',
+    ]) {
+      assert.equal(isManagedPolicyArn(bad), false, bad);
+    }
+  });
+});
+
+describe('permissionsBoundaryArgs', () => {
+  it('adds no key at all without a boundary', () => {
+    const args = permissionsBoundaryArgs(null);
+    assert.deepEqual(args, {});
+    assert.equal(Object.keys(args).length, 0);
+    assert.equal('permissionsBoundary' in args, false);
+  });
+
+  it('names the boundary with one', () => {
+    const arn = 'arn:aws:iam::111122223333:policy/agent-memory-boundary';
+    assert.deepEqual(permissionsBoundaryArgs(arn), { permissionsBoundary: arn });
   });
 });
