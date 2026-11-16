@@ -1,7 +1,7 @@
 /// <reference path="../.sst/platform/config.d.ts" />
 import { bucket } from "./storage.ts";
 import { mode } from "./mode.ts";
-import { functionPolicy, logsPolicy, trustPolicy } from "./policies.ts";
+import { functionPolicy, logsPolicy, permissionsBoundaryArgs, trustPolicy } from "./policies.ts";
 
 export { bucket };
 
@@ -30,6 +30,8 @@ export const fn = new sst.aws.Function("MemoryApiFunction", {
         { name: "bucket-access", policy: JSON.stringify(functionPolicy(bucketArn)) },
         { name: "logs", policy: JSON.stringify(logsPolicy(logGroupArn)) },
       ]);
+      // Adds nothing without AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN.
+      Object.assign(args, permissionsBoundaryArgs(mode.permissionsBoundaryArn));
     },
   },
 });

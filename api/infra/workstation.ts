@@ -1,7 +1,7 @@
 /// <reference path="../.sst/platform/config.d.ts" />
 import { bucket, parameterResources } from "./api.ts";
 import { mode } from "./mode.ts";
-import { bridgeRolePolicy, canaryRolePolicy, jobsTrustPolicy } from "./policies.ts";
+import { bridgeRolePolicy, canaryRolePolicy, jobsTrustPolicy, permissionsBoundaryArgs } from "./policies.ts";
 
 // Read and checked in mode.ts, before any resource is declared.
 const roleArns = mode.workstationRoleArns;
@@ -26,6 +26,7 @@ if (roleArns.length > 0 || githubSubjects.length > 0) {
     name: `${$app.name}-${$app.stage}-bridge`,
     maxSessionDuration: 3600,
     assumeRolePolicy: trustDocument,
+    ...permissionsBoundaryArgs(mode.permissionsBoundaryArn),
   });
   new aws.iam.RolePolicy("WorkstationBridgeRolePolicy", {
     role: bridgeRole.name,
@@ -46,6 +47,7 @@ if (roleArns.length > 0 || githubSubjects.length > 0) {
       name: `${$app.name}-${$app.stage}-canary`,
       maxSessionDuration: 3600,
       assumeRolePolicy: trustDocument,
+      ...permissionsBoundaryArgs(mode.permissionsBoundaryArn),
     });
     new aws.iam.RolePolicy("WorkstationCanaryRolePolicy", {
       role: canaryRole.name,

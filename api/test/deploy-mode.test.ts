@@ -5,6 +5,7 @@ import { describe, it } from 'node:test';
 delete process.env.AGENT_MEMORY_INVOKER_ROLE_ARNS;
 delete process.env.AGENT_MEMORY_WORKSTATION_ROLE_ARNS;
 delete process.env.AGENT_MEMORY_GITHUB_SUBJECTS;
+delete process.env.AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN;
 const { parseDeployMode } = await import('../infra/mode.ts');
 
 const ROLE_A = 'arn:aws:iam::123456789012:role/gateway-a';
@@ -13,13 +14,13 @@ const ROLE_B = 'arn:aws:iam::123456789012:role/path/gateway-b';
 describe('parseDeployMode', () => {
   it('is the HTTP deployment when the variable is not set or holds only blanks', () => {
     for (const env of [{}, { AGENT_MEMORY_INVOKER_ROLE_ARNS: '' }, { AGENT_MEMORY_INVOKER_ROLE_ARNS: ' , ' }]) {
-      assert.deepEqual(parseDeployMode(env), { direct: false, invokerRoleArns: [], workstationRoleArns: [], githubSubjects: [] });
+      assert.deepEqual(parseDeployMode(env), { direct: false, invokerRoleArns: [], workstationRoleArns: [], githubSubjects: [], permissionsBoundaryArn: null });
     }
   });
 
   it('is direct invocation when roles are given, trimmed, without empty entries or duplicates', () => {
     const mode = parseDeployMode({ AGENT_MEMORY_INVOKER_ROLE_ARNS: ` ${ROLE_A}, ,${ROLE_B},${ROLE_A}` });
-    assert.deepEqual(mode, { direct: true, invokerRoleArns: [ROLE_A, ROLE_B], workstationRoleArns: [], githubSubjects: [] });
+    assert.deepEqual(mode, { direct: true, invokerRoleArns: [ROLE_A, ROLE_B], workstationRoleArns: [], githubSubjects: [], permissionsBoundaryArn: null });
   });
 
   it('refuses anything that is not an IAM role ARN, without repeating the entry', () => {
@@ -95,5 +96,44 @@ describe('parseDeployMode', () => {
         `${name} ${bad}`,
       );
     }
+  });
+
+  describe('permissions boundary', () => {
+    const BOUNDARY = 'arn:aws:iam::111122223333:policy/boundaries/agent-memory-boundary';
+    const MESSAGE = 'AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN must be the ARN of an IAM managed policy.';
+
+    it('is null when the variable is not set, empty or only blanks', () => {
+      for (const env of [{}, { AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN: '' }, { AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN: ' \t ' }]) {
+        assert.equal(parseDeployMode(env).permissionsBoundaryArn, null);
+      }
+    });
+
+    it('reads the policy ARN, trimmed, beside the other switches', () => {
+      const mode = parseDeployMode({ AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN: ` ${BOUNDARY} `, AGENT_MEMORY_INVOKER_ROLE_ARNS: ROLE_A });
+      assert.deepEqual(mode, {
+        direct: true,
+        invokerRoleArns: [ROLE_A],
+        workstationRoleArns: [],
+        githubSubjects: [],
+        permissionsBoundaryArn: BOUNDARY,
+      });
+      for (const ok of ['arn:aws-cn:iam::111122223333:policy/b', 'arn:aws-us-gov:iam::111122223333:policy/b']) {
+        assert.equal(parseDeployMode({ AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN: ok }).permissionsBoundaryArn, ok);
+      }
+    });
+
+    it('refuses anything but a customer-managed policy ARN, with exactly one message', () => {
+      for (const bad of [
+        '*',
+        'arn:aws:iam::aws:policy/AdministratorAccess',
+        'arn:aws:iam::111122223333:role/boundary',
+        'arn:aws:iam::111122223333:policy/',
+        'arn:aws:iam::111122223333:policy/*',
+        'arn:aws-iso:iam::111122223333:policy/boundary',
+        `${BOUNDARY},${BOUNDARY}`,
+      ]) {
+        assert.throws(() => parseDeployMode({ AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN: bad }), { message: MESSAGE }, bad);
+      }
+    });
   });
 });

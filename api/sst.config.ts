@@ -15,6 +15,11 @@
 //                                        function directly, for example the execution role of an AgentCore
 //                                        gateway. When set, the deployment serves direct invocation only:
 //                                        no HTTP API and no token issuer. Without it, the HTTP API as always.
+//   AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN optional, the ARN of a customer-managed IAM policy. When set, every
+//                                        role the deployment creates (the function's role and the bridge and
+//                                        canary roles) carries it as its permissions boundary. The policy must
+//                                        already exist; the deployment neither creates nor changes it. Without
+//                                        it, the roles have no boundary.
 export default $config({
   app(input) {
     const region = process.env.AGENT_MEMORY_REGION;
