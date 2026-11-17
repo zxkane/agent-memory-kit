@@ -118,7 +118,11 @@ The same `setup.sh` command installs per-user LaunchAgents in
 `~/Library/LaunchAgents/io.github.agent-memory-kit.<scope>.plist`. Sync runs at
 login and every 120 seconds while logged in. The generated files contain this
 machine's actual home and Node.js paths; shell variables are not put in plist
-path fields. Homebrew and `~/.local/bin` are included in the jobs' PATH.
+path fields. Homebrew and `~/.local/bin` are included in the jobs' PATH. Setup also carries the standard HTTP_PROXY,
+HTTPS_PROXY, ALL_PROXY and NO_PROXY variables (and their lowercase forms) into
+the private plist. This preserves the installer's Git network routing without
+copying unrelated credentials from its environment. Rerun setup after changing
+proxy settings; launchd does not source your shell configuration.
 
 `--dry-run` writes nothing and makes no launchctl calls. `--no-enable` writes the
 files without starting jobs. Setup can be repeated: unchanged loaded jobs are

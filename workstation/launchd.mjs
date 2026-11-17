@@ -9,6 +9,7 @@ import { loadConfig } from './lib/config.mjs';
 const MARKER = '<!-- Managed by agent-memory-kit setup.sh. -->';
 const PREFIX = 'io.github.agent-memory-kit.';
 const scopes = ['sync', 'extract', 'organize', 'canary'];
+const PROXY_KEYS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'];
 const xml = (s) => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 function value(v) {
   if (typeof v === 'boolean') return `<${v}/>`;
@@ -26,7 +27,7 @@ export function calendarInterval(text) {
   return { ...(m[1] ? { Weekday: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(m[1]) } : {}), Hour: +m[2], Minute: +m[3] };
 }
 
-export function planLaunchd({ home, kitDir, nodeBin, config = {} }) {
+export function planLaunchd({ home, kitDir, nodeBin, config = {}, env = process.env }) {
   const dir = join(home, 'Library/LaunchAgents');
   const jobs = []; const notices = [];
   for (const scope of scopes) {
@@ -50,6 +51,9 @@ export function planLaunchd({ home, kitDir, nodeBin, config = {} }) {
       Label: label,
       ProgramArguments: [nodeBin, join(kitDir, 'workstation/launchd-job.mjs'), scope],
       EnvironmentVariables: {
+        // launchd does not run the user's shell initialization. Retain only the
+        // standard proxy variables needed to reach the same Git remotes.
+        ...Object.fromEntries(PROXY_KEYS.filter((k) => typeof env[k] === 'string' && env[k] !== '').map((k) => [k, env[k]])),
         HOME: home,
         PATH: [dirname(nodeBin), '/opt/homebrew/bin', '/usr/local/bin', join(home, '.local/bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'),
       },
@@ -75,9 +79,9 @@ function current(job) {
   return text;
 }
 
-export function installLaunchd({ home, kitDir, nodeBin, config = {}, dryRun = false, enable = true, check = false,
+export function installLaunchd({ home, kitDir, nodeBin, config = {}, env = process.env, dryRun = false, enable = true, check = false,
   exec = (args) => spawnSync('launchctl', args, { encoding: 'utf8' }), log = () => {} }) {
-  const plan = planLaunchd({ home, kitDir, nodeBin, config });
+  const plan = planLaunchd({ home, kitDir, nodeBin, config, env });
   const jobs = plan.jobs.map((job) => ({ ...job, before: current(job) }));
   const domain = `gui/${process.getuid()}`;
   const call = (args) => { const r = exec(args); if (r.status !== 0) throw new Error(`launchctl ${args[0]} failed; retry from a logged-in macOS session.`); };

@@ -104,3 +104,15 @@ test('missing config in the launchd CLI preserves existing scheduled jobs', (t) 
   assert.equal(r.status, 1); assert.match(r.stderr, /configuration is missing/);
   assert.equal(readFileSync(file, 'utf8'), old);
 });
+
+test('scheduled jobs retain proxy routing but do not copy arbitrary environment secrets', (t) => {
+  const f = fixture(t);
+  const env = { HTTPS_PROXY: 'http://127.0.0.1:9001', https_proxy: 'http://127.0.0.1:9001', NO_PROXY: 'localhost', AWS_SECRET_ACCESS_KEY: 'must-not-be-inherited', HOME: '/wrong/home' };
+  const job = planLaunchd({ ...f, env }).jobs[0];
+  assert.ok(job.text.includes('<key>HTTPS_PROXY</key><string>http://127.0.0.1:9001</string>'));
+  assert.ok(job.text.includes('<key>https_proxy</key>'));
+  assert.ok(job.text.includes('<key>NO_PROXY</key><string>localhost</string>'));
+  assert.ok(!job.text.includes('must-not-be-inherited'));
+  assert.ok(!job.text.includes('/wrong/home'));
+  assert.notEqual(job.signature, planLaunchd({ ...f, env: {} }).jobs[0].signature);
+});
