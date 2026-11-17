@@ -1,11 +1,11 @@
 #!/bin/bash
 # Enable agent-memory on this machine.
 #
-#   setup.sh [--dry-run] [--init <host> --repo-url <url>] [--no-enable] [--no-hooks]
+#   setup.sh [--dry-run] [--init <host> --repo-url <url>] [--no-enable] [--no-hooks] [--prepare]
 #
 # --init writes ~/.config/agent-memory/config.json (first run only).
 # --dry-run prints what would happen and changes nothing.
-# --no-enable writes the systemd units but does not enable the timers.
+# --no-enable writes scheduler files but does not enable the jobs.
 # When the config has consolidate.extract / consolidate.organize schedules, the matching
 # weekly timer is written too; a scope without a schedule has its units removed.
 # The same holds for canary.schedule (the timer of the deployed checks of the memory API).
@@ -21,13 +21,14 @@ die() {
 }
 
 usage() {
-    printf '%s\n' 'usage: setup.sh [--dry-run] [--init <host> --repo-url <url>] [--no-enable] [--no-hooks]' >&2
+    printf '%s\n' 'usage: setup.sh [--dry-run] [--init <host> --repo-url <url>] [--no-enable] [--no-hooks] [--prepare]' >&2
     exit 2
 }
 
 dry_run=0
 enable=1
 hooks=1
+prepare=0
 init_host=""
 repo_url_arg=""
 init=0
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) dry_run=1 ;;
         --no-enable) enable=0 ;;
         --no-hooks) hooks=0 ;;
+        --prepare) prepare=1 ;;
         --init)
             [[ $# -ge 2 ]] || usage
             init=1
@@ -61,6 +63,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 kit_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+platform="$(uname -s)"
+case "$platform" in Darwin|Linux) ;; *) die "unsupported operating system: $platform" ;; esac
 
 # Paths that end up inside a unit file or a hook command must not need escaping.
 # Prints the first character of $1 that is not supported, described in words.
@@ -75,7 +79,7 @@ unsafe_char() {
             '\') printf '%s' 'a backslash' ;;
             '#') printf '%s' 'a "#"' ;;
             '?') printf '%s' 'a "?"' ;;
-            ' ') printf '%s' 'a space' ;;
+            ' ') [[ "$platform" == Darwin ]] && continue; printf '%s' 'a space' ;;
             $'\n') printf '%s' 'a newline' ;;
             *) continue ;;
         esac
@@ -102,6 +106,8 @@ if why="$(unsafe_char "$kit_dir")"; then die "the kit path contains $why, which 
 if why="$(unsafe_char "$node_dir")"; then die "the Node.js path contains $why, which is not supported: $node_dir"; fi
 
 config_file="$HOME/.config/agent-memory/config.json"
+# All setup subprocesses use the file validated here, not an inherited override.
+export AGENT_MEMORY_CONFIG="$config_file"
 unit_dir="$HOME/.config/systemd/user"
 settings_file="$HOME/.claude/settings.json"
 state_dir="$HOME/.local/state/agent-memory"
@@ -184,8 +190,32 @@ agents_clone_needed=0
 # text): a parent that is a link into the notes clone would put the mirror inside its work tree.
 agents_overlaps=0
 if [[ $agents_clone_needed -eq 1 ]]; then
-    real_agents="$(realpath -m -- "$agents_dir" 2> /dev/null || true)"
-    real_notes="$(realpath -m -- "$repo_dir" 2> /dev/null || true)"
+    # Resolve the nearest existing ancestor; BSD realpath has no GNU -m option.
+    real_path() {
+        node --input-type=module -e '
+            import { realpathSync, lstatSync, readlinkSync } from "node:fs";
+            import { dirname, join, isAbsolute } from "node:path";
+            // Follow each symlink before interpreting later .. components. Lexical
+            // resolve(alias/../notes) can name a different directory than the OS.
+            let cursor = "/"; const pending = process.argv[1].split("/"); let links = 0;
+            while (pending.length) {
+                const part = pending.shift();
+                if (!part || part === ".") continue;
+                if (part === "..") { cursor = dirname(cursor); continue; }
+                const next = join(cursor, part);
+                const st = lstatSync(next, { throwIfNoEntry: false });
+                if (st?.isSymbolicLink()) {
+                    if (++links > 40) throw new Error("symlink loop");
+                    const target = readlinkSync(next);
+                    if (isAbsolute(target)) cursor = "/";
+                    pending.unshift(...target.split("/"));
+                } else cursor = st ? realpathSync(next) : next;
+            }
+            console.log(cursor);
+        ' "$1"
+    }
+    real_agents="$(real_path "$agents_dir" 2> /dev/null || true)"
+    real_notes="$(real_path "$repo_dir" 2> /dev/null || true)"
     if [[ -z "$real_agents" || -z "$real_notes" || "$real_agents/" == "$real_notes/"* || "$real_notes/" == "$real_agents/"* ]]; then
         agents_clone_needed=0
         agents_overlaps=1
@@ -221,18 +251,35 @@ if [[ $init -eq 1 || $clone_needed -eq 1 ]]; then
         || die "the notes repository does not answer: git ls-remote --exit-code $repo_url main failed."
 fi
 
+launchd_flags=()
+launchd_init_flags=()
+[[ $init -eq 0 ]] || launchd_init_flags=(--initializing)
+[[ $enable -eq 1 ]] || launchd_flags=(--no-enable)
+if [[ "$platform" == Darwin ]]; then
+    command -v launchctl >/dev/null || die 'launchctl is required on macOS.'
+    node "$kit_dir/workstation/launchd.mjs" --check ${launchd_init_flags[@]+"${launchd_init_flags[@]}"}
+fi
+
 if [[ $dry_run -eq 1 ]]; then
     [[ $init -eq 1 ]] && printf 'would write %s (host %s)\n' "$config_file" "$init_host"
     [[ $clone_needed -eq 1 ]] && printf 'would clone %s into %s\n' "$repo_url" "$repo_dir"
     [[ -z "$bridge_problem" ]] || bridge_problem_line
     [[ $agents_overlaps -eq 0 ]] || agents_overlap_line
     [[ $agents_clone_needed -eq 0 ]] || printf 'would clone the agents repository into %s\n' "$agents_dir"
+    if [[ $prepare -eq 1 ]]; then
+        printf '%s\n' 'would prepare the note clones and state directory; hooks and schedulers left unchanged'
+        exit 0
+    fi
     if [[ $hooks -eq 1 ]]; then
         printf 'would run node %s/workstation/install.mjs (hooks in %s)\n' "$kit_dir" "$settings_file"
     else
         printf 'would run node %s/workstation/install.mjs --no-hooks (no hooks in %s)\n' "$kit_dir" "$settings_file"
     fi
     node "$kit_dir/workstation/install.mjs" --plan ${install_flags[@]+"${install_flags[@]}"}
+    if [[ "$platform" == Darwin ]]; then
+        node "$kit_dir/workstation/launchd.mjs" --dry-run ${launchd_flags[@]+"${launchd_flags[@]}"} ${launchd_init_flags[@]+"${launchd_init_flags[@]}"}
+        exit 0
+    fi
     printf 'would write %s/agent-memory-sync.service and agent-memory-sync.timer\n' "$unit_dir"
     timers_on=""
     [[ -z "$consolidate_problem" ]] || invalid_block_line consolidate
@@ -314,6 +361,12 @@ fi
 mkdir -p "$(dirname "$state_dir")"
 mkdir -p -m 700 "$state_dir"
 
+# A caller can migrate and verify notes before switching the active installation.
+if [[ $prepare -eq 1 ]]; then
+    printf '%s\n' 'prepared note clones; hooks, launcher and schedulers left unchanged'
+    exit 0
+fi
+
 # 6. Hooks and the recorded Node.js path.
 if [[ $hooks -eq 1 ]]; then
     node "$kit_dir/workstation/install.mjs"
@@ -322,7 +375,13 @@ else
     printf '%s\n' 'hooks not registered (--no-hooks)'
 fi
 
-# 7. systemd units.
+# 7. Native per-user scheduler.
+if [[ "$platform" == Darwin ]]; then
+    node "$kit_dir/workstation/launchd.mjs" ${launchd_flags[@]+"${launchd_flags[@]}"}
+    exit 0
+fi
+
+# Linux systemd units.
 mkdir -p "$unit_dir"
 write_unit() { # write_unit <name> (content on stdin)
     local tmp="$unit_dir/.$1.tmp.$$"

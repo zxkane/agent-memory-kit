@@ -4,10 +4,9 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HOOK_MARKER, LAUNCHER_REL, checkInstall, install, kiroHookDocument, mergeCodexHooks, mergeHooks, planInstall, removeHooks, toolCommand } from '../install.mjs';
+import { HOOK_MARKER, LAUNCHER_REL, checkInstall, install, kiroHookDocument, launcherCommand, mergeCodexHooks, mergeHooks, planInstall, removeHooks, toolCommand } from '../install.mjs';
 import { tempDir } from './helpers.mjs';
 
-const RUN = '/srv/kit/workstation/run.sh';
 const INSTALL_MJS = join(dirname(fileURLToPath(import.meta.url)), '..', 'install.mjs');
 const LINKED = 'is a symbolic link or lies in a linked folder, so it was left unchanged.';
 
@@ -22,17 +21,21 @@ function fixture(t) {
 
 test('mergeHooks adds both hooks and keeps unrelated ones', () => {
   const other = { matcher: 'Write|Edit', hooks: [{ type: 'command', command: '"$HOME/tools/other.sh" hook', timeout: 6 }] };
-  const after = mergeHooks({ model: 'x', hooks: { PreToolUse: [structuredClone(other)] } }, RUN);
+  const after = mergeHooks({ model: 'x', hooks: { PreToolUse: [structuredClone(other)] } });
   assert.equal(after.model, 'x');
   assert.deepEqual(after.hooks.PreToolUse[0], other);
-  assert.deepEqual(after.hooks.PreToolUse[1], { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `"${RUN}" pre-write # agent-memory-kit`, timeout: 10 }] });
-  assert.deepEqual(after.hooks.SessionStart, [{ hooks: [{ type: 'command', command: `"${RUN}" session-start # agent-memory-kit`, timeout: 20 }] }]);
+  assert.deepEqual(after.hooks.PreToolUse[1], { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: launcherCommand('pre-write'), timeout: 10 }] });
+  assert.deepEqual(after.hooks.SessionStart, [{ hooks: [{ type: 'command', command: toolCommand('claude'), timeout: 20 }] }]);
 });
 
 test('mergeHooks is idempotent and replaces entries from an older kit location', () => {
-  const once = mergeHooks({}, '/old/place/workstation/run.sh');
-  const twice = mergeHooks(structuredClone(once), RUN);
-  assert.deepEqual(twice, mergeHooks({}, RUN));
+  const once = { hooks: {
+    SessionStart: [{ hooks: [{ type: 'command', command: '"/old/place/workstation/run.sh" session-start # agent-memory-kit', timeout: 20 }] }],
+    PreToolUse: [{ matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: '"/old/place/workstation/run.sh" pre-write # agent-memory-kit', timeout: 10 }] }],
+  } };
+  const twice = mergeHooks(structuredClone(once));
+  assert.deepEqual(twice, mergeHooks({}));
+  assert.deepEqual(mergeHooks(twice), twice);
 });
 
 test('mergeHooks keeps a group that mixes its own hook with another one', () => {
@@ -40,7 +43,7 @@ test('mergeHooks keeps a group that mixes its own hook with another one', () => 
     { type: 'command', command: '"/old/run.sh" pre-write # agent-memory-kit', timeout: 10 },
     { type: 'command', command: '"/x/other.sh"', timeout: 5 },
   ] };
-  const after = mergeHooks({ hooks: { PreToolUse: [mixed] } }, RUN);
+  const after = mergeHooks({ hooks: { PreToolUse: [mixed] } });
   assert.deepEqual(after.hooks.PreToolUse[0].hooks, [{ type: 'command', command: '"/x/other.sh"', timeout: 5 }]);
   assert.equal(after.hooks.PreToolUse.length, 2);
   assert.ok(HOOK_MARKER.startsWith('#'));
@@ -49,7 +52,7 @@ test('mergeHooks keeps a group that mixes its own hook with another one', () => 
 test('mergeHooks does not modify its input', () => {
   const input = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'x # agent-memory-kit' }] }] } };
   const copy = structuredClone(input);
-  mergeHooks(input, RUN);
+  mergeHooks(input);
   assert.deepEqual(input, copy);
 });
 
@@ -94,7 +97,7 @@ test('install creates settings.json when absent and rejects an unsafe kit path',
 
 test('removeHooks drops only the kit entries and adds no hooks key', () => {
   const other = { matcher: 'Write', hooks: [{ type: 'command', command: '"/x/other.sh"', timeout: 5 }] };
-  const installed = mergeHooks({ model: 'x', hooks: { PreToolUse: [structuredClone(other)] } }, RUN);
+  const installed = mergeHooks({ model: 'x', hooks: { PreToolUse: [structuredClone(other)] } });
   assert.deepEqual(removeHooks(installed), { model: 'x', hooks: { PreToolUse: [other] } });
   assert.deepEqual(removeHooks({ model: 'x' }), { model: 'x' });
 });
@@ -665,4 +668,19 @@ test('dangling links under the home directory count as linked and nothing is wri
       assert.doesNotThrow(() => planInstall({ home, hooks }), label);
     }
   }
+});
+
+
+test('Claude settings linked into a shared checkout contain only portable kit hooks', async (t) => {
+  const { home, kitDir, base } = fixture(t);
+  const settings = join(base, 'shared-settings.json'); writeFileSync(settings, '{}');
+  symlinkSync(settings, join(home, '.claude/settings.json'));
+  await install({ home, kitDir });
+  const text = readFileSync(settings, 'utf8');
+  assert.ok(text.includes('$HOME')); assert.ok(!text.includes(kitDir)); assert.ok(!text.includes(home));
+});
+
+
+test('hook merge preserves unrelated empty event arrays', () => {
+  assert.deepEqual(mergeHooks({ hooks: { Notification: [] } }).hooks.Notification, []);
 });

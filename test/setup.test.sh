@@ -33,6 +33,9 @@ git -C "$seed" push -q "$remote" main
 
 printf '%s\n' '#!/bin/bash' "printf '%s\\n' \"\$*\" >> \"$calls\"" > "$bin/systemctl"
 chmod +x "$bin/systemctl"
+# This suite tests the Linux scheduler even on macOS; native launchd has its own suite.
+printf '#!/bin/sh\necho Linux\n' > "$bin/uname"
+chmod +x "$bin/uname"
 
 fails=0
 check() { # check <description> <command...>
@@ -128,7 +131,7 @@ fresh_home
 run_setup --init alpha --repo-url "$remote"
 check 'init exits 0' test "$status" -eq 0
 cfg="$home/.config/agent-memory/config.json"
-check 'config mode is 600' test "$(stat -c %a "$cfg")" = 600
+check 'config mode is 600' test "$(node -p '(require("node:fs").statSync(process.argv[1]).mode & 0o777).toString(8)' "$cfg")" = 600
 check 'config host' grep -q '"host": *"alpha"' "$cfg"
 check 'config enabled' grep -q '"enabled": *true' "$cfg"
 check 'clone is on main' test "$(git -C "$home/agent-memory" rev-parse --abbrev-ref HEAD)" = main
@@ -144,7 +147,8 @@ settings="$home/.claude/settings.json"
 hook_count() { # hook_count <event> <action>: number of marked commands for that action
     node -e '
         const s = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
-        const want = `"${process.argv[2]}/workstation/run.sh" ${process.argv[4]} # agent-memory-kit`;
+        const action = process.argv[4] === "session-start" ? "session-start claude" : process.argv[4];
+        const want = `r="$HOME/.config/agent-memory/run.sh"; [ ! -x "$r" ] || "$r" ${action} # agent-memory-kit`;
         const groups = s.hooks[process.argv[3]] ?? [];
         console.log(groups.flatMap((g) => g.hooks).filter((h) => h.command === want).length);
     ' "$settings" "$kit" "$1" "$2"
@@ -153,7 +157,7 @@ check 'session hook' test "$(hook_count SessionStart session-start)" = 1
 check 'pre-write hook' test "$(hook_count PreToolUse pre-write)" = 1
 check 'timer enabled' has_line "$calls" '--user enable --now agent-memory-sync.timer'
 check 'daemon reloaded' has_line "$calls" '--user daemon-reload'
-check 'state directory mode is 700' test "$(stat -c %a "$home/.local/state/agent-memory")" = 700
+check 'state directory mode is 700' test "$(node -p '(require("node:fs").statSync(process.argv[1]).mode & 0o777).toString(8)' "$home/.local/state/agent-memory")" = 700
 
 # 4. Run again without --init.
 cp "$cfg" "$tmp/config.before"
@@ -246,12 +250,12 @@ check 'codex trust notice is printed' has_text "$out" 'Codex: start a session an
 run_setup --no-enable
 check 'agents rerun exits 0' test "$status" -eq 0
 check 'agents rerun prints no trust notice' bash -c '! grep -qF "run /hooks" <<< "$1"' _ "$out"
-codex_stamp="$(stat -c %Y.%y "$home/.codex/hooks.json")$(stat -c %y "$home/.kiro/hooks/agent-memory-kit.json")"
+codex_stamp="$(node -p 'require("node:fs").statSync(process.argv[1]).mtimeMs' "$home/.codex/hooks.json")$(node -p 'require("node:fs").statSync(process.argv[1]).mtimeMs' "$home/.kiro/hooks/agent-memory-kit.json")"
 run_setup --dry-run
 check 'agents rerun dry run exits 0' test "$status" -eq 0
 check 'agents rerun dry run does not say it would register Codex' bash -c '! grep -q "would register the Codex" <<< "$1"' _ "$out"
 check 'agents rerun dry run does not say it would write Kiro' bash -c '! grep -q "would write .*agent-memory-kit.json" <<< "$1"' _ "$out"
-check 'agents rerun leaves both hook files alone' test "$codex_stamp" = "$(stat -c %Y.%y "$home/.codex/hooks.json")$(stat -c %y "$home/.kiro/hooks/agent-memory-kit.json")"
+check 'agents rerun leaves both hook files alone' test "$codex_stamp" = "$(node -p 'require("node:fs").statSync(process.argv[1]).mtimeMs' "$home/.codex/hooks.json")$(node -p 'require("node:fs").statSync(process.argv[1]).mtimeMs' "$home/.kiro/hooks/agent-memory-kit.json")"
 run_setup --dry-run --no-hooks
 check 'agents no-hooks dry run exits 0' test "$status" -eq 0
 check 'agents no-hooks dry run names the Codex removal' has_text "$out" "would remove the Codex session-start hook from $home/.codex/hooks.json"
@@ -440,7 +444,7 @@ mkdir -p "$failbin"
 printf '%s\n' '#!/bin/bash' "printf '%s\\n' \"\$*\" >> \"$calls\"" 'if [[ "$*" == *daemon-reload* ]]; then exit 1; fi' > "$failbin/systemctl"
 chmod +x "$failbin/systemctl"
 rm -f "$calls"
-setup_path="$failbin:$PATH" run_setup --no-enable
+setup_path="$failbin:$bin:$PATH" run_setup --no-enable
 check 'failing reload after a removal exits 0' test "$status" -eq 0
 check 'failing reload still removed the organize files' test ! -e "$udir/agent-memory-organize.timer" -a ! -e "$udir/agent-memory-organize.service"
 check 'failing reload is reported' has_text "$out" 'could not reload systemd'
