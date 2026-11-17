@@ -465,6 +465,16 @@ test('session-start in a repository without origin shares its notes under this m
   }
 });
 
+test('session-start keeps the memory of a repository whose path cannot form an identity on this machine', (t) => {
+  const f = fixture(t, { origin: null });
+  const odd = join(f.tmp, 'tab\there', 'example-repo');
+  mkdirSync(odd, { recursive: true });
+  sh(odd, 'git', ['init', '-q']);
+  const r = run('session-start.mjs', { cwd: odd }, f.env);
+  assert.match(contextOf(r), /\nThis repository has no shareable "origin" remote and its path cannot form a machine identity, so its memory stays on this machine\.\n/);
+  assert.equal(existsSync(join(f.repo, 'projects')), false);
+});
+
 test('session-start moves the existing memory folder of a repository without origin into the clone', (t) => {
   const f = fixture(t, { origin: null });
   mkdirSync(f.link, { recursive: true });

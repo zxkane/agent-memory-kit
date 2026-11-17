@@ -107,10 +107,10 @@ test('a name collision is explained and a broken binding is a warning', (t) => {
     /WARNING: this repository's remote no longer matches the project its memory is linked to \(example\.com\/a\/app\)\./);
 });
 
-test('a repository without a shareable origin is told that its memory stays local', (t) => {
+test('a repository without any identity is told that its memory stays local', (t) => {
   const { base } = fixture(t);
   const out = buildSessionContext({ ...base, identity: { reason: 'no-identity', expected: null, linked: false } });
-  assert.match(out, /\nThis repository has no shareable "origin" remote, so its memory stays on this machine\.\n/);
+  assert.match(out, /\nThis repository has no shareable "origin" remote and its path cannot form a machine identity, so its memory stays on this machine\.\n/);
   assert.doesNotMatch(out, /not inside a Git repository/);
 });
 
@@ -213,7 +213,7 @@ test('tool context: empty and missing indexes print (empty)', (t) => {
 for (const [reason, expected, line] of [
   ['not-a-repository', null, 'This directory is not inside a Git repository, so it has no project notes.'],
   ['unusable-name', null, "This repository's directory name cannot be used as a project name, so it has no project notes."],
-  ['no-identity', null, 'This repository has no shareable "origin" remote, so it has no project notes.'],
+  ['no-identity', null, 'This repository has no shareable "origin" remote and its path cannot form a machine identity, so it has no project notes.'],
   ['mismatch', 'x'.repeat(300), `This repository shares its name with another project in shared memory (${'x'.repeat(200)}), so it has no project notes.`],
   ['mismatch', null, 'This repository shares its name with another project in shared memory, so it has no project notes.'],
 ]) {

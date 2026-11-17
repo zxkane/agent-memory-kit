@@ -197,7 +197,7 @@ export function buildSessionContext({
       : 'This directory is not inside a Git repository, so its memory stays on this machine.');
   }
   if (identity?.reason === 'no-identity') {
-    lines.push('This repository has no shareable "origin" remote, so its memory stays on this machine.');
+    lines.push('This repository has no shareable "origin" remote and its path cannot form a machine identity, so its memory stays on this machine.');
   }
   if (localShare !== null) lines.push(localShareLine(localShare));
   if (linkSkipped) {
@@ -271,7 +271,7 @@ function readLines(path) {
 const NO_PROJECT_REASONS = {
   'not-a-repository': () => 'This directory is not inside a Git repository, so it has no project notes.',
   'unusable-name': () => "This repository's directory name cannot be used as a project name, so it has no project notes.",
-  'no-identity': () => 'This repository has no shareable "origin" remote, so it has no project notes.',
+  'no-identity': () => 'This repository has no shareable "origin" remote and its path cannot form a machine identity, so it has no project notes.',
   mismatch: (expected) => `This repository shares its name with another project in shared memory${expected === null ? '' : ` (${safeIdentity(expected)})`}, so it has no project notes.`,
 };
 
