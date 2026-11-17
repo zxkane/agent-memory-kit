@@ -317,7 +317,7 @@ test('two folders with one project name and different identities: the first is a
   assert.equal(r2.adopted, 0);
 });
 
-test('two folders without origin and with one project name are both skipped as no-remote', (t) => {
+test('two folders without origin and with one project name: the first is shared under this machine\'s identity, the second collides', (t) => {
   const base = tempDir(t);
   const claudeDir = join(base, 'claude');
   const repoDir = join(base, 'clone');
@@ -331,18 +331,34 @@ test('two folders without origin and with one project name are both skipped as n
   const config = { host: 'alpha', repoDir, repoUrl: null, stateDir: join(base, 's'), claudeDir, staleAfterSeconds: 600 };
   const items = planMigration(config);
   assert.deepEqual(items.map((i) => [i.slug, i.action, i.reason]), [
-    [slugOf(first), 'skip', 'no-remote'],
-    [slugOf(second), 'skip', 'no-remote'],
+    [slugOf(first), 'adopt', null],
+    [slugOf(second), 'skip', 'name-collision'],
   ]);
-  const r = applyMigration(items, config);
-  assert.equal(r.adopted, 0);
-  assert.deepEqual(r.skipped.map((x) => x.reason), ['no-remote', 'no-remote']);
-  // forcing the pair through apply still creates nothing in the clone
+  // forcing the pair through apply still keeps the second one out
   const forced = items.map((i) => ({ ...i, action: 'adopt', reason: null }));
-  assert.deepEqual(applyMigration(forced, config).skipped.map((x) => x.reason), ['no-remote', 'no-remote']);
-  assert.ok(lstatSync(memFirst).isDirectory());
+  const r = applyMigration(forced, config);
+  assert.equal(r.adopted, 1);
+  assert.deepEqual(r.skipped.map((x) => x.reason), ['name-collision']);
+  assert.ok(lstatSync(memFirst).isSymbolicLink());
   assert.ok(lstatSync(memSecond).isDirectory());
-  assert.deepEqual(readdirSync(repoDir), []);
+  assert.equal(readFileSync(join(repoDir, 'projects', 'example-repo', '.project'), 'utf8'), `local/alpha${realpathSync(first)}\n`);
+  assert.deepEqual(readdirSync(join(repoDir, 'projects', 'example-repo')).sort(), ['.project', 'one.md']);
+});
+
+test('a folder bound under this machine\'s identity is adopted by the same repository once it has an origin', (t) => {
+  const base = tempDir(t);
+  const claudeDir = join(base, 'claude');
+  const repoDir = join(base, 'clone');
+  const root = makeRepo(join(base, 'a', 'example-repo'), 'https://example.com/owner/example-repo');
+  const project = join(repoDir, 'projects', 'example-repo');
+  mkdirSync(project, { recursive: true });
+  writeFileSync(join(project, '.project'), `local/alpha${realpathSync(root)}\n`);
+  put(join(session(claudeDir, slugOf(root), root), 'memory'), 'one.md', '1');
+  const config = { host: 'alpha', repoDir, repoUrl: null, stateDir: join(base, 's'), claudeDir, staleAfterSeconds: 600 };
+  const items = planMigration(config);
+  assert.deepEqual(items.map((i) => [i.action, i.reason]), [['adopt', null]]);
+  assert.equal(applyMigration(items, config).adopted, 1);
+  assert.equal(readFileSync(join(project, '.project'), 'utf8'), 'example.com/owner/example-repo\n');
 });
 
 function cli(config, args, extraEnv = {}) {

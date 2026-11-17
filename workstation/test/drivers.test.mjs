@@ -449,27 +449,54 @@ test('session-start warns when a linked repository has lost its matching remote'
 
 const contextOf = (r) => JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
 
-test('session-start in a repository without origin links nothing and says why', (t) => {
+const localShareRe = (root) => new RegExp(`\\nThis repository has no shareable "origin" remote, so its project notes are shared under this machine's identity \\(local/alpha${realpathSync(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\); a directory with the same name on another machine is not linked to them\\.\\n`);
+const markerOf = (f) => readFileSync(join(f.repo, 'projects', 'example-repo', '.project'), 'utf8');
+
+test('session-start in a repository without origin shares its notes under this machine\'s identity', (t) => {
   for (const origin of [null, '/srv/repos/example-repo.git', 'file:///srv/repos/example-repo.git']) {
     const f = fixture(t, { origin });
     const r = run('session-start.mjs', { cwd: f.worktree }, f.env);
     assert.equal(r.status, 0);
-    assert.match(contextOf(r), /\nThis repository has no shareable "origin" remote, so its memory stays on this machine\.\n/);
-    assert.equal(existsSync(f.link), false);
-    assert.equal(existsSync(join(f.repo, 'projects')), false);
+    assert.match(contextOf(r), localShareRe(f.mainRoot));
+    assert.doesNotMatch(contextOf(r), /stays on this machine/);
+    assert.equal(realpathSync(f.link), realpathSync(join(f.repo, 'projects', 'example-repo')));
+    assert.equal(markerOf(f), `local/alpha${realpathSync(f.mainRoot)}\n`);
     assert.equal(existsSync(join(f.state, 'hook-errors.log')), false);
   }
 });
 
-test('session-start leaves the existing memory folder of a repository without origin alone', (t) => {
+test('session-start moves the existing memory folder of a repository without origin into the clone', (t) => {
   const f = fixture(t, { origin: null });
   mkdirSync(f.link, { recursive: true });
   writeFileSync(join(f.link, 'local.md'), 'local note\n');
   const r = run('session-start.mjs', { cwd: f.worktree }, f.env);
-  assert.match(contextOf(r), /has no shareable "origin" remote/);
-  assert.equal(lstatSync(f.link).isDirectory(), true);
-  assert.equal(readFileSync(join(f.link, 'local.md'), 'utf8'), 'local note\n');
-  assert.equal(existsSync(join(f.repo, 'projects')), false);
+  assert.match(contextOf(r), localShareRe(f.mainRoot));
+  assert.equal(lstatSync(f.link).isSymbolicLink(), true);
+  assert.equal(readFileSync(join(f.repo, 'projects', 'example-repo', 'local.md'), 'utf8'), 'local note\n');
+});
+
+test('session-start hands the folder of a repository without origin over to the origin it gains', (t) => {
+  const f = fixture(t, { origin: null });
+  run('session-start.mjs', { cwd: f.worktree }, f.env);
+  sh(f.mainRoot, 'git', ['remote', 'add', 'origin', 'https://example.com/owner/example-repo']);
+  const r = run('session-start.mjs', { cwd: f.worktree }, f.env);
+  assert.equal(markerOf(f), 'example.com/owner/example-repo\n');
+  assert.doesNotMatch(contextOf(r), /no longer matches|no shareable|stays on this machine/);
+  assert.equal(realpathSync(f.link), realpathSync(join(f.repo, 'projects', 'example-repo')));
+});
+
+test('session-start leaves a folder bound by another machine or another directory alone', (t) => {
+  for (const origin of [null, 'https://example.com/owner/example-repo']) {
+    for (const other of ['local/beta/data/git/example-repo', 'local/alpha/elsewhere/example-repo']) {
+      const f = fixture(t, { origin });
+      mkdirSync(join(f.repo, 'projects', 'example-repo'), { recursive: true });
+      writeFileSync(join(f.repo, 'projects', 'example-repo', '.project'), `${other}\n`);
+      const r = run('session-start.mjs', { cwd: f.worktree }, f.env);
+      assert.match(contextOf(r), new RegExp(`shares its name with another project in shared memory \\(${other.replaceAll('.', '\\.')}\\), so its memory stays on this machine\\.`));
+      assert.equal(existsSync(f.link), false);
+      assert.equal(markerOf(f), `${other}\n`);
+    }
+  }
 });
 
 test('session-start in a repository whose directory name is not a usable project name says so', (t) => {
@@ -519,13 +546,14 @@ test('session-start codex outside a repository', (t) => {
   assert.equal(existsSync(join(f.repo, 'projects')), false);
 });
 
-test('session-start codex in a repository without origin', (t) => {
+test('session-start codex in a repository without origin shows its shared project notes', (t) => {
   const f = fixture(t, { origin: null });
   const r = run('session-start.mjs', { cwd: f.worktree }, f.env, ['codex']);
   assert.equal(r.status, 0);
-  assert.match(r.stdout, /has no shareable "origin" remote/);
-  assert.doesNotMatch(r.stdout, /Project index \(/);
-  assert.equal(existsSync(join(f.repo, 'projects')), false);
+  assert.match(r.stdout, localShareRe(f.mainRoot));
+  assert.match(r.stdout, /Project index \(/);
+  assert.equal(markerOf(f), `local/alpha${realpathSync(f.mainRoot)}\n`);
+  assert.equal(existsSync(f.claudeDir), false);
 });
 
 test('session-start codex with a name claimed by another repository', (t) => {

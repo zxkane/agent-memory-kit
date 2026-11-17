@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { PROJECT_MARKER, bindProject, markerTempName } from '../lib/identity.mjs';
+import { PROJECT_MARKER, bindProject, bindRepository, markerTempName } from '../lib/identity.mjs';
 import { tempDir } from './helpers.mjs';
 
 const folder = (t) => join(tempDir(t), 'projects', 'app');
@@ -147,4 +147,44 @@ test('other link failures are not hidden', (t) => {
   const dir = folder(t);
   assert.throws(() => bindProject(dir, 'example.com/a/app', { link: failingLink('EIO') }), /link failed: EIO/);
   assert.deepEqual(readdirSync(dir), []);
+});
+
+test('bindRepository binds and matches like bindProject when nothing is replaced', (t) => {
+  const dir = folder(t);
+  assert.deepEqual(bindRepository(dir, { identity: 'local/alpha/srv/app', replaces: null }), { ok: true, reason: 'bound', expected: null });
+  assert.deepEqual(bindRepository(dir, { identity: 'local/alpha/srv/app', replaces: null }), { ok: true, reason: 'match', expected: null });
+  assert.deepEqual(bindRepository(dir, { identity: 'local/beta/srv/app', replaces: null }),
+    { ok: false, reason: 'mismatch', expected: 'local/alpha/srv/app' });
+  assert.deepEqual(bindRepository(dir, { identity: null, replaces: null }), { ok: false, reason: 'no-identity', expected: null });
+});
+
+test('bindRepository hands a folder bound with the replaced identity over to the new one', (t) => {
+  const dir = folder(t);
+  bindProject(dir, 'local/alpha/srv/app');
+  const wanted = { identity: 'example.com/a/app', replaces: 'local/alpha/srv/app' };
+  assert.deepEqual(bindRepository(dir, wanted), { ok: true, reason: 'replaced', expected: null });
+  assert.equal(readFileSync(join(dir, '.project'), 'utf8'), 'example.com/a/app\n');
+  assert.deepEqual(bindRepository(dir, wanted), { ok: true, reason: 'match', expected: null });
+  assert.deepEqual(readdirSync(dir), ['.project']);
+});
+
+test('bindRepository never takes over a folder bound by another machine or repository', (t) => {
+  for (const other of ['local/beta/srv/app', 'local/alpha/elsewhere/app', 'example.com/b/app']) {
+    const dir = folder(t);
+    bindProject(dir, other);
+    assert.deepEqual(bindRepository(dir, { identity: 'example.com/a/app', replaces: 'local/alpha/srv/app' }),
+      { ok: false, reason: 'mismatch', expected: other });
+    assert.equal(readFileSync(join(dir, '.project'), 'utf8'), `${other}\n`);
+  }
+});
+
+test('bindRepository gives way to a marker published while it held the old one', (t) => {
+  const dir = folder(t);
+  bindProject(dir, 'local/alpha/srv/app');
+  const r = bindRepository(dir, { identity: 'example.com/a/app', replaces: 'local/alpha/srv/app' }, {
+    beforeReplace: (marker) => writeFileSync(marker, 'example.com/b/app\n'),
+  });
+  assert.deepEqual(r, { ok: false, reason: 'mismatch', expected: 'example.com/b/app' });
+  assert.equal(readFileSync(join(dir, '.project'), 'utf8'), 'example.com/b/app\n');
+  assert.deepEqual(readdirSync(dir), ['.project']);
 });

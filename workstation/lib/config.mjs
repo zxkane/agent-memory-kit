@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve, sep } from 'node:path';
 import { BUCKET_RE, REGION_RE, ROLE_ARN_RE } from './aws-names.mjs';
 import { scanText } from './secret-scan.mjs';
 
-const HOST_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+export const HOST_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;

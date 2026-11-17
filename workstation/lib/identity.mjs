@@ -87,9 +87,10 @@ function publish(marker, dir, identity, link) {
 
 // Ties a project folder to the repository that owns it. The marker is an
 // ordinary file in the notes clone, so the binding travels with the sync.
-// A repository without an identity (no shareable `origin`) cannot be told apart
-// from another one with the same directory name, so it is refused. A refused
-// repository never creates the folder.
+// Without an identity a repository cannot be told apart from another one with the
+// same directory name, so it is refused (callers pass the machine-bound identity of a
+// repository without a shareable `origin`, see projectIdentity). A refused repository
+// never creates the folder.
 // `steps` lets tests act between the stages of a bind; `steps.link` replaces linkSync.
 export function bindProject(targetDir, identity, steps = {}) {
   if (identity === null) return { ok: false, reason: 'no-identity', expected: null };
@@ -116,4 +117,46 @@ export function bindProject(targetDir, identity, steps = {}) {
     return compare(current, identity);
   }
   return { ok: false, reason: 'mismatch', expected: null };
+}
+
+// Hands a marker that records `from` over to `to`. The marker is moved aside first, so of
+// several racing sessions only one holds it; content other than `from` is put back untouched
+// (a marker published in between wins). Returns the result for `to`, as bindProject does.
+function replaceMarker(targetDir, from, to, steps) {
+  const marker = join(targetDir, PROJECT_MARKER);
+  const link = steps.link ?? linkSync;
+  const claimed = join(targetDir, markerTempName());
+  try {
+    renameSync(marker, claimed);
+  } catch (err) {
+    if (err.code === 'ENOENT') return bindProject(targetDir, to, steps); // removed in between
+    throw err;
+  }
+  try {
+    if (readMarker(claimed) !== from) {
+      try {
+        placeWithoutReplacing(link, claimed, marker);
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      }
+      const current = readMarker(marker);
+      return current === null ? bindProject(targetDir, to, steps) : compare(current, to);
+    }
+    steps.beforeReplace?.(marker);
+    const created = publish(marker, targetDir, to, link);
+    const current = readMarker(marker);
+    if (created && current === to) return { ok: true, reason: 'replaced', expected: null };
+    return current === null ? bindProject(targetDir, to, steps) : compare(current, to);
+  } finally {
+    rmSync(claimed, { force: true });
+  }
+}
+
+// bindProject for a repository's `{ identity, replaces }` (see projectIdentity): a folder
+// bound with `replaces`, the machine-bound identity of this same directory, passes to
+// `identity`. A folder bound with anything else is refused as bindProject refuses it.
+export function bindRepository(targetDir, { identity, replaces = null }, steps = {}) {
+  const bound = bindProject(targetDir, identity, steps);
+  if (bound.ok || replaces === null || identity === null || bound.expected !== replaces) return bound;
+  return replaceMarker(targetDir, replaces, identity, steps);
 }

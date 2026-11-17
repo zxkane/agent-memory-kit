@@ -8,9 +8,9 @@ import { join } from 'node:path';
 import { isatty } from 'node:tty';
 import { loadConfig } from './lib/config.mjs';
 import { buildSessionContext, buildToolContext, logHookError } from './lib/context.mjs';
-import { bindProject } from './lib/identity.mjs';
+import { bindRepository } from './lib/identity.mjs';
 import { ensureLink } from './lib/link.mjs';
-import { memoryLinkPath, projectName, repoIdentity, repoRoot } from './lib/project.mjs';
+import { memoryLinkPath, projectIdentity, projectName, repoRoot } from './lib/project.mjs';
 import { readStatus } from './lib/sync-engine.mjs';
 
 const TOOLS = ['claude', 'codex', 'kiro'];
@@ -33,13 +33,16 @@ function claudeContext(config, input) {
   const project = root ? projectName(root) : null;
   let identity;
   let linkSkipped = null;
+  let localShare = null;
   if (repoOk && project) {
     const linkPath = memoryLinkPath(config.claudeDir, root);
     const targetDir = join(config.repoDir, 'projects', project);
-    const bound = bindProject(targetDir, repoIdentity(root));
+    const wanted = projectIdentity(root, config.host);
+    const bound = bindRepository(targetDir, wanted);
     if (bound.ok) {
       const linked = ensureLink({ linkPath, targetDir, host: config.host });
       if (linked.action === 'skipped') linkSkipped = linked.reason;
+      else if (wanted.replaces === null) localShare = wanted.identity;
     } else if (bound.reason === 'no-identity') {
       identity = { reason: bound.reason, expected: null, linked: false };
     } else if (bound.expected !== null) {
@@ -49,7 +52,7 @@ function claudeContext(config, input) {
     }
   }
   const additionalContext = buildSessionContext({
-    config, status: readStatus(config), project, repoOk, identity, unusableName: root !== null && project === null, linkSkipped,
+    config, status: readStatus(config), project, repoOk, identity, unusableName: root !== null && project === null, linkSkipped, localShare,
   });
   return `${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext } })}\n`;
 }
@@ -62,14 +65,17 @@ function toolContext(config, input) {
   let project = null;
   let reason = null;
   let expected = null;
+  let localShare = null;
   if (root === null) {
     reason = 'not-a-repository';
   } else if (name === null) {
     reason = 'unusable-name';
   } else if (repoOk) {
-    const bound = bindProject(join(config.repoDir, 'projects', name), repoIdentity(root));
+    const wanted = projectIdentity(root, config.host);
+    const bound = bindRepository(join(config.repoDir, 'projects', name), wanted);
     if (bound.ok) {
       project = name;
+      if (wanted.replaces === null) localShare = wanted.identity;
     } else if (bound.reason === 'no-identity') {
       reason = 'no-identity';
     } else {
@@ -77,7 +83,7 @@ function toolContext(config, input) {
       expected = bound.expected ?? null;
     }
   }
-  return buildToolContext({ config, status: readStatus(config), project, repoOk, reason, expected });
+  return buildToolContext({ config, status: readStatus(config), project, repoOk, reason, expected, localShare });
 }
 
 // Parsed stdin JSON, or undefined when stdin is a terminal (never waited for), missing,

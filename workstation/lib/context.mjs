@@ -172,11 +172,16 @@ function statusLines(config, status, now) {
   return lines;
 }
 
+// Said to a session whose repository has no shareable `origin` but whose notes are shared.
+const localShareLine = (identity) => `This repository has no shareable "origin" remote, so its project notes are shared under this machine's identity (${safeIdentity(identity)}); a directory with the same name on another machine is not linked to them.`;
+
 // The text a session sees at start. Never longer than `cap` characters.
 // `unusableName`: the directory is a repository whose name cannot be a project name.
 // `linkSkipped`: the reason ensureLink gave for not linking the memory folder, or null.
+// `localShare`: the machine-bound identity the folder was bound with, or null.
 export function buildSessionContext({
-  config, status, project, repoOk, identity, unusableName = false, linkSkipped = null, now = new Date(), cap = DEFAULT_CAP,
+  config, status, project, repoOk, identity, unusableName = false, linkSkipped = null, localShare = null,
+  now = new Date(), cap = DEFAULT_CAP,
 }) {
   const { repoDir } = config;
   if (!repoOk) {
@@ -194,6 +199,7 @@ export function buildSessionContext({
   if (identity?.reason === 'no-identity') {
     lines.push('This repository has no shareable "origin" remote, so its memory stays on this machine.');
   }
+  if (localShare !== null) lines.push(localShareLine(localShare));
   if (linkSkipped) {
     lines.push(`This repository's memory folder could not be linked (${safeLinkReason(linkSkipped)}), so its memory stays on this machine.`);
   }
@@ -290,7 +296,7 @@ function fitIndex(lines, path, allowance) {
 // exceeds `budget`.
 // `project`: the bound project name, or null; `reason` says why it is null.
 export function buildToolContext({
-  config, status, project, repoOk, reason = null, expected = null, now = new Date(), budget = TOOL_BUDGET,
+  config, status, project, repoOk, reason = null, expected = null, localShare = null, now = new Date(), budget = TOOL_BUDGET,
 }) {
   const { repoDir } = config;
   if (!repoOk) return withinBudget(unusableCloneWarning(repoDir), budget);
@@ -305,6 +311,7 @@ export function buildToolContext({
     'To remember a fact, add one Markdown file with `name`, `description` and `metadata.type` (user, feedback, project or reference) frontmatter, and one line for it in that folder\'s MEMORY.md. Open a note when its index line is relevant.',
   ];
   if (project === null && NO_PROJECT_REASONS[reason]) head.push(NO_PROJECT_REASONS[reason](expected));
+  if (project !== null && localShare !== null) head.push(localShareLine(localShare));
   head.push(...statusLines(config, status, now));
 
   const sections = [];

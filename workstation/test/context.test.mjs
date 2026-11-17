@@ -739,3 +739,21 @@ test('a bridge step with a lastSuccess that is not a valid time falls back to fa
   const neither = bridgeCase(t, BRIDGE_UP, { up: stepFailed('raced', { lastSuccess: future, failingSince: 'soon' }), down: null });
   assert.deepEqual(bridgeLines(buildSessionContext(neither.args)), ['WARNING: the memory bridge (to S3) has not succeeded since it was set up: raced.']);
 });
+
+const LOCAL_SHARE = 'This repository has no shareable "origin" remote, so its project notes are shared under this machine\'s identity (local/alpha/data/git/app); a directory with the same name on another machine is not linked to them.';
+
+test('a repository shared under this machine\'s identity is told so', (t) => {
+  const { base } = fixture(t);
+  const out = buildSessionContext({ ...base, localShare: 'local/alpha/data/git/app' });
+  assert.ok(out.split('\n').includes(LOCAL_SHARE));
+  assert.doesNotMatch(out, /stays on this machine/);
+  assert.match(buildSessionContext({ ...base, localShare: 'local/alpha/odd path' }), /machine's identity \(unknown\)/);
+});
+
+test('tool context: a project shared under this machine\'s identity is told so', (t) => {
+  const { tool } = toolFixture(t);
+  const lines = buildToolContext({ ...tool, localShare: 'local/alpha/data/git/app' }).split('\n');
+  assert.ok(lines.includes(LOCAL_SHARE));
+  assert.ok(lines.some((l) => l.startsWith('Project index')));
+  assert.ok(!buildToolContext({ ...tool, project: null, reason: 'mismatch', localShare: 'local/alpha/x' }).includes('machine\'s identity'));
+});

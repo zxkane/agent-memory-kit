@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { sanitizeSlug, repoRoot, projectName, memoryLinkPath, repoIdentity } from '../lib/project.mjs';
+import { sanitizeSlug, repoRoot, projectName, memoryLinkPath, repoIdentity, localIdentity, projectIdentity } from '../lib/project.mjs';
 import { isolateGit, tempDir, sh } from './helpers.mjs';
 
 isolateGit();
@@ -114,4 +114,20 @@ test('repoIdentity never lets part of a credential into the identity', (t) => {
     const got = repoIdentity(repoWithOrigin(t, url));
     assert.equal(got, want);
   }
+});
+
+test('localIdentity joins the host and the physical root, and refuses unusable parts', () => {
+  assert.equal(localIdentity('alpha', '/data/git/app'), 'local/alpha/data/git/app');
+  for (const [host, root] of [['Alpha', '/x'], ['', '/x'], [null, '/x'], ['alpha', 'x'], ['alpha', '/x\ny'], ['alpha', null]]) {
+    assert.equal(localIdentity(host, root), null, `${host} ${root}`);
+  }
+});
+
+test('projectIdentity is the machine-bound identity without origin and the origin that replaces it otherwise', (t) => {
+  for (const url of [null, '/srv/repos/x.git', 'file:///srv/repos/x.git']) {
+    const root = repoWithOrigin(t, url);
+    assert.deepEqual(projectIdentity(root, 'alpha'), { identity: `local/alpha${root}`, replaces: null }, String(url));
+  }
+  const root = repoWithOrigin(t, 'https://example.com/Owner/Repo.git');
+  assert.deepEqual(projectIdentity(root, 'alpha'), { identity: 'example.com/Owner/Repo', replaces: `local/alpha${root}` });
 });
