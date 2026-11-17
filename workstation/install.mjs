@@ -28,23 +28,23 @@ export function removeHooks(config) {
       if (rest.length === group.hooks.length) kept.push(group);
       else if (rest.length > 0) kept.push({ ...group, hooks: rest });
     }
-    if (kept.length > 0) hooks[event] = kept;
+    if (kept.length > 0 || groups.length === 0) hooks[event] = kept;
     else delete hooks[event];
   }
   return out;
 }
 
 // Removes every hook this kit added earlier, then appends the current two.
-export function mergeHooks(config, runShPath) {
+export function mergeHooks(config) {
   const out = removeHooks(config);
   const hooks = out.hooks && typeof out.hooks === 'object' ? out.hooks : {};
   hooks.SessionStart = [
     ...(hooks.SessionStart ?? []),
-    { hooks: [{ type: 'command', command: `"${runShPath}" session-start ${HOOK_MARKER}`, timeout: 20 }] },
+    { hooks: [{ type: 'command', command: toolCommand('claude'), timeout: 20 }] },
   ];
   hooks.PreToolUse = [
     ...(hooks.PreToolUse ?? []),
-    { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `"${runShPath}" pre-write ${HOOK_MARKER}`, timeout: 10 }] },
+    { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: launcherCommand('pre-write'), timeout: 10 }] },
   ];
   out.hooks = hooks;
   return out;
@@ -53,8 +53,12 @@ export function mergeHooks(config, runShPath) {
 // The hook command for Codex and Kiro. It reaches the kit through a launcher at a fixed path
 // under $HOME, so one hook file can be shared between machines, and is silent where the
 // launcher is absent.
+export function launcherCommand(args) {
+  return `r="$HOME/${LAUNCHER_REL}"; [ ! -x "$r" ] || "$r" ${args} ${HOOK_MARKER}`;
+}
+
 export function toolCommand(tool) {
-  return `r="$HOME/${LAUNCHER_REL}"; [ ! -x "$r" ] || "$r" session-start ${tool} ${HOOK_MARKER}`;
+  return launcherCommand(`session-start ${tool}`);
 }
 
 function codexEntry() {
@@ -362,8 +366,7 @@ export async function install({ home, kitDir, hooks = true }) {
   checkInstall({ home, hooks });
   const { settingsPath, exists, settings, mode, target } = readSettings(home);
 
-  const runSh = join(kitDir, 'workstation/run.sh');
-  const merged = hooks ? mergeHooks(settings, runSh) : removeHooks(settings);
+  const merged = hooks ? mergeHooks(settings) : removeHooks(settings);
   writeFileSync(join(kitDir, 'workstation/node.local.path'), `${process.execPath}\n`);
   // Without hooks, a settings file is neither created nor rewritten when nothing changes.
   if (hooks || (exists && JSON.stringify(merged) !== JSON.stringify(settings))) {

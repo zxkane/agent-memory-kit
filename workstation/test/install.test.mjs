@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HOOK_MARKER, LAUNCHER_REL, checkInstall, install, kiroHookDocument, mergeCodexHooks, mergeHooks, planInstall, removeHooks, toolCommand } from '../install.mjs';
+import { HOOK_MARKER, LAUNCHER_REL, checkInstall, install, kiroHookDocument, launcherCommand, mergeCodexHooks, mergeHooks, planInstall, removeHooks, toolCommand } from '../install.mjs';
 import { tempDir } from './helpers.mjs';
 
 const RUN = '/srv/kit/workstation/run.sh';
@@ -25,8 +25,8 @@ test('mergeHooks adds both hooks and keeps unrelated ones', () => {
   const after = mergeHooks({ model: 'x', hooks: { PreToolUse: [structuredClone(other)] } }, RUN);
   assert.equal(after.model, 'x');
   assert.deepEqual(after.hooks.PreToolUse[0], other);
-  assert.deepEqual(after.hooks.PreToolUse[1], { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `"${RUN}" pre-write # agent-memory-kit`, timeout: 10 }] });
-  assert.deepEqual(after.hooks.SessionStart, [{ hooks: [{ type: 'command', command: `"${RUN}" session-start # agent-memory-kit`, timeout: 20 }] }]);
+  assert.deepEqual(after.hooks.PreToolUse[1], { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: launcherCommand('pre-write'), timeout: 10 }] });
+  assert.deepEqual(after.hooks.SessionStart, [{ hooks: [{ type: 'command', command: toolCommand('claude'), timeout: 20 }] }]);
 });
 
 test('mergeHooks is idempotent and replaces entries from an older kit location', () => {
@@ -665,4 +665,19 @@ test('dangling links under the home directory count as linked and nothing is wri
       assert.doesNotThrow(() => planInstall({ home, hooks }), label);
     }
   }
+});
+
+
+test('Claude settings linked into a shared checkout contain only portable kit hooks', async (t) => {
+  const { home, kitDir, base } = fixture(t);
+  const settings = join(base, 'shared-settings.json'); writeFileSync(settings, '{}');
+  symlinkSync(settings, join(home, '.claude/settings.json'));
+  await install({ home, kitDir });
+  const text = readFileSync(settings, 'utf8');
+  assert.ok(text.includes('$HOME')); assert.ok(!text.includes(kitDir)); assert.ok(!text.includes(home));
+});
+
+
+test('hook merge preserves unrelated empty event arrays', () => {
+  assert.deepEqual(mergeHooks({ hooks: { Notification: [] } }).hooks.Notification, []);
 });

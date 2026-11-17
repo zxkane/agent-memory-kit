@@ -33,10 +33,10 @@ Nothing happens on a machine until `setup.sh --init` has written `~/.config/agen
 
 ## Requirements
 
-- Linux with systemd user units, and user lingering enabled (`loginctl enable-linger`) so that the timer also runs while you are not logged in
+- Linux with systemd user units and user lingering (`loginctl enable-linger`), or macOS with a logged-in graphical user session for LaunchAgents
 - Node.js 24 or later
 - Git 2.30 or later
-- `flock` (part of util-linux)
+- `flock` (util-linux on Linux; `brew install flock` on macOS)
 - A private Git repository that the machine can write to without a prompt (an SSH key or a credential helper)
 - Git and the credential helper must be reachable on the timer's `PATH`, which is `<directory of the Node.js binary>:/usr/local/bin:/usr/bin:/bin`. A credential helper installed elsewhere needs an absolute path in your Git configuration.
 
@@ -62,7 +62,7 @@ Also create an empty `global/MEMORY.md`, then commit and push so that the defaul
 
 ## Install
 
-Clone this repository somewhere permanent. The hooks and the timer call the scripts in this clone by absolute path, so do not move it afterwards without running setup again. The path must not contain a double quote, `$`, a backtick, `%`, a backslash, `#`, `?`, a space or a newline; the same holds for the directory of the Node.js binary.
+Clone this repository somewhere permanent. The hooks and the timer call the scripts in this clone by absolute path, so do not move it afterwards without running setup again. The path must not contain a double quote, `$`, a backtick, `%`, a backslash, `#`, `?`, a space (Linux only) or a newline; the same holds for the directory of the Node.js binary.
 
 ```
 git clone https://example.com/you/agent-memory-kit.git ~/agent-memory-kit
@@ -71,6 +71,8 @@ cd ~/agent-memory-kit
 ```
 
 `alpha` is a short name for this machine: lowercase letters, digits and hyphens, at most 31 characters, starting with a letter or digit. Use a different name on each machine.
+
+On macOS, setup uses LaunchAgents instead of systemd (see below).
 
 `setup.sh` checks everything first and writes nothing if a check fails:
 
@@ -92,6 +94,7 @@ Then it:
 Options:
 
 - `--dry-run` runs the checks, prints what would happen and changes nothing. For Codex and Kiro it says whether a file would be written, or left unchanged because it or its folder is a symbolic link, and, with `--no-hooks`, what would be removed.
+- `--prepare` prepares configuration, note clones and the state directory only. It leaves the launcher, hooks and scheduler files unchanged, so an onboarding wrapper can migrate and verify notes before activating the new kit.
 - `--no-enable` writes the units but does not enable the timers. (A timer whose schedule was removed is still disabled before its unit files are deleted.)
 - `--no-hooks` does everything else but does not register the Claude Code, Codex and Kiro hooks, and removes the kit's own hook entries if they are present. Running `setup.sh` later without the flag registers them.
 
@@ -105,6 +108,46 @@ workstation/run.sh migrate --apply
 ```
 
 Running `./setup.sh` again without `--init` is safe. Use it after moving the kit or upgrading Node.js.
+
+Claude Code hooks also call the stable launcher under `$HOME`, so settings linked
+into a shared dotfiles checkout contain no machine-specific installation paths.
+
+## macOS scheduling
+
+The same `setup.sh` command installs per-user LaunchAgents in
+`~/Library/LaunchAgents/io.github.agent-memory-kit.<scope>.plist`. Sync runs at
+login and every 120 seconds while logged in. The generated files contain this
+machine's actual home and Node.js paths; shell variables are not put in plist
+path fields. Homebrew and `~/.local/bin` are included in the jobs' PATH.
+
+`--dry-run` writes nothing and makes no launchctl calls. `--no-enable` writes the
+files without starting jobs. Setup can be repeated: unchanged loaded jobs are
+kept running, other jobs and unowned plists are preserved, and a changed job that
+is running must finish before setup can replace it. Removing a schedule removes
+only that scope's kit-owned LaunchAgent. Existing Linux units are not touched.
+
+Consolidation remains off without a `consolidate` block. macOS supports daily
+`*-*-* HH:MM` and weekly `Sun *-*-* HH:MM` (any three-letter weekday) schedules in
+**local time**, with optional `:00` seconds. Other systemd expressions, including
+UTC suffixes, are reported and their existing LaunchAgents are left unchanged.
+An invalid optional configuration block also leaves its jobs unchanged. A Mac
+that is asleep at a calendar time runs the coalesced calendar job when it wakes;
+there is no catch-up across shutdown or logout.
+
+Each job retains its latest output, with mode 600, in
+`~/.local/state/agent-memory/launchd-<scope>.log` (or the configured stateDir).
+Runs have the same limits as the Linux services: 120 seconds for sync, 300 for
+canary, and four hours for consolidation. A deadline or shutdown stops the child
+process group, including clients and Git processes.
+
+```sh
+launchctl print "gui/$(id -u)/io.github.agent-memory-kit.sync"
+cat ~/.local/state/agent-memory/status.json
+```
+
+Rerun setup after changing the kit location or Node.js installation. The Node.js
+API tests include macOS setup with a temporary home, notes remote and launchctl
+stub; no test loads a real user job.
 
 ## Move existing Claude Code memory
 
