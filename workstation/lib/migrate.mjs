@@ -5,9 +5,9 @@ import {
   closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { join, parse } from 'node:path';
-import { PROJECT_MARKER, bindProject } from './identity.mjs';
+import { PROJECT_MARKER, bindRepository } from './identity.mjs';
 import { ensureLink, hasNestedEntries, mergeIndex } from './link.mjs';
-import { projectName, repoIdentity, repoRoot, sanitizeSlug } from './project.mjs';
+import { projectIdentity, projectName, repoRoot, sanitizeSlug } from './project.mjs';
 import { scanText } from './secret-scan.mjs';
 
 const INDEX = 'MEMORY.md';
@@ -144,11 +144,12 @@ export function planMigration(config) {
     else if (root === null) item.reason = 'no-repository';
     else if (project === null) item.reason = 'unsafe-project-name';
     else {
-      const identity = repoIdentity(root);
+      const { identity, replaces } = projectIdentity(root, config.host);
       const recorded = recordedIdentity(join(config.repoDir, 'projects', project));
       if (identity === null) {
         item.reason = 'no-remote';
-      } else if ((recorded !== null && recorded !== identity) || (claimed.has(project) && claimed.get(project) !== identity)) {
+      } else if ((recorded !== null && recorded !== identity && recorded !== replaces)
+        || (claimed.has(project) && claimed.get(project) !== identity)) {
         item.reason = 'name-collision';
       } else {
         claimed.set(project, identity);
@@ -263,7 +264,7 @@ export function applyMigration(items, config, opts = {}) {
       continue;
     }
     const targetDir = join(config.repoDir, 'projects', item.project);
-    const bound = bindProject(targetDir, repoIdentity(item.root));
+    const bound = bindRepository(targetDir, projectIdentity(item.root, config.host));
     if (!bound.ok) {
       skip(bound.reason === 'no-identity' ? 'no-remote' : 'name-collision');
       continue;

@@ -107,10 +107,10 @@ test('a name collision is explained and a broken binding is a warning', (t) => {
     /WARNING: this repository's remote no longer matches the project its memory is linked to \(example\.com\/a\/app\)\./);
 });
 
-test('a repository without a shareable origin is told that its memory stays local', (t) => {
+test('a repository without any identity is told that its memory stays local', (t) => {
   const { base } = fixture(t);
   const out = buildSessionContext({ ...base, identity: { reason: 'no-identity', expected: null, linked: false } });
-  assert.match(out, /\nThis repository has no shareable "origin" remote, so its memory stays on this machine\.\n/);
+  assert.match(out, /\nThis repository has no shareable "origin" remote and its path cannot form a machine identity, so its memory stays on this machine\.\n/);
   assert.doesNotMatch(out, /not inside a Git repository/);
 });
 
@@ -213,7 +213,7 @@ test('tool context: empty and missing indexes print (empty)', (t) => {
 for (const [reason, expected, line] of [
   ['not-a-repository', null, 'This directory is not inside a Git repository, so it has no project notes.'],
   ['unusable-name', null, "This repository's directory name cannot be used as a project name, so it has no project notes."],
-  ['no-identity', null, 'This repository has no shareable "origin" remote, so it has no project notes.'],
+  ['no-identity', null, 'This repository has no shareable "origin" remote and its path cannot form a machine identity, so it has no project notes.'],
   ['mismatch', 'x'.repeat(300), `This repository shares its name with another project in shared memory (${'x'.repeat(200)}), so it has no project notes.`],
   ['mismatch', null, 'This repository shares its name with another project in shared memory, so it has no project notes.'],
 ]) {
@@ -738,4 +738,22 @@ test('a bridge step with a lastSuccess that is not a valid time falls back to fa
   assert.deepEqual(bridgeLines(buildSessionContext(young.args)), []);
   const neither = bridgeCase(t, BRIDGE_UP, { up: stepFailed('raced', { lastSuccess: future, failingSince: 'soon' }), down: null });
   assert.deepEqual(bridgeLines(buildSessionContext(neither.args)), ['WARNING: the memory bridge (to S3) has not succeeded since it was set up: raced.']);
+});
+
+const LOCAL_SHARE = 'This repository has no shareable "origin" remote, so its project notes are shared under this machine\'s identity (local/alpha/data/git/app); a directory with the same name on another machine is not linked to them.';
+
+test('a repository shared under this machine\'s identity is told so', (t) => {
+  const { base } = fixture(t);
+  const out = buildSessionContext({ ...base, localShare: 'local/alpha/data/git/app' });
+  assert.ok(out.split('\n').includes(LOCAL_SHARE));
+  assert.doesNotMatch(out, /stays on this machine/);
+  assert.match(buildSessionContext({ ...base, localShare: 'local/alpha/odd path' }), /machine's identity \(unknown\)/);
+});
+
+test('tool context: a project shared under this machine\'s identity is told so', (t) => {
+  const { tool } = toolFixture(t);
+  const lines = buildToolContext({ ...tool, localShare: 'local/alpha/data/git/app' }).split('\n');
+  assert.ok(lines.includes(LOCAL_SHARE));
+  assert.ok(lines.some((l) => l.startsWith('Project index')));
+  assert.ok(!buildToolContext({ ...tool, project: null, reason: 'mismatch', localShare: 'local/alpha/x' }).includes('machine\'s identity'));
 });

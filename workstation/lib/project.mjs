@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { HOST_RE } from './config.mjs';
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -74,4 +75,24 @@ export function repoIdentity(root) {
   } catch {
     return null;
   }
+}
+
+
+// Identity of a repository without a shareable `origin`: this machine's name and the
+// repository's physical root. Its notes are shared like any others (the other machines and
+// the hub read them), but only this directory on this machine binds the folder, so a
+// directory with the same name elsewhere is kept apart. Null when either part is unusable.
+export function localIdentity(host, root) {
+  if (typeof host !== 'string' || !HOST_RE.test(host)) return null;
+  if (typeof root !== 'string' || !root.startsWith('/') || /[\u0000-\u001f\u007f]/.test(root)) return null;
+  return `local/${host}${root}`;
+}
+
+// The identity a repository binds its project folder with (`identity`), and the
+// machine-bound identity that it takes over (`replaces`): a repository that gains a shareable
+// `origin` keeps the folder it bound before it had one. Never throws.
+export function projectIdentity(root, host) {
+  const local = localIdentity(host, root);
+  const remote = repoIdentity(root);
+  return remote === null ? { identity: local, replaces: null } : { identity: remote, replaces: local };
 }
