@@ -53,6 +53,9 @@ function run(script, input, env, args = []) {
 
 const errorLines = (state) => readFileSync(join(state, 'hook-errors.log'), 'utf8').trim().split('\n');
 
+// The session-start sentence on where notes go (TC-WRITE-ROUTE-*).
+const writeRoute = (what, folders, these) => `On this machine, write ${what} as files in ${folders}, not with the memory API's write tool (memory_write): what it writes goes to agents/<agent>/ in the memory API's store and never appears in ${these}.`;
+
 test('session-start is silent without a config', (t) => {
   const f = fixture(t, { enabled: false });
   const r = run('session-start.mjs', { cwd: f.worktree }, f.env);
@@ -68,6 +71,8 @@ test('session-start links the memory folder and returns context', (t) => {
   const out = JSON.parse(r.stdout);
   assert.equal(out.hookSpecificOutput.hookEventName, 'SessionStart');
   assert.match(out.hookSpecificOutput.additionalContext, /^Shared memory is on\./);
+  // TC-WRITE-ROUTE-003: Claude Code is told to write files, not to use the memory API.
+  assert.ok(out.hookSpecificOutput.additionalContext.split('\n').includes(writeRoute('notes', `your memory directory or ${f.repo}/global/`, 'these folders')));
   assert.equal(realpathSync(f.link), realpathSync(join(f.repo, 'projects', basename(f.mainRoot))));
 });
 
@@ -522,11 +527,15 @@ test('session-start in a repository whose directory name is not a usable project
   assert.equal(existsSync(join(f.repo, 'projects')), false);
 });
 
+// TC-WRITE-ROUTE-001/002: the session is told to write files into the project folder or global/.
+const toolWriteRoute = (f) => writeRoute('notes', `${f.repo}/projects/example-repo/ or ${f.repo}/global/`, 'these folders');
+
 function assertToolText(r, f) {
   assert.equal(r.status, 0);
   assert.match(r.stdout, /^Shared memory is on\./);
   assert.match(r.stdout, /Project index \(/);
   assert.match(r.stdout, /Global index \(/);
+  assert.ok(r.stdout.split('\n').includes(toolWriteRoute(f)), 'the write-route sentence names the project folder');
   assert.throws(() => JSON.parse(r.stdout));
   assert.equal(readFileSync(join(f.repo, 'projects', 'example-repo', '.project'), 'utf8'), 'example.com/a/example-repo\n');
   assert.equal(existsSync(f.claudeDir), false);
@@ -552,6 +561,7 @@ test('session-start codex outside a repository', (t) => {
   const r = run('session-start.mjs', { cwd: f.tmp }, f.env, ['codex']);
   assert.equal(r.status, 0);
   assert.match(r.stdout, /This directory is not inside a Git repository, so it has no project notes\./);
+  assert.ok(r.stdout.split('\n').includes(writeRoute('facts that apply across projects', `${f.repo}/global/`, 'this folder')));
   assert.doesNotMatch(r.stdout, /Project index \(/);
   assert.equal(existsSync(join(f.repo, 'projects')), false);
 });

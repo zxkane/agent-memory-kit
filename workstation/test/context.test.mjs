@@ -19,14 +19,35 @@ function fixture(t) {
   return { tmp, repo, cfg, fresh, base, writeGlobal };
 }
 
-test('healthy state prints the two fixed lines and the global index', (t) => {
+// The sentence that tells a session on a synced machine where notes go (TC-WRITE-ROUTE-*).
+const writeRoute = (folders, what = 'notes') => `On this machine, write ${what} as files in ${folders}, not with the memory API's write tool (memory_write): what it writes goes to agents/<agent>/ in the memory API's store and never appears in ${folders.includes(' or ') ? 'these folders' : 'this folder'}.`;
+const crossProject = (repo) => writeRoute(`${repo}/global/`, 'facts that apply across projects');
+
+test('healthy state prints the three fixed lines and the global index', (t) => {
   const { repo, base, writeGlobal } = fixture(t);
   writeGlobal('- [Prefs](prefs.md) — keep replies short\n');
   assert.equal(buildSessionContext(base), [
     `Shared memory is on. Notes under ${repo} are synced between machines every few minutes.`,
     `Facts that apply across projects belong in ${repo}/global/, in the same format as project memory: one fact per file plus one line in MEMORY.md.`,
+    writeRoute(`your memory directory or ${repo}/global/`),
     'Global index:', '- [Prefs](prefs.md) — keep replies short', '',
   ].join('\n'));
+});
+
+test('TC-WRITE-ROUTE-003: every Claude Code session is told to write files, not to use the memory API', (t) => {
+  const { repo, base } = fixture(t);
+  const want = writeRoute(`your memory directory or ${repo}/global/`);
+  for (const args of [
+    base,
+    { ...base, project: null },
+    { ...base, project: null, unusableName: true },
+    { ...base, linkSkipped: 'nested-entries' },
+    { ...base, identity: { reason: 'mismatch', expected: 'example.com/a/app', linked: false } },
+    { ...base, localShare: 'local/alpha/data/git/app' },
+  ]) {
+    assert.equal(buildSessionContext(args).split('\n').filter((l) => l === want).length, 1);
+  }
+  assert.doesNotMatch(buildSessionContext({ ...base, repoOk: false }), /memory_write/);
 });
 
 test('a missing global index prints (empty)', (t) => {
@@ -196,6 +217,7 @@ test('tool context: project and global index, exact text', (t) => {
     `Shared memory is on. Notes under ${repo} are synced between machines every few minutes.`,
     `Project notes for this repository: ${repo}/projects/p/ — notes for all projects: ${repo}/global/.`,
     'To remember a fact, add one Markdown file with `name`, `description` and `metadata.type` (user, feedback, project or reference) frontmatter, and one line for it in that folder\'s MEMORY.md. Open a note when its index line is relevant.',
+    writeRoute(`${repo}/projects/p/ or ${repo}/global/`),
     `Project index (${repo}/projects/p/MEMORY.md):`,
     '- [A](a.md) — alpha',
     `Global index (${repo}/global/MEMORY.md):`,
@@ -222,11 +244,33 @@ for (const [reason, expected, line] of [
     writeGlobal('- g\n');
     const lines = buildToolContext({ ...base, project: null, reason, expected }).split('\n');
     assert.equal(lines[1], `Notes for all projects: ${repo}/global/.`);
-    assert.equal(lines[3], line);
+    assert.equal(lines[3], crossProject(repo));
+    assert.equal(lines[4], line);
     assert.ok(!lines.some((l) => l.startsWith('Project index')));
-    assert.equal(lines[4], `Global index (${repo}/global/MEMORY.md):`);
+    assert.equal(lines[5], `Global index (${repo}/global/MEMORY.md):`);
   });
 }
+
+test('TC-WRITE-ROUTE-001: in a bound repository the tool text names projects/<name>/ and global/', (t) => {
+  const { repo, tool } = toolFixture(t);
+  const lines = buildToolContext(tool).split('\n');
+  assert.deepEqual(lines.filter((l) => l.includes('memory_write')), [writeRoute(`${repo}/projects/p/ or ${repo}/global/`)]);
+  const shared = buildToolContext({ ...tool, localShare: 'local/alpha/data/git/app' }).split('\n');
+  assert.ok(shared.includes(writeRoute(`${repo}/projects/p/ or ${repo}/global/`)));
+});
+
+test('TC-WRITE-ROUTE-004: outside a repository the sentence names global/; a long index still fits the budget', (t) => {
+  const { repo, base, writeGlobal } = toolFixture(t);
+  writeGlobal(bulk(400, 'x'.repeat(58)));
+  const out = buildToolContext({ ...base, project: null, reason: 'not-a-repository' });
+  const lines = out.split('\n');
+  assert.ok(lines.includes(crossProject(repo)));
+  assert.ok(!out.includes(`${repo}/projects/`));
+  assert.ok(out.endsWith(`[truncated; full index: ${repo}/global/MEMORY.md]\n`));
+  // The sentence is fixed text: the index still fills the budget up to less than one more line.
+  assert.ok(textCost(out) <= TOOL_BUDGET);
+  assert.ok(TOOL_BUDGET - textCost(out) < 64, `left ${TOOL_BUDGET - textCost(out)}`);
+});
 
 test('tool context: repo not usable', (t) => {
   const { base } = toolFixture(t);

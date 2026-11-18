@@ -175,6 +175,11 @@ function statusLines(config, status, now) {
 // Said to a session whose repository has no shareable `origin` but whose notes are shared.
 const localShareLine = (identity) => `This repository has no shareable "origin" remote, so its project notes are shared under this machine's identity (${safeIdentity(identity)}); a directory with the same name on another machine is not linked to them.`;
 
+// Said to every session on a synced machine: notes are files in the clone. A note written through
+// the memory API's write tool lands in agents/<agent>/ in the API's store instead, so it never
+// reaches these folders and is never consolidated. `what` is what to write, `folders` where.
+const writeRouteLine = (what, folders) => `On this machine, write ${what} as files in ${folders.join(' or ')}, not with the memory API's write tool (memory_write): what it writes goes to agents/<agent>/ in the memory API's store and never appears in ${folders.length === 1 ? 'this folder' : 'these folders'}.`;
+
 // The text a session sees at start. Never longer than `cap` characters.
 // `unusableName`: the directory is a repository whose name cannot be a project name.
 // `linkSkipped`: the reason ensureLink gave for not linking the memory folder, or null.
@@ -190,6 +195,7 @@ export function buildSessionContext({
   const lines = [
     `Shared memory is on. Notes under ${repoDir} are synced between machines every few minutes.`,
     `Facts that apply across projects belong in ${repoDir}/global/, in the same format as project memory: one fact per file plus one line in MEMORY.md.`,
+    writeRouteLine('notes', ['your memory directory', `${repoDir}/global/`]),
   ];
   if (project === null) {
     lines.push(unusableName
@@ -309,6 +315,10 @@ export function buildToolContext({
       ? `Notes for all projects: ${repoDir}/global/.`
       : `Project notes for this repository: ${repoDir}/projects/${project}/ — notes for all projects: ${repoDir}/global/.`,
     'To remember a fact, add one Markdown file with `name`, `description` and `metadata.type` (user, feedback, project or reference) frontmatter, and one line for it in that folder\'s MEMORY.md. Open a note when its index line is relevant.',
+    // Without a project folder only cross-project facts have a place; project facts must not land in global/.
+    project === null
+      ? writeRouteLine('facts that apply across projects', [`${repoDir}/global/`])
+      : writeRouteLine('notes', [`${repoDir}/projects/${project}/`, `${repoDir}/global/`]),
   ];
   if (project === null && NO_PROJECT_REASONS[reason]) head.push(NO_PROJECT_REASONS[reason](expected));
   if (project !== null && localShare !== null) head.push(localShareLine(localShare));
