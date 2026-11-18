@@ -100,7 +100,7 @@ test('consolidate block is returned with given values', (t) => {
     maxTranscriptBytes: 50000, maxTurns: 10, maxBudgetUsd: 1.5, timeoutMinutes: 12,
   };
   write({ ...BASE, consolidate: block });
-  assert.deepEqual(loadConfig(env).consolidate, block);
+  assert.deepEqual(loadConfig(env).consolidate, { ...block, agents: null });
 });
 
 test('consolidate defaults are filled', (t) => {
@@ -108,7 +108,7 @@ test('consolidate defaults are filled', (t) => {
   write({ ...BASE, consolidate: { command: '/bin/m', model: 'm1' } });
   assert.deepEqual(loadConfig(env).consolidate, {
     command: '/bin/m', model: 'm1', env: {}, extract: null, organize: null,
-    maxProjects: 5, maxTranscriptBytes: 200000, maxTurns: 200, maxBudgetUsd: 5, timeoutMinutes: 30,
+    maxProjects: 5, maxTranscriptBytes: 200000, maxTurns: 200, maxBudgetUsd: 5, timeoutMinutes: 30, agents: null,
   });
 });
 
@@ -218,8 +218,44 @@ test('item 4: a key the consolidate block does not know makes it invalid, naming
     maxProjects: 2, maxTranscriptBytes: 20000, maxTurns: 20, maxBudgetUsd: 2, timeoutMinutes: 20,
   };
   write({ ...BASE, consolidate: every });
-  assert.deepEqual(loadConfig(env).consolidate, every);
+  assert.deepEqual(loadConfig(env).consolidate, { ...every, agents: null });
   assert.equal(loadConfig(env).consolidateProblem, null);
+});
+
+const AGENTS_OK = { bucket: 'example-bucket', region: 'ap-northeast-1' };
+const ORGANIZER_ARN = 'arn:aws:iam::123456789012:role/agent-memory-prod-organizer';
+
+test('the agents part of the consolidate block names the bucket of the agent scopes', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  write({ ...BASE, consolidate: { ...ok, agents: AGENTS_OK } });
+  assert.deepEqual(loadConfig(env).consolidate.agents, { ...AGENTS_OK, roleArn: null, credentials: 'instance' });
+  const full = { ...AGENTS_OK, roleArn: ORGANIZER_ARN, credentials: 'environment' };
+  write({ ...BASE, consolidate: { ...ok, agents: full } });
+  assert.deepEqual(loadConfig(env).consolidate.agents, full);
+  write({ ...BASE, consolidate: { ...ok, agents: null } });
+  assert.equal(loadConfig(env).consolidate.agents, null);
+});
+
+test('an invalid agents part makes the consolidate block invalid, naming its field', (t) => {
+  const { env, write } = setup(t);
+  const ok = { command: '/bin/m', model: 'm1' };
+  for (const [agents, problem] of [
+    ['bucket', 'agents'],
+    [[AGENTS_OK], 'agents'],
+    [{}, 'agents.bucket'],
+    [{ ...AGENTS_OK, bucket: 'Bad_Bucket' }, 'agents.bucket'],
+    [{ ...AGENTS_OK, region: 'tokyo' }, 'agents.region'],
+    [{ ...AGENTS_OK, roleArn: 'arn:aws:iam::123456789012:user/someone' }, 'agents.roleArn'],
+    [{ ...AGENTS_OK, credentials: 'file' }, 'agents.credentials'],
+    [{ ...AGENTS_OK, buckett: 'x' }, 'agents.buckett'],
+    [{ ...AGENTS_OK, ['AKIA' + 'ABCDEFGHIJKLMNOP']: 'x' }, 'agents.(an unknown key)'],
+  ]) {
+    write({ ...BASE, consolidate: { ...ok, agents } });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.consolidate, null, problem);
+    assert.equal(cfg.consolidateProblem, problem);
+  }
 });
 
 const BRIDGE_OK = {

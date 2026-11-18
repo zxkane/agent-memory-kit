@@ -154,6 +154,41 @@ export function bridgeRolePolicy(bucketArn: string): PolicyDocument {
   };
 }
 
+/**
+ * The organizer role's whole permission set: the agent scopes (`agents/*`), their search snapshot
+ * (`index/agents.json`) and the job's own record (`index/organizer.json`), for
+ * `run.sh consolidate organize --agents`. Every put and every delete must carry a precondition
+ * header (If-Match, or If-None-Match for a key that must not exist yet); the policy does not check
+ * its value, so it stops blind writes and deletes, not a holder of the role (the narrow trust does
+ * that). The job sends the ETag of the version it copied, so it never overwrites or deletes a note
+ * that an agent wrote meanwhile. A delete with an ETag also needs s3:GetObject. Nothing under `mem/`,
+ * and no other `index/` key: a read of a missing record answers 403 (no list permission there),
+ * which the job treats as missing.
+ */
+export function organizerRolePolicy(bucketArn: string): PolicyDocument {
+  const keys = [`${bucketArn}/agents/*`, `${bucketArn}/index/agents.json`, `${bucketArn}/index/organizer.json`];
+  return {
+    Version: '2012-10-17',
+    Statement: [
+      { Effect: 'Allow', Action: ['s3:GetObject'], Resource: keys },
+      { Effect: 'Allow', Action: ['s3:PutObject'], Resource: keys, Condition: { Null: { 's3:if-match': 'false' } } },
+      { Effect: 'Allow', Action: ['s3:PutObject'], Resource: keys, Condition: { Null: { 's3:if-none-match': 'false' } } },
+      {
+        Effect: 'Allow',
+        Action: ['s3:DeleteObject'],
+        Resource: [`${bucketArn}/agents/*`],
+        Condition: { Null: { 's3:if-match': 'false' } },
+      },
+      {
+        Effect: 'Allow',
+        Action: ['s3:ListBucket'],
+        Resource: [bucketArn],
+        Condition: { StringLike: { 's3:prefix': ['agents/*'] } },
+      },
+    ],
+  };
+}
+
 /** The canary role's whole permission set: read exactly the parameters its checks use. */
 export function canaryRolePolicy(parameterArns: string[]): PolicyDocument {
   return {

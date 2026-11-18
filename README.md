@@ -234,7 +234,7 @@ There are two jobs, each run per folder of notes (a "scope": one project folder,
 - **Extract** reads the recent conversations of one project, from Claude Code and from Codex, and corrects or adds notes for what they show. It works on project folders only, never on `global/`, and it never retires a note.
 - **Organize** tidies a folder: it merges notes that say the same thing, repairs frontmatter that is missing or broken (a complete frontmatter block is left alone, and its `name` need not equal the file name), marks facts that cannot both be true, turns relative dates into absolute ones, and keeps `MEMORY.md` complete and within 200 lines and 25,000 bytes. When the index is over its limit, that comes first: the model is shown the current size and asked to shorten the hooks before it merges notes. It never translates: every fact stays in the language it is written in. For a project it also sees `global/`, as a destination only: it may move a note about the person there, but the notes already in `global/` are organized only by a run on the `global` scope (see the rules below). It may retire a note (see below).
 
-Both are started with `workstation/run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]`.
+Both are started with `workstation/run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]`. The scopes that agents write through the memory API have an Organize run of their own (see "The agent scopes of the memory API").
 
 ### How a run is kept safe
 
@@ -289,6 +289,7 @@ Add a `consolidate` block to `~/.config/agent-memory/config.json`. `command` and
 | `maxTurns` | 200 | Turns the model may take for one scope, 1 to 1000. |
 | `maxBudgetUsd` | 5 | Spending limit for one scope, a number above 0 and at most 100. It is passed to the client as the client's own limit, which may be overshot slightly. |
 | `timeoutMinutes` | 30 | Time limit for one scope, 1 to 240. The driver stops the client when it is reached. A repair run has the same limit again, so a scope with a repair run can take twice as long. |
+| `agents` | absent | Where the Organize run for agent scopes finds them (`bucket`, `region`, optional `roleArn` and `credentials`); see "The agent scopes of the memory API". |
 
 The cost is bounded three ways: at most `maxProjects` scopes per run, at most `maxBudgetUsd` for each (a repair run gets what is left of it, so one scope's two runs together stay within it), and a ceiling for the whole run of `maxProjects` times `maxBudgetUsd`, or, for a run that names its projects with `--project`, the number of named projects times `maxBudgetUsd` (a scope whose cost is not reported counts at its full limit). The ceiling is checked between scopes, so a scope that overshoots its own limit is not cut off by it. When the ceiling is reached the run stops with a message and the remaining scopes wait for the next run. Start with a dry run on one project (see "Try it first").
 
@@ -399,6 +400,96 @@ An Organize run you revert will be done again: the folder's content then differs
 ### What was tested
 
 What was checked: the options the driver passes were checked against Claude Code's command-line client in its restricted mode, with a full model ID. The test suite runs the whole pipeline against a stand-in for the model, not a real one. A run with a real model and your notes is your own dry run (see "Try it first"): do it before you enable a timer, and check that the report shows `denials: 0`. A model alias (a short name such as a family name) may not resolve in restricted mode, so put the full ID in `model`. Another client needs to accept the same options: `-p`, `--restricted`, `--tools`, `--permission-mode acceptEdits`, `--permission-prompts none`, `--strict-mcp-config`, `--no-session-persistence`, `--output-format json`, `--model`, `--max-turns`, `--max-budget-usd` and `--add-dir`, and report its cost and turns in the JSON result.
+
+### The agent scopes of the memory API
+
+Notes that agents write through the memory API (`agents/<agent>/` in the bucket, see "Memory API") are not in the notes clone, so the runs above never see them. `workstation/run.sh consolidate organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]` organizes those scopes with the same model, prompt and rules as Organize: it merges duplicates, repairs frontmatter, keeps `MEMORY.md` complete and within 200 lines and 25,000 bytes, retires a note only into an existing target, checks content retention and refuses credentials. Facts about one project stay in the agent's scope: an agent note carries no `.project`, so the run does not move it into `projects/<name>/`. Nothing about it runs until the `consolidate` block has an `agents` part, and no timer starts it: it runs where it can reach the bucket with the organizer role (below), for example in a GitHub Actions job.
+
+```json
+{
+  "consolidate": {
+    "command": "/path/to/claude",
+    "model": "<model-id>",
+    "agents": { "bucket": "<bucket-name>", "region": "<region>", "credentials": "environment" }
+  }
+}
+```
+
+| Field of `agents` | Default | Meaning and rules |
+|---|---|---|
+| `bucket` | required | The deployment's bucket (`bucket/name` in its SSM parameters), with the same rule as the bridge's. |
+| `region` | required | The bucket's region. |
+| `roleArn` | absent | ARN of the organizer role, when the credentials of `credentials` are not already that role's: each S3 step exchanges them (STS `AssumeRole`, session `agent-memory-organizer`, 15 minutes). |
+| `credentials` | `instance` | `instance` (the instance metadata service) or `environment` (the temporary credentials of a GitHub Actions job), as for the bridge; never both, no fallback. |
+
+A value that breaks a rule makes the whole `consolidate` block invalid, named `agents.<field>`, as for the block's own fields.
+
+How such a run is kept safe:
+
+1. The scope's notes are copied from the bucket into a folder beside the work folder, outside the folders the model client may use, and from there into the work folder. The model works on the copy with file tools only, as in Organize, and the client's environment holds none of the run's AWS credentials. Those two limits are the client's own restriction to its folders and the environment the driver gives it: any other process of the same user can read the driver's environment, credentials included, so run the job where nothing else runs as that user (a GitHub Actions runner of its own, for example). A scope holding an object of more than 1,000,000 bytes, which the API cannot have written, is `skipped`, and the run goes on with the next scope.
+2. The result must pass Organize's rules and the memory API's own: every changed or new note has a one-line description of 1 to 300 characters, a `metadata.type` of user, feedback, project or reference and 1 to 50,000 bytes of text after the frontmatter; a new note's file name is a lower-case slug of up to 80 characters other than `memory`; the scope keeps at most 200 notes and 240,000 bytes in the search snapshot, which stays under 4,000,000 bytes. A rejected result gets the same one repair run as in Organize.
+3. Applying follows the API's order. First the scope is listed again: when any of its notes changed since the copy (an agent wrote one), nothing is applied (`changed-meanwhile`). Then the search snapshot `index/agents.json` is updated in one conditional write, which checks the scope's entries against the copy once more and gives the scope one entry per note of the result; from here on the result counts as applied. Then each changed note is written only over the version that was copied (If-Match) and each new one only where none exists (If-None-Match). Only after that are retired notes deleted, each only in the version that was copied, and only while the note it went to holds what this run wrote there: a retired note whose target an agent wrote again, or that the run could not write, stays (*`<file>` was not retired: the note it went to does not hold what this run wrote*), so its content is always in at least one note. Last, `MEMORY.md` gets the result's index, with any line that an agent wrote meanwhile carried over and a line for every retired note that is still in the bucket. A note that an agent writes again after the snapshot update keeps the agent's version (*an agent wrote `<file>` again meanwhile; its version was kept*); its search entry is then read back from the bucket, and the scope stays due, because the model never saw that version.
+4. When the scope's search entries do not describe its notes (an API write or a run that stopped part-way), a run rewrites them from the notes, also when the model changed nothing or its result was rejected (*the search entries of the scope did not match its notes and were rewritten from them*); the notes themselves are not written then. Every text the run writes is read once and must be the one the rules checked.
+5. `--dry-run` reports the result and writes nothing to the bucket, not even the run's record.
+
+**Which scopes, and the record.** A scope with notes is due when its notes changed since a run organized it, or when none ever did; the one whose model was started longest ago goes first (never started first). A run takes at most `maxProjects` scopes and spends at most `maxBudgetUsd` on each, as Organize does; `--agent <name>` names scopes and takes them whatever their state. The record of what was organized lives in the bucket, as `index/organizer.json`, so that a job that keeps no state between runs (such as a GitHub Actions job) does not organize the same notes again: each scope's last organize, the digest of its notes then (the ETags of its objects), when its model was last started, and its last outcome. The marks move as for Organize: after `applied`, `no-change`, and `rejected` when the model completed; the digest recorded after `applied` is that of the notes as the run left them, so a note an agent wrote meanwhile keeps the scope due. A `skipped` scope moves to the back of the queue.
+
+**Output and outcomes.** Each scope prints `organize agents/<agent>: <outcome>, ...` with the same outcomes and exit codes as Organize; the report is printed (there is no notes clone to commit it to). An error of an S3 step before the snapshot update applied nothing (`error`); one after it may have left part of the result in the bucket (`apply-interrupted`), and the next run finds the scope changed and organizes it again.
+
+**The bucket is not versioned**: a note that a run deleted or replaced has no earlier copy in the bucket. The agents repository keeps one when bridge down copied it before the run (see "Down: the agents repository is a mirror"); its next run mirrors the result, so a retired note disappears from the repository too, and its history keeps the old file. To bring a note back, write it again through the API's `memory_write`.
+
+**Where it runs.** Run it in one place only, where the organizer role can be assumed: with `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS` a GitHub Actions job of the listed repository and branch; with `AGENT_MEMORY_ORGANIZER_ROLE_ARNS` a machine whose instance role is listed (`credentials: "instance"` and `roleArn`). A machine without the organizer role cannot run it, and a pull-only bridge machine needs nothing of it. The job's model client needs credentials for its model service of its own; never give it the job's AWS credentials, which may delete agent notes. In a GitHub Actions job the credentials of the login step last at most the role's hour and are not renewed, so let a run fit into it: for example one scope per run (`maxProjects: 1`) and a `timeoutMinutes` that leaves room for a repair run. A step that starts with expired credentials fails before anything is written.
+
+```yaml
+name: agent-memory organize agent scopes
+on:
+  schedule:
+    - cron: '17 6 * * 0'
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: agent-memory-organize-agents
+  cancel-in-progress: false
+jobs:
+  organize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AGENT_MEMORY_BUCKET: ${{ vars.AGENT_MEMORY_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5          # the kit, at a commit you have reviewed
+        with:
+          repository: <owner>/agent-memory-kit
+          ref: <commit>
+          path: kit
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install the model client
+        run: <install the model client and give it credentials for its model service>
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ORGANIZER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 3600
+      - name: Write the configuration
+        run: |
+          jq -n --arg state "$RUNNER_TEMP/agent-memory-state" --arg unused "$RUNNER_TEMP/no-notes-clone" \
+            --arg command "<absolute path of the model client>" --arg bucket "$AGENT_MEMORY_BUCKET" --arg region "$AWS_REGION" \
+            '{enabled: true, host: "github-actions", repoDir: $unused, stateDir: $state,
+              consolidate: {command: $command, model: "<model-id>", maxProjects: 1, timeoutMinutes: 25,
+                            agents: {bucket: $bucket, region: $region, credentials: "environment"}}}' \
+            > "$RUNNER_TEMP/agent-memory.json"
+      - name: Organize the agent scopes
+        env:
+          AGENT_MEMORY_CONFIG: ${{ runner.temp }}/agent-memory.json
+        run: bash kit/workstation/run.sh consolidate organize --agents
+```
+
+The run needs no notes clone (`repoDir` must only be an absolute path); the client's own settings go into the block's `env`. Try it first with `--dry-run --keep` and read the kept work folder, as for Organize.
 
 ## Bridge to S3 and the agents repository (optional)
 
@@ -869,7 +960,7 @@ The notes in the bucket are meant to be a replica of the workstation notes. The 
 
   `path` is the note's path in the client-scope form that `memory_read` takes (`global/<file>.md` or `projects/<project>/<file>.md`, without the `mem/` prefix). `MEMORY.md` files are not listed. Entries outside `global/` and `projects/` are ignored.
 
-The API writes the matching agent-side objects itself: `agents/<agent>/<name>.md`, `agents/<agent>/MEMORY.md` and `index/agents.json`.
+The API writes the matching agent-side objects itself: `agents/<agent>/<name>.md`, `agents/<agent>/MEMORY.md` and `index/agents.json`. The only other writer of these is the Organize run for agent scopes (see "The agent scopes of the memory API"), which also keeps its record in `index/organizer.json`.
 
 ### Operations
 
@@ -887,12 +978,12 @@ A deployment given `AGENT_MEMORY_INVOKER_ROLE_ARNS` (see "Deploy") serves the sa
 
 ### Limits and trust
 
-- The API reads a replica of the workstation notes and can write only under `agents/<agent>/`. It has no delete operation.
+- The API reads a replica of the workstation notes and can write only under `agents/<agent>/`. It has no delete operation. Agent scopes are tidied, and notes deleted, only by the Organize run for agent scopes, with a role of its own (see "The agent scopes of the memory API").
 - The API cannot tell callers apart. The gateway presents one machine identity, so any caller the gateway lets use `memory_write` can write to any agent's scope, including replacing another agent's note. Which callers may use which tool is the gateway's job. The bucket is not versioned, so a note that is replaced is gone from the bucket. The notes under `mem/` are a copy of the notes repository and can always be uploaded again. The agents' notes are copied into the second repository only when the bridge's down step runs (it is optional; see "Mirror the agent notes (mirror repository)"): without it there is no other copy of `agents/`, and even with it a note that is replaced before the next run was never copied and cannot be recovered.
 - The function's role trusts only the Lambda service (SST would otherwise also add the account as a trusted principal, so the trust policy is set explicitly).
 - The function has no permission to list the bucket. S3 therefore reports a missing object as "access denied" instead of "not found", and the API treats both as "not found" (404 `not_found` for a read). This is safe for writes: every create is conditional on the object not existing and every update on its current version, so a read that was denied for an object that does exist makes the following write fail as a conflict (409) instead of overwriting it.
 - Two writes of the same note name at the same moment can leave the note file and the search snapshot holding different text (the file from one request, the snapshot from the other) until the next write of that note. Reading the note and searching it may then disagree briefly. The next write of that note, or a re-upload by the bridge, makes them agree again.
-- Each agent scope holds at most 200 notes and about 240 KB of text, and there are at most 16 agent scopes. A write that would exceed the first two limits fails with `scope_full`; a write that would exceed the number of scopes or the total size of the agent store fails with `store_full`. There is no way to free space through the API, because it cannot delete. An operator removes notes in the bucket directly.
+- Each agent scope holds at most 200 notes and about 240 KB of text, and there are at most 16 agent scopes. A write that would exceed the first two limits fails with `scope_full`; a write that would exceed the number of scopes or the total size of the agent store fails with `store_full`. There is no way to free space through the API, because it cannot delete: the Organize run for agent scopes merges and retires notes, and an operator can remove notes in the bucket directly.
 - Credentials: a note, a name or a description that looks like a credential is refused with `secret_detected`. This is a safety net with a fixed list of patterns, so a credential in an unusual shape can pass. It is not a guarantee.
 - Notes are data, not instructions. Anything an agent reads through the API was written by a person or an agent and may be wrong or hostile.
 - With direct invocation, the `gateway` and `target` fields of the log line are what the invoker put into the client context of the invocation, not a verified gateway. A direct deployment has no check of its own: the canary and "Check a deployment" apply to the HTTP set-up, and the hand check with `aws lambda invoke` (see "Register the API with an MCP gateway") is the test after a deployment.
@@ -926,7 +1017,7 @@ Every later deploy of the stage must pass the same variable. Adding or removing 
 
 `AGENT_MEMORY_WORKSTATION_ROLE_ARNS` optionally holds a comma-separated list of the ARNs of the workstation's own IAM roles (the instance role of the machine that runs the bridge and the canary). When it is set (or `AGENT_MEMORY_GITHUB_SUBJECTS` is), the deployment creates two roles, `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary` (with invoker roles only the bridge role; the canary applies to the HTTP set-up only), and nothing is added to the bucket policy, which holds only the TLS-only deny. Each role has a maximum session of one hour, no managed policy and one inline policy, and its trust policy names only the ARNs in the variable (each must be an IAM role ARN; a wildcard is refused), plus the GitHub jobs of `AGENT_MEMORY_GITHUB_SUBJECTS` when that is set (below). Every ARN in the variable must name a role that exists: IAM refuses a trust policy that names a role it cannot find, and the deployment stops at the creation of the role ("Invalid principal in policy").
 
-- The bridge role may write and delete objects under `mem/`; write `index/mem.json`; read and write `index/bridge.json`; read objects under `agents/`; and list the bucket with the prefixes `mem/` and `agents/`. It cannot write or delete anything else, including `agents/` and `index/agents.json`, which only the API writes.
+- The bridge role may write and delete objects under `mem/`; write `index/mem.json`; read and write `index/bridge.json`; read objects under `agents/`; and list the bucket with the prefixes `mem/` and `agents/`. It cannot write or delete anything else, including `agents/` and `index/agents.json`, which only the API and the organizer role (below) write.
 - The canary role (only without invoker roles) may read (`ssm:GetParameter`) exactly four parameters of the stage: `gateway/url`, `cognito/token-endpoint`, `cognito/probe/client-id` and `cognito/probe/client-secret`, under `/agent-memory/<stage>/mcp/`. It cannot read the hub client's secret. The default key of Parameter Store lets every principal of the account decrypt, so this permission is the whole grant.
 - The ARNs are published as the plain parameters `/agent-memory/<stage>/mcp/bridge/role-arn` and, without invoker roles, `/agent-memory/<stage>/mcp/canary/role-arn`. Copy them into the `roleArn` of the bridge and canary blocks.
 - Within one account, a role named directly as the principal of a trust policy can assume the role without any identity policy of its own, so the workstation's role needs no change; the exception is an explicit deny, a permissions boundary or an organization policy that forbids it.
@@ -935,7 +1026,15 @@ Every later deploy of the stage must pass the same variable. Adding or removing 
 
 Without either variable the deployment creates neither role, no role-ARN parameter and no grant. Pass the list at deploy time in the environment of the deploy command, for example `AGENT_MEMORY_WORKSTATION_ROLE_ARNS=arn:aws:iam::<aws-account-id>:role/<role-name> AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>`; separate several ARNs with commas. **Every later deploy of the stage must pass the variable again**: a deploy without it (and without the subjects) deletes the two roles, and a bridge or canary configured with `roleArn` then fails with `sts failed: 403 AccessDenied` until the next deploy that has it. IAM records a trusted role by its internal ID, not by its name. If a workstation role is deleted and created again under the same name, the two roles no longer trust it, and the exchange fails with `sts failed: 403 AccessDenied`. To repair it, run `npx sst refresh --stage <stage>` and then deploy again with the variable, so that the trust policies are written anew. The names of the two roles carry the stage and not the region, and IAM role names are shared by the whole account: deploy a stage name in one region per account. A stage that an earlier release deployed with the variable gave the workstation role its S3 grants through the bucket policy. After a deployment of this release a bridge without `roleArn` is refused (`list failed: 403 AccessDenied` or similar) unless that role has its own grants, so set `roleArn` in the `bridge` and `canary` blocks when you deploy. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
 
-`AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN` optionally holds the ARN of a customer-managed IAM policy, `arn:aws:iam::<aws-account-id>:policy/<name>` (a path before the name is allowed). It is for an operator whose deploy role may only create or change roles that carry a given permissions boundary. When it is set, every role the deployment creates carries that policy as its permissions boundary: the function's role and, when they exist, `agent-memory-<stage>-bridge` and `agent-memory-<stage>-canary`. A value that is not such an ARN stops the deployment before anything is created; an AWS-managed policy (`arn:aws:iam::aws:policy/...`) is refused too. **The policy must already exist, and the deployment does not create or change it.** A boundary only takes permissions away: a role may then do only what both its own policy and the boundary allow. **So the boundary must allow everything the roles do, or the service stops working**, and the deployment itself still succeeds: the function reads and writes objects in the notes bucket and writes to its log group `/aws/lambda/agent-memory-<stage>-api`; the bridge role reads, writes, deletes and lists objects in the bucket; the canary role reads its four parameters with `ssm:GetParameter`, and one of them is a secure string, which Parameter Store decrypts with a KMS key: if the canary is refused that parameter once a boundary is in place, allow `kms:Decrypt` for that key in the boundary as well. Without the variable the roles have no boundary and the deployment is the same as before. Every later deploy of the stage must pass the variable again: a deploy without it removes the boundary from the roles, which a deploy role restricted in this way is usually not allowed to do.
+`AGENT_MEMORY_ORGANIZER_ROLE_ARNS` and `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS` optionally hold, with the same rules as the two variables above, the IAM roles and the exact GitHub Actions subjects that may assume the organizer role `agent-memory-<stage>-organizer`, which the Organize run for agent scopes uses (see "The agent scopes of the memory API"). Either one creates the role and the plain parameter `/agent-memory/<stage>/mcp/organizer/role-arn`; without both they do not exist. The role has its own trust, never that of the bridge and canary roles, because it may delete agent notes: list only the one repository and branch (or the one machine role) that runs the job. It has a maximum session of one hour, no managed policy and one inline policy, in both set-ups:
+
+- read objects under `agents/`, `index/agents.json` and `index/organizer.json`;
+- write the same objects only with a precondition (`s3:if-match` or `s3:if-none-match` present), and delete objects under `agents/` only with `If-Match`. The policy requires the header, not a particular value: a request with `If-Match: *`, or with an ETag the role first read, passes. It keeps the job from writing or deleting blindly; it does not keep a holder of the role from deleting notes, which is why only the job may assume it. The job itself always sends the ETag of the version it copied;
+- list the bucket with the prefix `agents/`.
+
+It has no access to `mem/` or to any other `index/` key. Every later deploy of the stage must pass the variables again; a deploy without them deletes the role.
+
+`AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN` optionally holds the ARN of a customer-managed IAM policy, `arn:aws:iam::<aws-account-id>:policy/<name>` (a path before the name is allowed). It is for an operator whose deploy role may only create or change roles that carry a given permissions boundary. When it is set, every role the deployment creates carries that policy as its permissions boundary: the function's role and, when they exist, `agent-memory-<stage>-bridge`, `agent-memory-<stage>-canary` and `agent-memory-<stage>-organizer`. A value that is not such an ARN stops the deployment before anything is created; an AWS-managed policy (`arn:aws:iam::aws:policy/...`) is refused too. **The policy must already exist, and the deployment does not create or change it.** A boundary only takes permissions away: a role may then do only what both its own policy and the boundary allow. **So the boundary must allow everything the roles do, or the service stops working**, and the deployment itself still succeeds: the function reads and writes objects in the notes bucket and writes to its log group `/aws/lambda/agent-memory-<stage>-api`; the bridge role reads, writes, deletes and lists objects in the bucket; the canary role reads its four parameters with `ssm:GetParameter`, and one of them is a secure string, which Parameter Store decrypts with a KMS key: if the canary is refused that parameter once a boundary is in place, allow `kms:Decrypt` for that key in the boundary as well. Without the variable the roles have no boundary and the deployment is the same as before. Every later deploy of the stage must pass the variable again: a deploy without it removes the boundary from the roles, which a deploy role restricted in this way is usually not allowed to do.
 
 The deployment creates:
 
@@ -945,6 +1044,7 @@ The deployment creates:
 - SSM parameters under `/agent-memory/<stage>/mcp/`: `bucket/name` in every set-up; without invoker roles also `gateway/url`, `cognito/issuer`, `cognito/token-endpoint`, `cognito/hub/client-id`, `cognito/hub/client-secret` (a secure string), `cognito/hub/credential-version`, `cognito/probe/client-id`, `cognito/probe/client-secret` (a secure string); with invoker roles `function/arn`;
 - with `AGENT_MEMORY_INVOKER_ROLE_ARNS`, one invoke permission per role;
 - with `AGENT_MEMORY_WORKSTATION_ROLE_ARNS` or `AGENT_MEMORY_GITHUB_SUBJECTS`, the role `agent-memory-<stage>-bridge` and the parameter `/agent-memory/<stage>/mcp/bridge/role-arn`; and, only without invoker roles, the role `agent-memory-<stage>-canary` and the parameter `/agent-memory/<stage>/mcp/canary/role-arn`.
+- with `AGENT_MEMORY_ORGANIZER_ROLE_ARNS` or `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS`, the role `agent-memory-<stage>-organizer` and the parameter `/agent-memory/<stage>/mcp/organizer/role-arn`.
 
 ### Check a deployment
 

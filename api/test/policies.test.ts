@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   bridgeRolePolicy,
+  organizerRolePolicy,
   bucketPolicy,
   canaryRolePolicy,
   functionPolicy,
@@ -130,6 +131,47 @@ describe('bridgeRolePolicy', () => {
           assert.ok(!actions.includes('s3:DeleteObject'), r);
         }
       }
+    }
+  });
+});
+
+describe('organizerRolePolicy', () => {
+  const policy = organizerRolePolicy(BUCKET);
+  const statements = policy.Statement as Statement[];
+  const keys = [`${BUCKET}/agents/*`, `${BUCKET}/index/agents.json`, `${BUCKET}/index/organizer.json`];
+
+  it('holds exactly five allow statements, without a principal', () => {
+    assert.deepEqual(statements, [
+      { Effect: 'Allow', Action: ['s3:GetObject'], Resource: keys },
+      { Effect: 'Allow', Action: ['s3:PutObject'], Resource: keys, Condition: { Null: { 's3:if-match': 'false' } } },
+      { Effect: 'Allow', Action: ['s3:PutObject'], Resource: keys, Condition: { Null: { 's3:if-none-match': 'false' } } },
+      { Effect: 'Allow', Action: ['s3:DeleteObject'], Resource: [`${BUCKET}/agents/*`], Condition: { Null: { 's3:if-match': 'false' } } },
+      { Effect: 'Allow', Action: ['s3:ListBucket'], Resource: [BUCKET], Condition: { StringLike: { 's3:prefix': ['agents/*'] } } },
+    ]);
+  });
+
+  it('allows a put or a delete only with a precondition, and nothing under mem/ or on other index keys', () => {
+    for (const s of statements) {
+      assert.equal(s.Principal, undefined);
+      const actions = asList(s.Action);
+      if (actions.includes('s3:PutObject') || actions.includes('s3:DeleteObject')) {
+        assert.equal(actions.length, 1);
+        const keyNames = Object.keys(s.Condition?.Null ?? {});
+        assert.equal(keyNames.length, 1, 'one precondition key');
+        assert.ok(['s3:if-match', 's3:if-none-match'].includes(keyNames[0] as string));
+        assert.equal(s.Condition?.Null?.[keyNames[0] as string], 'false');
+        assert.equal(Object.keys(s.Condition ?? {}).length, 1);
+      }
+      if (actions.includes('s3:DeleteObject')) assert.deepEqual(s.Condition, { Null: { 's3:if-match': 'false' } });
+      for (const r of asList(s.Resource)) {
+        assert.ok(!r.startsWith(`${BUCKET}/mem/`), r);
+        assert.notEqual(r, `${BUCKET}/index/mem.json`);
+        assert.notEqual(r, `${BUCKET}/index/bridge.json`);
+        assert.notEqual(r, `${BUCKET}/index/*`);
+        assert.notEqual(r, `${BUCKET}/*`);
+        assert.notEqual(r, '*');
+      }
+      for (const a of actions) assert.ok(['s3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket'].includes(a), a);
     }
   });
 });
