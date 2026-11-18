@@ -17,7 +17,7 @@ import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
 import { runSync, writeStatus } from './lib/sync-engine.mjs';
-import { buildDigest, projectSessionDirs, sessionFilesSince } from './lib/transcripts.mjs';
+import { buildDigest, codexProjectSessions, filesChangedSince, projectSessionDirs, sessionFilesSince } from './lib/transcripts.mjs';
 import { apply, evaluate, noteFiles, readRegular, snapshot } from './lib/workdir.mjs';
 
 const RUN_SH = join(dirname(fileURLToPath(import.meta.url)), 'run.sh');
@@ -205,7 +205,15 @@ function cloneProblem(config) {
   return null;
 }
 
-function stepScan(config) {
+// `--codex-since <ms>`: also the Codex sessions of each project changed after that time, the start
+// of the longest session window (an Extract run narrows them to each project's own window). They
+// are found by the repository of their directory, which takes Git, so an Organize run does not
+// look for them.
+function stepScan(config, rest) {
+  const valued = rest.length > 0 ? ['--codex-since'] : [];
+  const a = parseStepArgs(rest, valued);
+  const codexSince = a['--codex-since'] === undefined ? null : Number(a['--codex-since']);
+  if (codexSince !== null && !(/^\d{1,16}$/.test(a['--codex-since']) && Number.isSafeInteger(codexSince))) throw new Error('invalid --codex-since');
   const problem = cloneProblem(config);
   if (problem) throw new Error(problem);
   const dir = projectsDir(config);
@@ -214,9 +222,10 @@ function stepScan(config) {
   const global = g ? { usable: true, ...scopeInfo(g) } : { usable: false };
   const names = new Set(projects.map((p) => p.name));
   const sessions = [...projectSessionDirs(config)].filter(([name]) => names.has(name));
+  const codexSessions = codexSince === null ? [] : [...codexProjectSessions(config, { sinceMs: codexSince, projects: [...names] })];
   // A project folder named like the global scope would be confused with it; it is never used.
   const ignored = dir && lstatOrNull(join(dir, GLOBAL))?.isDirectory() ? [GLOBAL] : [];
-  out({ outcome: 'scan', projects, global, sessions, ignored });
+  out({ outcome: 'scan', projects, global, sessions, codexSessions, ignored });
 }
 
 function stepSnapshot(config, rest) {
@@ -502,7 +511,7 @@ function stepMain(args) {
     return 1;
   }
   try {
-    if (name === 'scan' && rest.length === 0) stepScan(config);
+    if (name === 'scan') stepScan(config, rest);
     else if (name === 'snapshot') stepSnapshot(config, rest);
     else if (name === 'apply') stepApply(config, rest);
     else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ...');
@@ -620,22 +629,26 @@ function windowStart(entry, now) {
   return last === null ? now - EXTRACT_LOOKBACK_MS : Math.max(last, now - EXTRACT_MAX_WINDOW_MS);
 }
 
-// Extract: projects with a session file changed since their window start. The one whose model
-// run was tried longest ago goes first (never tried first, which includes state written before
-// `lastExtractTried` existed), so every project gets its turn across runs even when one is
-// rejected every time; then the oldest session window, then the newest session.
+// Extract: projects with a session file of Claude Code or Codex changed since their window start.
+// The one whose model run was tried longest ago goes first (never tried first, which includes state
+// written before `lastExtractTried` existed), so every project gets its turn across runs even when
+// one is rejected every time; then the oldest session window, then the newest session.
 function extractScopes(scan, state, opts, now) {
   const dirs = new Map(scan.sessions);
-  const names = opts.projects.length > 0 ? opts.projects : [...dirs.keys()];
+  const codex = new Map(scan.codexSessions ?? []);
+  const names = opts.projects.length > 0 ? opts.projects : [...new Set([...dirs.keys(), ...codex.keys()])];
   const list = [];
   for (const scope of names) {
     const tried = timeOf(state.projects[scope]?.lastExtractTried) ?? -Infinity;
     const last = timeOf(state.projects[scope]?.lastExtract);
     const since = windowStart(state.projects[scope], now);
-    const files = sessionFilesSince(dirs.get(scope) ?? [], since);
+    const files = [
+      ...sessionFilesSince(dirs.get(scope) ?? [], since).map((file) => ({ tool: 'claude', file })),
+      ...filesChangedSince(codex.get(scope) ?? [], since).map((file) => ({ tool: 'codex', file })),
+    ];
     if (opts.projects.length === 0 && files.length === 0) continue;
     let newest = 0;
-    for (const file of files) {
+    for (const { file } of files) {
       try {
         newest = Math.max(newest, statSync(file).mtimeMs);
       } catch {
@@ -1058,7 +1071,10 @@ async function driverMain(argv) {
   const started = new Date();
   const now = started.getTime();
   removeStaleRuns(config, now);
-  const scanStep = runStep(['scan']);
+  if (opts.kind === 'extract' && config.codexDir === null) {
+    process.stdout.write(`agent-memory consolidate: codexDir in ${configPath()} is not an absolute path; Codex sessions are not read.\n`);
+  }
+  const scanStep = runStep(opts.kind === 'extract' ? ['scan', '--codex-since', String(now - EXTRACT_MAX_WINDOW_MS)] : ['scan']);
   const scan = scanStep.result;
   if (await signalsHandled()) {
     process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing was applied\n`);

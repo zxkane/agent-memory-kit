@@ -583,6 +583,140 @@ function extractFixture(t) {
   return f;
 }
 
+// ---- Codex sessions (TC-EXTRACT-CODEX-*) ----
+
+// A source repository with an `origin`, and a Codex session file under the test HOME's ~/.codex
+// whose directory is `cwd`. Each turn is [role, text, minutes ago].
+function codexRepo(f, dir, origin) {
+  mkdirSync(dir, { recursive: true });
+  sh(dir, 'git', ['init', '-q', '-b', 'main']);
+  sh(dir, 'git', ['remote', 'add', 'origin', origin]);
+  return dir;
+}
+let codexCount = 0;
+function codexSession(f, cwd, turns, { source = 'vscode', extra = [] } = {}) {
+  const folder = join(f.home, '.codex', 'sessions', '2026', '11', '18');
+  mkdirSync(folder, { recursive: true });
+  const id = `c0de${String(codexCount++).padStart(4, '0')}`;
+  const file = join(folder, `rollout-2026-11-18T10-00-00-0000-${id}.jsonl`);
+  const ago = (min) => new Date(Date.now() - min * 60000).toISOString();
+  const records = [
+    { timestamp: ago(120), type: 'session_meta', payload: { id, timestamp: ago(120), cwd, originator: 'codex-tui', source } },
+    ...turns.map(([role, text, min]) => ({
+      timestamp: ago(min), type: 'event_msg',
+      payload: { type: 'item_completed', item: { type: role === 'user' ? 'UserMessage' : 'AgentMessage', id: `${role}${min}`, content: [{ type: 'text', text }] } },
+    })),
+    ...extra,
+  ];
+  writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  return { file, id };
+}
+
+test('TC-EXTRACT-CODEX-001: a project used only from Codex is extracted, and only its own sessions are read', (t) => {
+  const f = fixture(t);
+  f.seed({
+    'projects/cx/MEMORY.md': index('a.md'),
+    'projects/cx/a.md': note('a', 'Old note', 'An old fact.'),
+    'projects/cx/.project': 'example.com/owner/cx\n',
+  });
+  const repo = codexRepo(f, join(f.tmp, 'src', 'cx'), 'https://example.com/owner/cx.git');
+  const other = codexRepo(f, join(f.tmp, 'elsewhere', 'cx'), 'https://example.com/someone/cx.git');
+  const mine = codexSession(f, repo, [['user', 'CODEX-SESSION-PHRASE which port does staging use?', 60], ['agent', 'Port 8443.', 59]]);
+  codexSession(f, other, [['user', 'OTHER-REPOSITORY-PHRASE', 50]]);
+  codexSession(f, repo, [['user', 'EXEC-RUN-PHRASE', 40]], { source: 'exec' });
+
+  // Without --project the run takes the project: Codex sessions count for the selection.
+  let r = f.run('extract', '--dry-run');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['cx']);
+
+  // The end-to-end check of the issue: --project, a dry run that keeps its work folder.
+  r = f.run('extract', '--project', 'cx', '--dry-run', '--keep');
+  assert.equal(r.status, 0, r.stderr);
+  const call = f.calls().at(-1);
+  const digestFile = join(dirname(call.cwd), 'input', 'digest.md');
+  assert.ok(r.stdout.includes(dirname(call.cwd)));
+  const digest = readFileSync(digestFile, 'utf8');
+  assert.equal(digest, call.digest);
+  assert.match(digest, new RegExp(`^=== Codex session ${mine.id}, `));
+  assert.match(digest, /^USER \(.+\):\nCODEX-SESSION-PHRASE which port does staging use\?$/m);
+  assert.match(digest, /^AGENT \(.+\):\nPort 8443\.$/m);
+  assert.doesNotMatch(digest, /OTHER-REPOSITORY-PHRASE|EXEC-RUN-PHRASE/);
+  assert.equal(f.readState().projects.cx.lastExtract, undefined, 'a dry run moves no mark');
+});
+
+test('TC-EXTRACT-CODEX-003: Claude Code and Codex sessions of one project share one digest, newest first', (t) => {
+  const f = extractFixture(t);
+  f.seed({ 'projects/p/.project': 'example.com/owner/p\n' });
+  const repo = codexRepo(f, join(f.tmp, 'src', 'p'), 'git@example.com:owner/p.git');
+  const { id } = codexSession(f, repo, [['user', 'CODEX-NEWER-PHRASE', 30]]);
+  const r = f.run('extract', '--project', 'p', '--dry-run');
+  assert.equal(r.status, 0, r.stderr);
+  const [call] = f.calls();
+  const headers = [...call.digest.matchAll(/^=== (Claude Code|Codex) session (\S+),/gm)].map((m) => `${m[1]} ${m[2]}`);
+  assert.deepEqual(headers, [`Codex ${id}`, 'Claude Code -work-p-']);
+  assert.match(call.digest, new RegExp(SESSION_PHRASE));
+  assert.match(call.digest, /CODEX-NEWER-PHRASE/);
+});
+
+test('an automated Codex run that wrote a note file into the clone is read', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/cx/MEMORY.md': index('a.md'), 'projects/cx/a.md': note('a', 'A', 'A fact.'), 'projects/cx/.project': 'example.com/owner/cx\n' });
+  const repo = codexRepo(f, join(f.tmp, 'src', 'cx'), 'https://example.com/owner/cx.git');
+  const change = {
+    timestamp: new Date(Date.now() - 20 * 60000).toISOString(), type: 'event_msg',
+    payload: { type: 'item_completed', item: { type: 'FileChange', id: 'f', status: 'completed', changes: { [join(f.repo, 'projects', 'cx', 'port.md')]: { type: 'add', content: 'x' } } } },
+  };
+  codexSession(f, repo, [['user', 'AUTOMATED-PROMPT-PHRASE', 30], ['agent', 'AUTOMATED-AGENT-PHRASE: saved the port note.', 25]], { source: 'exec', extra: [change] });
+  const r = f.run('extract', '--project', 'cx', '--dry-run');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(f.calls()[0].digest, /AUTOMATED-AGENT-PHRASE/);
+  assert.doesNotMatch(f.calls()[0].digest, /AUTOMATED-PROMPT-PHRASE/, 'a program\'s prompt is not what the person typed');
+});
+
+test('a Codex session whose turns all lie before the last Extract is not read again', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/cx/MEMORY.md': index('a.md'), 'projects/cx/a.md': note('a', 'A', 'A fact.'), 'projects/cx/.project': 'example.com/owner/cx\n' });
+  const repo = codexRepo(f, join(f.tmp, 'src', 'cx'), 'https://example.com/owner/cx.git');
+  codexSession(f, repo, [['user', 'OLD-CODEX-TURN', 180], ['agent', 'Old answer.', 179]]);
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.stateFile(), JSON.stringify({ projects: { cx: { lastExtract: new Date(Date.now() - 60 * 60000).toISOString() } } }));
+  const r = f.run('extract', '--project', 'cx');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^extract cx: no-session/m);
+  assert.deepEqual(f.calls(), []);
+});
+
+test('a codexDir that is not an absolute path is reported; Extract goes on without Codex sessions', (t) => {
+  const f = extractFixture(t);
+  const c = JSON.parse(readFileSync(f.configFile, 'utf8'));
+  writeFileSync(f.configFile, JSON.stringify({ ...c, codexDir: '~/.codex' }));
+  const r = f.run('extract', '--project', 'p', '--dry-run');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^agent-memory consolidate: codexDir in .+ is not an absolute path; Codex sessions are not read\.$/m);
+  assert.match(f.calls()[0].digest, new RegExp(SESSION_PHRASE));
+});
+
+test('an organize run does not look for Codex sessions', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.seed({ 'projects/p/.project': 'example.com/owner/p\n' });
+  const repo = codexRepo(f, join(f.tmp, 'src', 'p'), 'https://example.com/owner/p.git');
+  codexSession(f, repo, [['user', 'hello', 30]]);
+  const step = (...args) => spawnSync(RUN_SH, ['consolidate-step', 'scan', ...args], { env: f.env, encoding: 'utf8' });
+  const scan = step();
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.deepEqual(JSON.parse(scan.stdout).codexSessions, []);
+  const withCodex = step('--codex-since', String(Date.now() - DAY_MS));
+  assert.equal(withCodex.status, 0, withCodex.stderr);
+  assert.deepEqual(JSON.parse(withCodex.stdout).codexSessions.map(([name, files]) => [name, files.length]), [['p', 1]]);
+  // The driver gives the bound: a file written before it is not listed.
+  assert.deepEqual(JSON.parse(step('--codex-since', String(Date.now() + DAY_MS)).stdout).codexSessions, []);
+  for (const bad of [['--other'], ['--codex-since'], ['--codex-since', 'soon'], ['--codex-since', '-1']]) {
+    assert.equal(step(...bad).status, 1, bad.join(' '));
+  }
+});
+
 test('F3: a session file touched again that holds only turns from before the window is no-session', (t) => {
   const f = extractFixture(t);
   const hours = (n) => n * 3600 * 1000;

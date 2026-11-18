@@ -160,6 +160,13 @@ export function loadConfig(env = process.env) {
     if (typeof raw.repoDir !== 'string' || !isAbsolute(raw.repoDir)) return null;
     const stateDir = raw.stateDir ?? join(home, '.local/state/agent-memory');
     const claudeDir = raw.claudeDir ?? join(home, '.claude');
+    // Codex keeps its sessions under $CODEX_HOME (default ~/.codex). A timer does not get the shell's
+    // CODEX_HOME, so `codexDir` in the file fixes it for every run; a relative CODEX_HOME is ignored.
+    // Only Extract reads it: a `codexDir` that is not an absolute path is null (no Codex sessions are
+    // read, and Extract says so) instead of turning the whole configuration off.
+    const codexHome = typeof env.CODEX_HOME === 'string' && isAbsolute(env.CODEX_HOME) ? env.CODEX_HOME : null;
+    const codexDirRaw = raw.codexDir ?? codexHome ?? join(home, '.codex');
+    const codexDir = typeof codexDirRaw === 'string' && isAbsolute(codexDirRaw) && !CONTROL_RE.test(codexDirRaw) ? codexDirRaw : null;
     if (typeof stateDir !== 'string' || !isAbsolute(stateDir)) return null;
     if (typeof claudeDir !== 'string' || !isAbsolute(claudeDir)) return null;
     const repoUrl = typeof raw.repoUrl === 'string' && raw.repoUrl ? raw.repoUrl : null;
@@ -169,7 +176,7 @@ export function loadConfig(env = process.env) {
     const bridge = parseBridge(raw.bridge, raw.repoDir);
     const canary = parseCanary(raw.canary);
     return {
-      host: raw.host, repoDir: raw.repoDir, repoUrl, stateDir, claudeDir, staleAfterSeconds: stale,
+      host: raw.host, repoDir: raw.repoDir, repoUrl, stateDir, claudeDir, codexDir, staleAfterSeconds: stale,
       consolidate: consolidate.value, consolidateProblem: consolidate.problem,
       bridge: bridge.value, bridgeProblem: bridge.problem,
       canary: canary.value, canaryProblem: canary.problem,

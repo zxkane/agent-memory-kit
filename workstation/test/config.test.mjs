@@ -32,7 +32,7 @@ test('applies defaults', (t) => {
   write({ enabled: true, host: 'alpha', repoDir: '/home/u/agent-memory' });
   assert.deepEqual(loadConfig(env), {
     host: 'alpha', repoDir: '/home/u/agent-memory', repoUrl: null,
-    stateDir: join(dir, '.local/state/agent-memory'), claudeDir: join(dir, '.claude'),
+    stateDir: join(dir, '.local/state/agent-memory'), claudeDir: join(dir, '.claude'), codexDir: join(dir, '.codex'),
     staleAfterSeconds: 600, consolidate: null, consolidateProblem: null, bridge: null, bridgeProblem: null, canary: null, canaryProblem: null,
   });
 });
@@ -42,11 +42,11 @@ test('reads the default path under HOME and honors explicit values', (t) => {
   mkdirSync(join(dir, '.config/agent-memory'), { recursive: true });
   writeFileSync(join(dir, '.config/agent-memory/config.json'), JSON.stringify({
     enabled: true, host: 'beta', repoDir: '/r', repoUrl: 'git@example.com:u/m.git',
-    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30,
+    stateDir: '/s', claudeDir: '/c', codexDir: '/cx', staleAfterSeconds: 30,
   }));
   assert.deepEqual(loadConfig({ HOME: dir }), {
     host: 'beta', repoDir: '/r', repoUrl: 'git@example.com:u/m.git',
-    stateDir: '/s', claudeDir: '/c', staleAfterSeconds: 30, consolidate: null, consolidateProblem: null, bridge: null, bridgeProblem: null, canary: null, canaryProblem: null,
+    stateDir: '/s', claudeDir: '/c', codexDir: '/cx', staleAfterSeconds: 30, consolidate: null, consolidateProblem: null, bridge: null, bridgeProblem: null, canary: null, canaryProblem: null,
   });
 });
 
@@ -66,6 +66,25 @@ test('rejects a bad host, a relative repoDir and invalid JSON', (t) => {
 });
 
 const BASE = { enabled: true, host: 'alpha', repoDir: '/home/u/agent-memory' };
+
+test('the Codex folder is codexDir, else an absolute CODEX_HOME, else ~/.codex', (t) => {
+  const { dir, env, write } = setup(t);
+  write(BASE);
+  assert.equal(loadConfig(env).codexDir, join(dir, '.codex'));
+  assert.equal(loadConfig({ ...env, CODEX_HOME: '/opt/codex-home' }).codexDir, '/opt/codex-home');
+  // A relative CODEX_HOME is not a folder the timer can find: it is ignored, the rest still works.
+  assert.equal(loadConfig({ ...env, CODEX_HOME: 'codex-home' }).codexDir, join(dir, '.codex'));
+  assert.equal(loadConfig({ ...env, CODEX_HOME: '' }).codexDir, join(dir, '.codex'));
+  write({ ...BASE, codexDir: '/srv/codex' });
+  assert.equal(loadConfig({ ...env, CODEX_HOME: '/opt/codex-home' }).codexDir, '/srv/codex');
+  // Only Extract reads it: a codexDir that is not an absolute path is null, the rest still works.
+  for (const codexDir of ['~/.codex', 'rel', 42, '/a\nb']) {
+    write({ ...BASE, codexDir });
+    const cfg = loadConfig(env);
+    assert.equal(cfg.codexDir, null, String(codexDir));
+    assert.equal(cfg.repoDir, BASE.repoDir);
+  }
+});
 
 test('consolidate is null when the block is absent', (t) => {
   const { env, write } = setup(t);
