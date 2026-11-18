@@ -51,6 +51,11 @@ export function createFakeS3({ pageSize = 1000 } = {}) {
       return new Response(null, { status: 200, headers: { etag } });
     }
     if (method === 'DELETE') {
+      if (headers['if-match'] !== undefined) {
+        const current = objects.get(key);
+        if (!current) return errorResponse(404, 'NoSuchKey');
+        if (headers['if-match'] !== '*' && current.etag !== headers['if-match']) return errorResponse(412, 'PreconditionFailed');
+      }
       objects.delete(key);
       return new Response(null, { status: 204 });
     }

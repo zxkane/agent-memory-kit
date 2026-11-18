@@ -145,9 +145,14 @@ export function createS3({ bucket, region, credentials, fetchImpl = fetch, now =
       return { status: 'conflict' };
     },
 
-    async del(key) {
-      const res = await send('del', 'DELETE', pathOf('del', key));
+    // With ifMatch, only the object of that ETag is deleted: `conflict` when it changed (412, or 409
+    // when a concurrent write won), `missing` when it is gone. Without, S3 deletes whatever is there.
+    async del(key, { ifMatch } = {}) {
+      const headers = ifMatch === undefined ? {} : { 'if-match': ifMatch };
+      const res = await send('del', 'DELETE', pathOf('del', key), { headers });
       if (res.status >= 200 && res.status < 300) return { status: 'ok' };
+      if (ifMatch !== undefined && (res.status === 412 || res.status === 409)) return { status: 'conflict' };
+      if (ifMatch !== undefined && res.status === 404) return { status: 'missing' };
       throw failure('del', res);
     },
 

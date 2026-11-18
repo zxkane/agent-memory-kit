@@ -5,6 +5,8 @@ import { describe, it } from 'node:test';
 delete process.env.AGENT_MEMORY_INVOKER_ROLE_ARNS;
 delete process.env.AGENT_MEMORY_WORKSTATION_ROLE_ARNS;
 delete process.env.AGENT_MEMORY_GITHUB_SUBJECTS;
+delete process.env.AGENT_MEMORY_ORGANIZER_ROLE_ARNS;
+delete process.env.AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS;
 delete process.env.AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN;
 const { parseDeployMode } = await import('../infra/mode.ts');
 
@@ -14,13 +16,13 @@ const ROLE_B = 'arn:aws:iam::123456789012:role/path/gateway-b';
 describe('parseDeployMode', () => {
   it('is the HTTP deployment when the variable is not set or holds only blanks', () => {
     for (const env of [{}, { AGENT_MEMORY_INVOKER_ROLE_ARNS: '' }, { AGENT_MEMORY_INVOKER_ROLE_ARNS: ' , ' }]) {
-      assert.deepEqual(parseDeployMode(env), { direct: false, invokerRoleArns: [], workstationRoleArns: [], githubSubjects: [], permissionsBoundaryArn: null });
+      assert.deepEqual(parseDeployMode(env), { direct: false, invokerRoleArns: [], workstationRoleArns: [], githubSubjects: [], organizerRoleArns: [], organizerGithubSubjects: [], permissionsBoundaryArn: null });
     }
   });
 
   it('is direct invocation when roles are given, trimmed, without empty entries or duplicates', () => {
     const mode = parseDeployMode({ AGENT_MEMORY_INVOKER_ROLE_ARNS: ` ${ROLE_A}, ,${ROLE_B},${ROLE_A}` });
-    assert.deepEqual(mode, { direct: true, invokerRoleArns: [ROLE_A, ROLE_B], workstationRoleArns: [], githubSubjects: [], permissionsBoundaryArn: null });
+    assert.deepEqual(mode, { direct: true, invokerRoleArns: [ROLE_A, ROLE_B], workstationRoleArns: [], githubSubjects: [], organizerRoleArns: [], organizerGithubSubjects: [], permissionsBoundaryArn: null });
   });
 
   it('refuses anything that is not an IAM role ARN, without repeating the entry', () => {
@@ -81,8 +83,25 @@ describe('parseDeployMode', () => {
     }
   });
 
+  it('reads the organizer\'s own roles and GitHub subjects, apart from the workstation ones', () => {
+    const subject = 'repo:example-owner@100/example-mirror@300:ref:refs/heads/main';
+    const mode = parseDeployMode({
+      AGENT_MEMORY_ORGANIZER_ROLE_ARNS: ` ${ROLE_B},${ROLE_B}`,
+      AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS: `${subject}, `,
+      AGENT_MEMORY_WORKSTATION_ROLE_ARNS: ROLE_A,
+    });
+    assert.deepEqual(mode.organizerRoleArns, [ROLE_B]);
+    assert.deepEqual(mode.organizerGithubSubjects, [subject]);
+    assert.deepEqual(mode.workstationRoleArns, [ROLE_A]);
+    assert.deepEqual(mode.githubSubjects, []);
+  });
+
   it('refuses a malformed workstation role or GitHub subject before anything is declared, without repeating it', () => {
     const cases: Array<[string, string]> = [
+      ['AGENT_MEMORY_ORGANIZER_ROLE_ARNS', 'arn:aws:iam::123456789012:user/someone'],
+      ['AGENT_MEMORY_ORGANIZER_ROLE_ARNS', '*'],
+      ['AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS', 'repo:example-owner/example-repo:pull_request'],
+      ['AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS', 'repo:example-owner/*:ref:refs/heads/main'],
       ['AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'arn:aws:iam::123456789012:user/someone'],
       ['AGENT_MEMORY_WORKSTATION_ROLE_ARNS', '*'],
       ['AGENT_MEMORY_GITHUB_SUBJECTS', 'repo:example-owner/example-repo:environment:production'],
@@ -115,6 +134,8 @@ describe('parseDeployMode', () => {
         invokerRoleArns: [ROLE_A],
         workstationRoleArns: [],
         githubSubjects: [],
+        organizerRoleArns: [],
+        organizerGithubSubjects: [],
         permissionsBoundaryArn: BOUNDARY,
       });
       for (const ok of ['arn:aws-cn:iam::111122223333:policy/b', 'arn:aws-us-gov:iam::111122223333:policy/b']) {

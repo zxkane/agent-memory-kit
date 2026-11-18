@@ -79,6 +79,23 @@ test('del removes the object, also when it is already gone', async () => {
   assert.deepEqual(await s3.del('k.md'), { status: 'ok' });
 });
 
+test('del with ifMatch deletes only the version that was read; a gone object is missing', async () => {
+  const { s3, fake } = setup();
+  const { etag } = await s3.put('k.md', 'one');
+  await s3.put('k.md', 'two');
+  assert.deepEqual(await s3.del('k.md', { ifMatch: etag }), { status: 'conflict' });
+  assert.equal(fake.objects.get('k.md').body.toString(), 'two');
+  assert.equal(fake.requests.at(-1).headers['if-match'], etag);
+  assert.deepEqual(await s3.del('k.md', { ifMatch: md5('two') }), { status: 'ok' });
+  assert.equal(fake.objects.size, 0);
+  assert.deepEqual(await s3.del('k.md', { ifMatch: md5('two') }), { status: 'missing' });
+  // A 409 (a concurrent write won) is a conflict too.
+  await s3.put('k.md', 'three');
+  fake.failNext(1, 409);
+  assert.deepEqual(await s3.del('k.md', { ifMatch: md5('three') }), { status: 'conflict' });
+  assert.ok(fake.objects.has('k.md'));
+});
+
 test('list follows three pages and decodes keys with a space and a plus', async () => {
   const { s3, fake } = setup({ pageSize: 2 });
   const keys = ['agents/a b.md', 'agents/c+d.md', 'agents/e.md', 'agents/f&g.md', 'agents/h.md'];

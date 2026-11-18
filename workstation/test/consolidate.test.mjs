@@ -25,6 +25,7 @@ const DAY_MS = 24 * 3600 * 1000;
 const FAKE = `#!${process.execPath}
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 const cwd = process.cwd();
 const scope = basename(cwd) === 'notes' ? basename(dirname(cwd)) : basename(cwd);
@@ -48,6 +49,12 @@ for (const [rel, text] of Object.entries(ins.writes ?? {})) {
   writeFileSync(join(cwd, rel), text);
 }
 for (const [path, text] of Object.entries(ins.liveWrites ?? {})) writeFileSync(path, text);
+// An agent writing through the memory API while the model runs: objects of the fake bucket file.
+for (const [key, text] of Object.entries(ins.bucketWrites ?? {})) {
+  const bucket = JSON.parse(readFileSync(process.env.FAKE_S3_FILE, 'utf8'));
+  bucket[key] = { body: Buffer.from(text).toString('base64'), etag: '"' + createHash('md5').update(text).digest('hex') + '"' };
+  writeFileSync(process.env.FAKE_S3_FILE, JSON.stringify(bucket));
+}
 for (const argv of ins.git ?? []) execFileSync('git', argv, { stdio: 'ignore' });
 for (const [rel, target] of Object.entries(ins.links ?? {})) {
   rmSync(join(cwd, rel), { recursive: true, force: true });
@@ -134,6 +141,7 @@ function fixture(t, { consolidate = {}, block = true } = {}) {
     calls: () => (existsSync(callsFile)
       ? readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []),
     run: (...args) => spawnSync(RUN_SH, ['consolidate', ...args], { env, encoding: 'utf8' }),
+    runWith: (extra, ...args) => spawnSync(RUN_SH, ['consolidate', ...args], { env: { ...env, ...extra }, encoding: 'utf8' }),
     seed(files) {
       for (const [rel, text] of Object.entries(files)) write(a, rel, text);
       assert.equal(runSync(seedConfig).ok, true);
@@ -2104,4 +2112,200 @@ test('S1: a scratch file beside a good result in notes/ and global/ is ignored, 
   assert.match(text, /^- global\/\(1 entry that is not a note file\): ignored$/m);
   assert.ok(!f.remoteFiles().some((x) => /\.tmp$|sub\//.test(x)));
   assert.equal(existsSync(join(f.repo, 'projects/p/a.md.tmp')), false);
+});
+
+// ---- organize --agents: the agent scopes of the memory API's bucket (TC-AGENT-ORG-*) ----
+
+const AGENT_FACTS = 'Deploys always go through the staging stack first; staging listens on port 8443, production answers on port 443 behind the shared load balancer, and every release needs a signed changelog entry before promotion.';
+const apiNote = (name, description, content) =>
+  ['---', `name: ${name}`, `description: ${JSON.stringify(description)}`, 'metadata:', '  type: reference', '---', '', content].join('\n') + '\n';
+const apiLine = (name, description) => `- [${name}](${name}.md) — ${description}`;
+const md5 = (text) => `"${createHash('md5').update(text).digest('hex')}"`;
+const AGENTS_BLOCK = { bucket: 'example-bucket', region: 'ap-northeast-1', credentials: 'environment' };
+
+// A fake bucket in a file (see fake-s3-preload.mjs) holding the agent scope codex-alpha with two
+// notes that say the same thing, and the driver's environment to reach it.
+function agentsFixture(t, { block = AGENTS_BLOCK, consolidate = {} } = {}) {
+  const f = fixture(t, { consolidate: { agents: block, ...consolidate } });
+  const bucketFile = join(f.tmp, 'bucket.json');
+  const logFile = join(f.tmp, 's3.log');
+  const objects = {};
+  const put = (key, text) => { objects[key] = { body: Buffer.from(text).toString('base64'), etag: md5(text) }; };
+  put('agents/codex-alpha/deploys.md', apiNote('deploys', 'How deploys go', AGENT_FACTS));
+  put('agents/codex-alpha/deploy-steps.md', apiNote('deploy-steps', 'Deploy steps', AGENT_FACTS));
+  put('agents/codex-alpha/MEMORY.md', `${apiLine('deploys', 'How deploys go')}\n${apiLine('deploy-steps', 'Deploy steps')}\n`);
+  put('index/agents.json', JSON.stringify({ version: 1, notes: [
+    { path: 'agents/codex-alpha/deploy-steps.md', name: 'deploy-steps', description: 'Deploy steps', type: 'reference', body: AGENT_FACTS },
+    { path: 'agents/codex-alpha/deploys.md', name: 'deploys', description: 'How deploys go', type: 'reference', body: AGENT_FACTS },
+  ] }));
+  writeFileSync(bucketFile, JSON.stringify(objects));
+  f.setConfig({ env: { FAKE_INSTRUCTIONS: join(f.tmp, 'instructions.json'), FAKE_CALLS: join(f.tmp, 'calls.jsonl'), FAKE_SUMMARY: SUMMARY, FAKE_S3_FILE: bucketFile } });
+  const awsEnv = {
+    NODE_OPTIONS: `--import ${join(PKG, 'test', 'fake-s3-preload.mjs')}`, FAKE_S3_FILE: bucketFile, FAKE_S3_LOG: logFile,
+    AWS_ACCESS_KEY_ID: 'ASIAEXAMPLEKEYID0001', AWS_SECRET_ACCESS_KEY: 'example-signing-value', AWS_SESSION_TOKEN: 'example-session-value',
+  };
+  const bucket = () => Object.fromEntries(Object.entries(JSON.parse(readFileSync(bucketFile, 'utf8'))).map(([k, o]) => [k, Buffer.from(o.body, 'base64').toString('utf8')]));
+  const log = () => (existsSync(logFile) ? readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+  return { ...f, bucketFile, bucket, log, runAgents: (...args) => f.runWith(awsEnv, 'organize', '--agents', ...args), awsEnv };
+}
+
+const MERGED_DEPLOYS = apiNote('deploys', 'How deploys go (merged)', `${AGENT_FACTS} Steps: build, deploy to staging, check, promote.`);
+const agentMerge = () => ({
+  'agents-codex-alpha': {
+    writes: {
+      'notes/deploys.md': MERGED_DEPLOYS,
+      'notes/deploy-steps.md': 'MOVED TO [[deploys]]\n',
+      'notes/MEMORY.md': `${apiLine('deploys', 'How deploys go, with the steps')}\n`,
+    },
+  },
+});
+const writes = (log) => log.filter((r) => r.method === 'PUT' || r.method === 'DELETE');
+
+test('TC-AGENT-ORG-001 (driver): organize --agents merges two duplicate notes and records the scope in the bucket', (t) => {
+  const f = agentsFixture(t);
+  f.instruct(agentMerge());
+  const r = f.runAgents();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: applied, 3 change\(s\), USD 0\.25, stopped: completed$/m);
+  assert.match(r.stdout, /^# Organize agents\/codex-alpha — /m);
+  assert.match(r.stdout, /^- deploy-steps\.md → deploys\.md$/m);
+  const b = f.bucket();
+  assert.equal(b['agents/codex-alpha/deploy-steps.md'], undefined);
+  assert.equal(b['agents/codex-alpha/deploys.md'], MERGED_DEPLOYS);
+  assert.equal(b['agents/codex-alpha/MEMORY.md'], `${apiLine('deploys', 'How deploys go, with the steps')}\n`);
+  assert.deepEqual(JSON.parse(b['index/agents.json']).notes.map((n) => n.path), ['agents/codex-alpha/deploys.md']);
+  const state = JSON.parse(b['index/organizer.json']).scopes['codex-alpha'];
+  assert.ok(state.lastOrganize && state.lastOrganizeTried && /^[0-9a-f]{64}$/.test(state.organizedDigest));
+  assert.equal(state.lastOutcome.outcome, 'applied');
+  // Every write was conditional.
+  for (const w of writes(f.log())) assert.ok(w.ifMatch !== null || w.ifNoneMatch === '*', `${w.method} ${w.key}`);
+  // Nothing changed since: the next run takes nothing and calls no model.
+  const again = f.runAgents();
+  assert.equal(again.status, 0, again.stderr);
+  assert.match(again.stdout, /^organize: nothing to do$/m);
+  assert.equal(f.calls().length, 1);
+  // The model worked on a copy; it never saw the run's credentials.
+  assert.doesNotMatch(JSON.stringify(f.calls()), /ASIAEXAMPLE|example-signing/);
+});
+
+test('TC-AGENT-ORG-004: organize --agents --dry-run reports the result and writes nothing to the bucket', (t) => {
+  const f = agentsFixture(t);
+  f.instruct(agentMerge());
+  const before = readFileSync(f.bucketFile, 'utf8');
+  const r = f.runAgents('--dry-run', '--keep');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: dry-run, 3 change\(s\)/m);
+  assert.match(r.stdout, /^- deploy-steps\.md → deploys\.md$/m);
+  assert.deepEqual(writes(f.log()), []);
+  assert.equal(readFileSync(f.bucketFile, 'utf8'), before);
+  assert.match(r.stdout, /work folder kept: /);
+});
+
+test('TC-AGENT-ORG-003 (driver): a note an agent writes while the model runs is kept; nothing of the run is applied', (t) => {
+  const f = agentsFixture(t);
+  const theirs = apiNote('fresh', 'Written meanwhile', 'An agent wrote this through the API during the run.');
+  f.instruct({ 'agents-codex-alpha': { ...agentMerge()['agents-codex-alpha'], bucketWrites: { 'agents/codex-alpha/fresh.md': theirs } } });
+  const r = f.runAgents();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: changed meanwhile, nothing applied/m);
+  assert.match(r.stdout, /^ {2}- changed meanwhile: fresh\.md$/m);
+  const b = f.bucket();
+  assert.equal(b['agents/codex-alpha/fresh.md'], theirs);
+  assert.ok(b['agents/codex-alpha/deploy-steps.md'], 'nothing retired');
+  assert.equal(writes(f.log()).filter((w) => w.key !== 'index/organizer.json').length, 0);
+  const state = JSON.parse(b['index/organizer.json']).scopes['codex-alpha'];
+  assert.equal(state.organizedDigest, undefined, 'the scope stays due');
+  assert.ok(state.lastOrganizeTried);
+});
+
+test('TC-AGENT-ORG-002 (driver): a result that drops content is rejected after one repair run; the bucket is unchanged', (t) => {
+  const f = agentsFixture(t);
+  f.instruct({ 'agents-codex-alpha': { writes: {
+    'notes/deploys.md': apiNote('deploys', 'How deploys go', 'Deploys exist.'),
+    'notes/deploy-steps.md': 'MOVED TO [[deploys]]\n',
+    'notes/MEMORY.md': `${apiLine('deploys', 'How deploys go')}\n`,
+  } } });
+  const before = Object.entries(f.bucket()).filter(([k]) => k !== 'index/organizer.json');
+  const r = f.runAgents();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: rejected, nothing applied \(\d+ rule violation\(s\)\), USD 0\.50, stopped: completed, one repair run/m);
+  assert.match(r.stdout, /most of this note's content is missing/);
+  assert.equal(f.calls().length, 2);
+  assert.deepEqual(Object.entries(f.bucket()).filter(([k]) => k !== 'index/organizer.json'), before);
+  assert.doesNotMatch(r.stdout, /search entries/, 'entries in step are left alone');
+  // A completed model that was rejected marks the content as seen: the next run does not repeat it.
+  assert.match(f.runAgents().stdout, /^organize: nothing to do$/m);
+});
+
+test('organize --agents: a rejected result on a scope with entries out of step still rewrites the entries', (t) => {
+  const f = agentsFixture(t);
+  const objects = JSON.parse(readFileSync(f.bucketFile, 'utf8'));
+  const doc = JSON.parse(Buffer.from(objects['index/agents.json'].body, 'base64').toString('utf8'));
+  doc.notes = doc.notes.filter((n) => n.path !== 'agents/codex-alpha/deploy-steps.md');
+  const text = JSON.stringify(doc);
+  objects['index/agents.json'] = { body: Buffer.from(text).toString('base64'), etag: md5(text) };
+  writeFileSync(f.bucketFile, JSON.stringify(objects));
+  f.instruct({ 'agents-codex-alpha': { writes: { 'notes/deploys.md': apiNote('deploys', 'How deploys go', 'Deploys exist.') } } });
+  const r = f.runAgents();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: rejected, nothing applied/m);
+  assert.match(r.stdout, /^ {2}- the search entries of the scope did not match its notes and were rewritten from them$/m);
+  assert.deepEqual(JSON.parse(f.bucket()['index/agents.json']).notes.map((n) => n.path), ['agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md']);
+  assert.equal(f.bucket()['agents/codex-alpha/deploys.md'], apiNote('deploys', 'How deploys go', AGENT_FACTS), 'the notes are untouched');
+});
+
+test('organize --agents: a scope with an object too large to be a note is skipped; the next scope still runs', (t) => {
+  const f = agentsFixture(t);
+  const objects = JSON.parse(readFileSync(f.bucketFile, 'utf8'));
+  objects['agents/aaa-first/huge.md'] = { body: Buffer.from('x'.repeat(1_000_001)).toString('base64'), etag: '"huge"' };
+  writeFileSync(f.bucketFile, JSON.stringify(objects));
+  f.instruct(agentMerge());
+  const r = f.runAgents();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize agents\/aaa-first: skipped, 0 change\(s\), USD 0\.00$/m);
+  assert.match(r.stdout, /^ {2}- a note of this scope is larger than 1000000 bytes$/m);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: applied, 3 change\(s\)/m);
+  // It goes to the back of the queue: it never keeps the others waiting.
+  assert.ok(JSON.parse(f.bucket()['index/organizer.json']).scopes['aaa-first'].lastOrganizeTried);
+});
+
+test('organize --agents: search entries out of step with the notes are reported by a dry run and rewritten by a run', (t) => {
+  const f = agentsFixture(t);
+  const objects = JSON.parse(readFileSync(f.bucketFile, 'utf8'));
+  const doc = JSON.parse(Buffer.from(objects['index/agents.json'].body, 'base64').toString('utf8'));
+  doc.notes = doc.notes.filter((n) => n.path !== 'agents/codex-alpha/deploy-steps.md');
+  const text = JSON.stringify(doc);
+  objects['index/agents.json'] = { body: Buffer.from(text).toString('base64'), etag: md5(text) };
+  writeFileSync(f.bucketFile, JSON.stringify(objects));
+  f.instruct({});
+  const dry = f.runAgents('--dry-run');
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /^organize agents\/codex-alpha: no-change, 0 change\(s\)/m);
+  assert.match(dry.stdout, /^ {2}- the search entries of the scope do not match its notes; a run without --dry-run rewrites them$/m);
+  assert.deepEqual(writes(f.log()), []);
+  const r = f.runAgents();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^ {2}- the search entries of the scope did not match its notes and were rewritten from them$/m);
+  assert.deepEqual(JSON.parse(f.bucket()['index/agents.json']).notes.map((n) => n.path), ['agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md']);
+});
+
+test('organize --agents: usage errors, a missing agents block and missing credentials', (t) => {
+  const f = agentsFixture(t);
+  for (const args of [['--project', 'p'], ['--agent', 'Bad_Name'], ['--agent']]) {
+    const r = f.runAgents(...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /^usage: /m);
+  }
+  assert.equal(f.runWith(f.awsEnv, 'extract', '--agents').status, 2);
+  const unknown = f.runAgents('--agent', 'nobody');
+  assert.equal(unknown.status, 2);
+  assert.match(unknown.stderr, /"nobody" is not an agent scope of the bucket\./);
+  const noCreds = f.runWith({ ...f.awsEnv, AWS_SESSION_TOKEN: '' }, 'organize', '--agents');
+  assert.equal(noCreds.status, 1);
+  assert.match(noCreds.stderr, /the agent scopes could not be read \(credentials failed: 0 NoEnvironment\)/);
+  const plain = agentsFixture(t, { block: null });
+  const r = plain.runAgents();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /organizing the agent scopes needs "agents" in the consolidate block/);
+  assert.deepEqual(plain.calls(), []);
 });

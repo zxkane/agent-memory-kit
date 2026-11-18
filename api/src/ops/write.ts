@@ -22,10 +22,11 @@ import { parseWrite } from '../validate.ts';
 
 // Quotas that add up: 16 scopes of at most 240,000 bytes is 3,840,000, below the 4,000,000-byte
 // total, so a full scope cannot take room from another one.
-const MAX_SCOPE_NOTES = 200;
-const MAX_SCOPE_BYTES = 240_000;
+// Exported for the test that checks the workstation's Organize run for agent scopes against them.
+export const MAX_SCOPE_NOTES = 200;
+export const MAX_SCOPE_BYTES = 240_000;
 const MAX_SCOPES = 16;
-const MAX_SNAPSHOT_BYTES = 4_000_000;
+export const MAX_SNAPSHOT_BYTES = 4_000_000;
 const SNAPSHOT_KEY = 'index/agents.json';
 
 function refuseCredentials(text: string): void {

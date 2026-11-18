@@ -12,6 +12,11 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  AGENT_RE, AgentScopeError, agentScopeProblems, agentScopesS3, applyAgentScope, copyAgentScope, listAgentScopes,
+  noteCount, readOrganizerState, recordOrganizerState, repairAgentEntries, scopeDigest,
+} from './lib/agent-scopes.mjs';
+import { AwsError } from './lib/aws.mjs';
 import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
@@ -39,7 +44,7 @@ const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
-const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]';
+const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]';
 const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
 const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -465,8 +470,7 @@ function stepApply(config, rest) {
     // following a link; the result says that this step made the copy.
     let original = false;
     if (outcome === 'rejected' && a['--keep-original'] === true) {
-      rmSync(join(work, ORIGINAL), { recursive: true, force: true });
-      snapshot([{ label: 'original', liveDir: pairs[0].liveDir, workDir: join(work, ORIGINAL) }]);
+      copyOriginal(work, pairs[0].liveDir);
       original = true;
     }
     out({ ...result, outcome, report: withReport ? report() : null, digest, original });
@@ -528,7 +532,7 @@ function stepMain(args) {
 function parseDriverArgs(argv) {
   const [kind, ...rest] = argv;
   if (!KINDS.includes(kind)) return null;
-  const opts = { kind, projects: [], dryRun: false, keep: false, model: undefined, minRetention: undefined };
+  const opts = { kind, projects: [], agents: false, agentNames: [], dryRun: false, keep: false, model: undefined, minRetention: undefined };
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === '--dry-run') {
@@ -539,6 +543,13 @@ function parseDriverArgs(argv) {
       const v = rest[++i];
       if (!(v === GLOBAL || isPlainName(v))) return null;
       if (!opts.projects.includes(v)) opts.projects.push(v);
+    } else if (arg === '--agents') {
+      opts.agents = true;
+    } else if (arg === '--agent') {
+      const v = rest[++i];
+      if (typeof v !== 'string' || !AGENT_RE.test(v)) return null;
+      opts.agents = true;
+      if (!opts.agentNames.includes(v)) opts.agentNames.push(v);
     } else if (arg === '--model') {
       const v = rest[++i];
       if (opts.model !== undefined || typeof v !== 'string' || !MODEL_RE.test(v)) return null;
@@ -552,6 +563,8 @@ function parseDriverArgs(argv) {
     }
   }
   if (kind === 'extract' && opts.projects.includes(GLOBAL)) return null;
+  // The agent scopes are organized only, and never together with the clone's scopes.
+  if (opts.agents && (kind !== 'organize' || opts.projects.length > 0)) return null;
   return opts;
 }
 
@@ -798,20 +811,68 @@ async function signalsHandled() {
   return interrupted;
 }
 
-// One scope: snapshot (locked), model run on the copy, apply (locked).
-async function runScope({ config, opts, model, runDir, scope, digest }) {
+// The two steps of a clone scope, each a locked step (`run.sh consolidate-step`).
+// `snapshot(work)` copies the scope into the work folder and returns `{ hasGlobal }`, or `{ done }`
+// with the scope's result when it cannot go on. `apply(work, run, modelInfo, options)` judges the
+// result and applies it, and returns the step's result.
+function cloneSteps({ opts, model, scope, digest }) {
+  let planBuf = null;
+  return {
+    async snapshot(work) {
+      const snapStep = runStep(['snapshot', '--work', work, '--kind', opts.kind, '--scope', scope]);
+      const snap = snapStep.result;
+      if (await signalsHandled()) return { done: { outcome: 'aborted' } };
+      if (!snap) return { done: { outcome: 'step-failed', step: 'snapshot', lockTimeout: lockTimedOut(snapStep) } };
+      if (snap.outcome !== 'snapshot') return { done: { ...snap, step: 'snapshot' } };
+      planBuf = readFileSync(join(work, 'plan.json'));
+      return { hasGlobal: JSON.parse(planBuf.toString('utf8')).pairs.some((p) => p.label === GLOBAL) };
+    },
+    // The apply step for the model figures of `run`: its result, or how it ended without one.
+    async apply(work, run, modelInfo, { keepOriginal = false, repaired = 0 } = {}) {
+      const args = [
+        'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', run.stopReason,
+        '--cost', run.costUsd === null ? 'unknown' : String(run.costUsd), '--turns', run.turns === null ? 'unknown' : String(run.turns),
+        '--denials', String(run.denials),
+        '--model', model, '--min-retention', opts.minRetention === undefined ? 'default' : String(opts.minRetention),
+        '--conversation', conversationArg(digest ? conversationOf(digest) : null), '--repaired', String(repaired),
+      ];
+      if (keepOriginal) args.push('--keep-original');
+      if (opts.dryRun) args.push('--dry-run');
+      const applyStep = runStep(args);
+      const res = applyStep.result;
+      // An apply step that finished stands, signal or not: its line says what happened to the notes
+      // and the run stops afterwards. One that ended without its line ended in one of three ways:
+      // - the wait for the sync lock timed out (run.sh exit LOCK_TIMEOUT_CODE): nothing was done;
+      // - SIGINT, SIGTERM or SIGHUP killed it: that is only possible before its handlers existed,
+      //   so before it did anything. The run stops as interrupted by that signal, even when only
+      //   the step received it;
+      // - anything else (SIGKILL, a crash): it may have applied and committed changes, so it is
+      //   never reported as "nothing applied".
+      await signalsHandled();
+      if (!res) {
+        if (lockTimedOut(applyStep)) return { outcome: 'step-failed', step: 'apply', lockTimeout: true };
+        if (INTERRUPT_SIGNALS.includes(applyStep.signal)) {
+          onSignal(applyStep.signal);
+          return { outcome: 'aborted' };
+        }
+        return { outcome: 'apply-interrupted', step: 'apply' };
+      }
+      return { ...res, step: 'apply' };
+    },
+  };
+}
+
+// One scope: snapshot, model run on the copy, apply. `steps` are the clone's locked steps unless
+// given; `folder` names the scope's work folder in the run folder.
+async function runScope({ config, opts, model, runDir, scope, digest, folder = scope, steps = cloneSteps({ opts, model, scope, digest }) }) {
   const c = config.consolidate;
-  const work = join(runDir, scope);
+  const work = join(runDir, folder);
   mkdirSync(work, { mode: 0o700 });
   chmodSync(work, 0o700);
   try {
-    const snapStep = runStep(['snapshot', '--work', work, '--kind', opts.kind, '--scope', scope]);
-    const snap = snapStep.result;
-    if (await signalsHandled()) return { outcome: 'aborted', work };
-    if (!snap) return { outcome: 'step-failed', step: 'snapshot', lockTimeout: lockTimedOut(snapStep), work };
-    if (snap.outcome !== 'snapshot') return { ...snap, step: 'snapshot', work };
-    const planBuf = readFileSync(join(work, 'plan.json'));
-    const hasGlobal = JSON.parse(planBuf.toString('utf8')).pairs.some((p) => p.label === GLOBAL);
+    const ready = await steps.snapshot(work);
+    if (ready.done) return { ...ready.done, work };
+    const { hasGlobal } = ready;
     let cwd = work;
     let prompt;
     const addDirs = [];
@@ -849,39 +910,7 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
       };
     };
     const infoOf = (run) => ({ ran: run.ran, stopReason: run.stopReason, costUsd: run.costUsd, denials: run.denials });
-    // The apply step for the model figures of `run`: its result, or how it ended without one.
-    const applyOnce = async (run, { keepOriginal = false, repaired = 0 } = {}) => {
-      const args = [
-        'apply', '--work', work, '--plan-sha256', sha256(planBuf), '--stop-reason', run.stopReason,
-        '--cost', run.costUsd === null ? 'unknown' : String(run.costUsd), '--turns', run.turns === null ? 'unknown' : String(run.turns),
-        '--denials', String(run.denials),
-        '--model', model, '--min-retention', opts.minRetention === undefined ? 'default' : String(opts.minRetention),
-        '--conversation', conversationArg(digest ? conversationOf(digest) : null), '--repaired', String(repaired),
-      ];
-      if (keepOriginal) args.push('--keep-original');
-      if (opts.dryRun) args.push('--dry-run');
-      const applyStep = runStep(args);
-      const res = applyStep.result;
-      const modelInfo = infoOf(run);
-      // An apply step that finished stands, signal or not: its line says what happened to the notes
-      // and the run stops afterwards. One that ended without its line ended in one of three ways:
-      // - the wait for the sync lock timed out (run.sh exit LOCK_TIMEOUT_CODE): nothing was done;
-      // - SIGINT, SIGTERM or SIGHUP killed it: that is only possible before its handlers existed,
-      //   so before it did anything. The run stops as interrupted by that signal, even when only
-      //   the step received it;
-      // - anything else (SIGKILL, a crash): it may have applied and committed changes, so it is
-      //   never reported as "nothing applied".
-      await signalsHandled();
-      if (!res) {
-        if (lockTimedOut(applyStep)) return { outcome: 'step-failed', step: 'apply', lockTimeout: true, model: modelInfo, work };
-        if (INTERRUPT_SIGNALS.includes(applyStep.signal)) {
-          onSignal(applyStep.signal);
-          return { outcome: 'aborted', model: modelInfo, work };
-        }
-        return { outcome: 'apply-interrupted', step: 'apply', model: modelInfo, work };
-      }
-      return { ...res, step: 'apply', model: modelInfo, work };
-    };
+    const applyOnce = async (run, options) => ({ ...(await steps.apply(work, run, infoOf(run), options)), model: infoOf(run), work });
 
     const first = await runOnce(prompt, c.maxBudgetUsd, addDirs);
     if (await signalsHandled()) return { outcome: 'aborted', model: infoOf(first), work };
@@ -897,7 +926,7 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
       // `no-change` always means the model completed and found nothing.
       if (res.outcome === 'no-change' && first.stopReason !== 'completed') {
         // Beside the scope's work folder, in the run folder: no folder the model can write to.
-        const stderrLog = join(runDir, `model-stderr-${scope}.log`);
+        const stderrLog = join(runDir, `model-stderr-${folder}.log`);
         writeFileSync(stderrLog, first.stderrTail, { mode: 0o600 });
         chmodSync(stderrLog, 0o600);
         return { ...res, outcome: 'model-failed', repairs: 0 };
@@ -925,6 +954,233 @@ async function runScope({ config, opts, model, runDir, scope, digest }) {
   } finally {
     if (!opts.keep) removeTree(work);
   }
+}
+
+// ---- Agent scopes: agents/<agent>/ in the memory API's bucket (organize --agents) ----
+
+// What an AWS or agent-scope error may print: its own fixed message; anything else is one line.
+const awsText = (err) => (err instanceof AwsError || err instanceof AgentScopeError ? err.message : firstLine(err));
+
+// For a repair run: a reference copy of the scope's notes as they were taken, in original/ of the
+// work folder. Whatever the model left there is removed first, without following a link.
+function copyOriginal(work, liveDir) {
+  rmSync(join(work, ORIGINAL), { recursive: true, force: true });
+  snapshot([{ label: 'original', liveDir, workDir: join(work, ORIGINAL) }]);
+}
+
+// The two steps of an agent scope, with the same contract as cloneSteps, run in this process. The
+// copy as it was taken sits beside the work folder, outside the folders the model client may use;
+// nothing is written to the bucket before the result passed every rule, and never in a dry run.
+function agentSteps({ config, opts, model, agent, s3For, runDir }) {
+  const scope = `agents/${agent}`;
+  let plan = null;
+  let pairs = null;
+  let snap = null;
+  const liveDir = join(runDir, `live-${agent}`);
+  return {
+    async snapshot(work) {
+      mkdirSync(liveDir, { mode: 0o700 });
+      try {
+        plan = await copyAgentScope({ s3: await s3For({ signal: abort.signal }), agent, dir: liveDir });
+      } catch (err) {
+        if (await signalsHandled()) return { done: { outcome: 'aborted' } };
+        if (err instanceof AgentScopeError && err.skip) return { done: { outcome: 'skipped', reason: err.message } };
+        return { done: { outcome: 'error', step: 'snapshot', error: awsText(err) } };
+      }
+      if (await signalsHandled()) return { done: { outcome: 'aborted' } };
+      pairs = [{ label: 'notes', liveDir, workDir: join(work, 'notes') }];
+      snap = snapshot(pairs);
+      return { hasGlobal: false };
+    },
+    async apply(work, run, modelInfo, { keepOriginal = false, repaired = 0 } = {}) {
+      const ev = evaluate({ pairs, snap, allowRetire: true, minRetention: opts.minRetention });
+      const workDir = pairs[0].workDir;
+      const errors = [...safeErrors(ev.errors, ['notes']), ...agentScopeProblems({ agent, plan, changes: ev.changes, liveDir, workDir })];
+      const now = new Date();
+      const descriptions = new Map();
+      for (const c of ev.changes.filter((x) => x.kind === 'add')) {
+        const buf = readRegular(join(workDir, c.file));
+        if (buf && sha256(buf) === c.hash) descriptions.set(`notes/${c.file}`, cleanDescription(parseNote(buf.toString('utf8')).description));
+      }
+      const report = () => buildReport({
+        config, kind: 'organize', scope, date: now.toISOString().slice(0, 10), model, stopReason: run.stopReason,
+        costUsd: run.costUsd, turns: run.turns, denials: run.denials, pairs, snap, ev, descriptions, conversation: null, repaired,
+      });
+      const result = {
+        step: 'apply', errors, changes: ev.changes.map((c) => ({ label: c.label, file: shown(c.file), kind: c.kind, target: c.target })),
+        ignored: ev.ignored, stats: ev.stats, liveChanged: ev.liveChanged.map(shown),
+      };
+      // Search entries that do not describe the notes (a write that stopped part-way) are rewritten
+      // from them, also when the model changed nothing.
+      const repairEntries = ev.changes.length === 0 && !plan.inStep;
+      let outcome = null;
+      if (ev.liveChanged.length > 0) outcome = 'changed-meanwhile';
+      else if (errors.length > 0) outcome = 'rejected';
+      else if (ev.changes.length === 0 && !repairEntries) outcome = 'no-change';
+      else if (opts.dryRun) outcome = ev.changes.length === 0 ? 'no-change' : 'dry-run';
+      if (outcome !== null) {
+        let original = false;
+        if (outcome === 'rejected' && keepOriginal) {
+          copyOriginal(work, liveDir);
+          original = true;
+        }
+        const withReport = outcome === 'dry-run' || (opts.dryRun && outcome === 'rejected');
+        return { ...result, outcome, report: withReport ? report() : null, original, entriesOutOfStep: repairEntries };
+      }
+      // The writes are not given the run's signal: once they started they finish, and say what was done.
+      let res;
+      try {
+        res = await applyAgentScope({ s3: await s3For(), agent, plan, changes: ev.changes, liveDir, workDir });
+      } catch (err) {
+        return err.partial ? { ...result, outcome: 'apply-interrupted', reason: awsText(err) } : { ...result, outcome: 'error', error: awsText(err) };
+      }
+      if (res.outcome === 'changed-meanwhile') return { ...result, outcome: res.outcome, liveChanged: res.liveChanged.map(shown) };
+      if (res.outcome === 'rejected') return { ...result, outcome: res.outcome, errors: res.errors };
+      const extra = { digest: res.digest, keptNewer: res.keptNewer.map(shown), kept: res.kept.map(shown) };
+      if (repairEntries) return { ...result, outcome: 'no-change', entriesRepaired: true, ...extra };
+      return { ...result, outcome: 'applied', report: report(), ...extra };
+    },
+    // After the scope's final verdict, when it wrote nothing (rejected): search entries out of step
+    // with the copied notes are still rewritten from them, so that the marks never move past them.
+    async repairEntries() {
+      if (plan === null || opts.dryRun) return false;
+      return repairAgentEntries({ s3: await s3For(), agent, plan, liveDir });
+    },
+  };
+}
+
+// Organize: an agent scope with notes is due when its notes changed since a run organized it (or
+// none ever did). The one whose model was started longest ago goes first (never first). Named
+// scopes are all taken, in the order given.
+function agentScopesDue(scopes, state, opts) {
+  const infos = [...scopes].map(([agent, files]) => ({ agent, files, digest: scopeDigest(files) }));
+  if (opts.agentNames.length > 0) return opts.agentNames.map((agent) => infos.find((i) => i.agent === agent));
+  const entry = (i) => state.scopes[i.agent];
+  const tried = (i) => timeOf(entry(i)?.lastOrganizeTried) ?? -Infinity;
+  const older = (a, b) => (a === b ? 0 : a - b);
+  return infos.filter((i) => noteCount(i.files) > 0 && i.digest !== entry(i)?.organizedDigest)
+    .sort((x, y) => older(tried(x), tried(y)) || byName(x.agent, y.agent));
+}
+
+// Moves an agent scope's marks in index/organizer.json, as record() does for a clone scope: the
+// content mark after `applied`, `no-change` and a `rejected` result of a completed model, at the
+// digest the run left (or found) the scope with; the ordering mark whenever the model was started,
+// and for a scope that was skipped, so that it does not stay first. Never in a dry run.
+async function recordAgent(s3For, agent, res, started, digestBefore) {
+  const completed = res.model?.stopReason === 'completed';
+  const advance = res.outcome === 'applied' || res.outcome === 'no-change' || (res.outcome === 'rejected' && completed);
+  await recordOrganizerState(await s3For(), agent, (entry) => {
+    if (modelStarted(res) || res.repairs > 0 || res.outcome === 'skipped') entry.lastOrganizeTried = started.toISOString();
+    if (advance) {
+      entry.lastOrganize = started.toISOString();
+      entry.organizedDigest = res.digest ?? digestBefore;
+    }
+    entry.lastOutcome = {
+      at: new Date().toISOString(), outcome: res.outcome, stopReason: res.model?.stopReason ?? null,
+      costUsd: res.model?.costUsd ?? null, denials: res.model?.denials ?? null, repairs: res.repairs ?? 0,
+    };
+    return entry;
+  });
+}
+
+// The lines an agent scope adds below its headline.
+function agentLines(res) {
+  const lines = [];
+  for (const file of res.keptNewer ?? []) lines.push(`  - an agent wrote ${file} again meanwhile; its version was kept`);
+  for (const file of res.kept ?? []) lines.push(`  - ${file} was not retired: the note it went to does not hold what this run wrote`);
+  if (res.entriesRepaired) lines.push('  - the search entries of the scope did not match its notes and were rewritten from them');
+  else if (res.entriesOutOfStep) lines.push('  - the search entries of the scope do not match its notes; a run without --dry-run rewrites them');
+  if (res.recordError) lines.push(`  - the run could not be recorded in index/organizer.json: ${res.recordError}`);
+  return lines.length === 0 ? '' : `${lines.join('\n')}\n`;
+}
+
+async function agentsMain({ config, opts, model, started }) {
+  const c = config.consolidate;
+  if (!c.agents) {
+    process.stdout.write(`agent-memory: organizing the agent scopes needs "agents" in the consolidate block of ${configPath()}; nothing was run.\n`);
+    return 1;
+  }
+  const s3For = agentScopesS3(c.agents);
+  let scopes;
+  let state;
+  try {
+    const s3 = await s3For({ signal: abort.signal });
+    scopes = await listAgentScopes(s3);
+    state = await readOrganizerState(s3);
+  } catch (err) {
+    if (await signalsHandled()) {
+      process.stdout.write(`organize: interrupted by ${interrupted}; nothing was applied\n`);
+      return SIGNAL_CODES[interrupted];
+    }
+    process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${awsText(err)})\n`);
+    return 1;
+  }
+  for (const name of opts.agentNames) {
+    if (!scopes.has(name)) {
+      process.stderr.write(`agent-memory consolidate: ${JSON.stringify(name)} is not an agent scope of the bucket.\n${USAGE}\n`);
+      return 2;
+    }
+  }
+  const list = agentScopesDue(scopes, state, opts);
+  const limit = opts.agentNames.length > 0 ? Infinity : c.maxProjects;
+  const ceiling = (opts.agentNames.length > 0 ? opts.agentNames.length : c.maxProjects) * c.maxBudgetUsd;
+  let calls = 0;
+  let spent = 0;
+  let runDir = null;
+  let failed = false;
+  try {
+    for (const item of list) {
+      if ((await signalsHandled()) || calls >= limit) break;
+      if (spent >= ceiling) {
+        process.stdout.write(`organize: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}\n`);
+        break;
+      }
+      runDir ??= makeRunDir(config, started, opts.keep);
+      calls += 1;
+      const scope = `agents/${item.agent}`;
+      const steps = agentSteps({ config, opts, model, agent: item.agent, s3For, runDir });
+      const res = await runScope({ config, opts, model, runDir, scope, folder: `agents-${item.agent}`, steps });
+      spent += spentBy(res, c);
+      if (res.outcome === 'rejected') {
+        try {
+          if (await steps.repairEntries()) res.entriesRepaired = true;
+        } catch (err) {
+          res.reason = `the search entries of the scope could not be rewritten: ${awsText(err)}`;
+          failed = true;
+        }
+      }
+      if (!opts.dryRun) {
+        try {
+          await recordAgent(s3For, item.agent, res, started, item.digest);
+        } catch (err) {
+          res.recordError = awsText(err);
+          failed = true;
+        }
+      }
+      printScope('organize', scope, res, opts, config.repoDir);
+      process.stdout.write(agentLines(res));
+      if (res.outcome === 'aborted') break;
+      if (res.outcome === 'step-failed' || res.outcome === 'error' || res.outcome === 'apply-interrupted') {
+        failed = true;
+        break;
+      }
+      if (res.outcome === 'model-failed') {
+        failed = true;
+        if (NOT_STARTED.includes(res.model.stopReason)) {
+          process.stdout.write(`organize: stopped; the model command could not be started (${res.model.stopReason})\n`);
+          break;
+        }
+      }
+    }
+  } finally {
+    if (runDir && !opts.keep) removeTree(runDir);
+  }
+  if (await signalsHandled()) {
+    process.stdout.write(`organize: interrupted by ${interrupted}; nothing more was applied\n`);
+    return SIGNAL_CODES[interrupted];
+  }
+  if (list.length === 0) process.stdout.write('organize: nothing to do\n');
+  return failed ? 1 : 0;
 }
 
 // The figures of a first run and its repair run together: costs, turns and denials summed (unknown
@@ -1019,7 +1275,9 @@ function headline(kind, scope, res) {
 
 function printScope(kind, scope, res, opts, repoDir) {
   const lines = [headline(kind, scope, res)];
-  if (res.outcome === 'apply-interrupted') {
+  if (res.outcome === 'apply-interrupted' && scope.startsWith('agents/')) {
+    lines.push('  - writing the result to the bucket stopped part-way; the next run finds the scope changed and organizes it again');
+  } else if (res.outcome === 'apply-interrupted') {
     lines.push('  - the apply step ended without reporting its result; look at the log of the notes repository'
       + ` (git -C ${repoDir} log) for a consolidate(...) commit, and at its working tree`);
   }
@@ -1071,6 +1329,7 @@ async function driverMain(argv) {
   const started = new Date();
   const now = started.getTime();
   removeStaleRuns(config, now);
+  if (opts.agents) return agentsMain({ config, opts, model, started });
   if (opts.kind === 'extract' && config.codexDir === null) {
     process.stdout.write(`agent-memory consolidate: codexDir in ${configPath()} is not an absolute path; Codex sessions are not read.\n`);
   }

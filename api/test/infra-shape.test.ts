@@ -14,7 +14,7 @@ const read = (rel: string): string => readFileSync(new URL(rel, root), 'utf8');
 
 describe('infrastructure source', () => {
   it('has the expected program files', () => {
-    for (const f of ['sst.config.ts', 'infra/policies.ts', 'infra/storage.ts', 'infra/auth.ts', 'infra/api.ts', 'infra/http.ts', 'infra/mode.ts', 'infra/workstation.ts']) {
+    for (const f of ['sst.config.ts', 'infra/policies.ts', 'infra/storage.ts', 'infra/auth.ts', 'infra/api.ts', 'infra/http.ts', 'infra/mode.ts', 'infra/workstation.ts', 'infra/organizer.ts']) {
       assert.ok(files.includes(f), f);
     }
   });
@@ -171,9 +171,38 @@ describe('infrastructure source', () => {
     assert.match(read('sst.config.ts'), /import\("\.\/infra\/workstation\.ts"\)/);
   });
 
+  it('creates the organizer role, its policy and its parameter only inside the branch on its own two variables', () => {
+    const src = squash('infra/organizer.ts');
+    const branch = src.match(/if\(roleArns\.length>0\|\|githubSubjects\.length>0\)\{(.*)\}$/);
+    assert.ok(branch, 'branch on the organizer role ARNs or GitHub subjects');
+    const body = branch[1] as string;
+    for (const pattern of [/newaws\.iam\.Role\(/g, /newaws\.iam\.RolePolicy\(/g, /newaws\.ssm\.Parameter\(/g]) {
+      assert.equal((src.match(pattern) ?? []).length, 1, String(pattern));
+      assert.equal((body.match(pattern) ?? []).length, 1, String(pattern));
+    }
+    assert.match(src, /constroleArns=mode\.organizerRoleArns;/);
+    assert.match(src, /constgithubSubjects=mode\.organizerGithubSubjects;/);
+    assert.doesNotMatch(src, /mode\.workstationRoleArns|mode\.githubSubjects|process\.env/);
+    assert.match(body, /name:`\$\{\$app\.name\}-\$\{\$app\.stage\}-organizer`/);
+    assert.match(body, /maxSessionDuration:3600/);
+    assert.match(body, /assumeRolePolicy:trustDocument/);
+    assert.match(body, /organizerRolePolicy\(arn\)/);
+    assert.match(body, /name:`\$\{prefix\}\/organizer\/role-arn`/);
+    assert.match(src, /jobsTrustPolicy\(/);
+    assert.doesNotMatch(src, /OpenIdConnectProvider|managedPolicyArns|aws\.iam\.RolePolicyAttachment/);
+    // The two data sources are read only in the arm taken when subjects are given.
+    const split = src.match(/^(.*?)githubSubjects\.length===0\?(.*?):(\$interpolate.*)$/);
+    assert.ok(split, 'the choice on the subjects');
+    assert.doesNotMatch(`${split[1]}${split[2]}`, /getCallerIdentityOutput|getPartitionOutput/);
+    assert.match(read('sst.config.ts'), /import\("\.\/infra\/organizer\.ts"\)/);
+  });
+
   describe('deployment switches', () => {
     it('parses the four variables in mode.ts only, before any resource', () => {
-      for (const name of ['AGENT_MEMORY_INVOKER_ROLE_ARNS', 'AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'AGENT_MEMORY_GITHUB_SUBJECTS', 'AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN']) {
+      for (const name of [
+        'AGENT_MEMORY_INVOKER_ROLE_ARNS', 'AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'AGENT_MEMORY_GITHUB_SUBJECTS',
+        'AGENT_MEMORY_ORGANIZER_ROLE_ARNS', 'AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS', 'AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN',
+      ]) {
         assert.match(read('infra/mode.ts'), new RegExp(name));
         for (const f of files.filter((f) => f !== 'infra/mode.ts')) {
           assert.doesNotMatch(read(f), new RegExp(`process\\.env\\.${name}`), f);
@@ -284,7 +313,7 @@ describe('infrastructure source', () => {
       );
       assert.deepEqual(
         declared.map(([f, name]) => `${f} ${name}`),
-        ['infra/workstation.ts WorkstationBridgeRole', 'infra/workstation.ts WorkstationCanaryRole'],
+        ['infra/organizer.ts AgentScopesOrganizerRole', 'infra/workstation.ts WorkstationBridgeRole', 'infra/workstation.ts WorkstationCanaryRole'],
       );
       for (const [, name, body] of declared) {
         assert.ok((body as string).includes(`...${boundary},`), name);
@@ -293,7 +322,7 @@ describe('infrastructure source', () => {
       for (const f of files.filter((f) => f !== 'infra/policies.ts')) {
         assert.doesNotMatch(read(f), /permissionsBoundary\s*[:=]/, f);
       }
-      for (const f of ['infra/api.ts', 'infra/workstation.ts']) {
+      for (const f of ['infra/api.ts', 'infra/workstation.ts', 'infra/organizer.ts']) {
         assert.match(read(f), /import\s*\{[^}]*\bpermissionsBoundaryArgs\b[^}]*\}\s*from\s*"\.\/policies\.ts"/, f);
       }
     });

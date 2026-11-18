@@ -24,8 +24,9 @@ function calendar(value) {
 
 const CONSOLIDATE_KEYS = [
   'command', 'model', 'env', 'extract', 'organize', 'maxProjects', 'maxTranscriptBytes', 'maxTurns', 'maxBudgetUsd',
-  'timeoutMinutes',
+  'timeoutMinutes', 'agents',
 ];
+const AGENTS_KEYS = ['bucket', 'region', 'roleArn', 'credentials'];
 
 // Whether an unknown key may be printed by name (the driver and setup.sh echo the problem field):
 // only a word-shaped key (a misspelling is a word), and not one that the secret scan flags, such
@@ -34,6 +35,24 @@ const CONSOLIDATE_KEYS = [
 const WORD_KEY_RE = /^[A-Za-z][A-Za-z_-]{0,31}$/;
 function echoable(key) {
   return WORD_KEY_RE.test(key) && scanText(key).length === 0;
+}
+
+// The optional `agents` part of the consolidation block: where an Organize run with `--agents` finds
+// the agent scopes (the memory API's bucket) and which credentials it takes. `{ value, problem }`,
+// the problem named `agents.<field>`.
+function parseAgents(block) {
+  if (block === undefined || block === null) return { value: null, problem: null };
+  const bad = (field) => ({ value: null, problem: field === null ? 'agents' : `agents.${field}` });
+  if (typeof block !== 'object' || Array.isArray(block)) return bad(null);
+  const unknown = Object.keys(block).find((key) => !AGENTS_KEYS.includes(key));
+  if (unknown !== undefined) return bad(echoable(unknown) ? unknown : '(an unknown key)');
+  if (typeof block.bucket !== 'string' || !BUCKET_RE.test(block.bucket)) return bad('bucket');
+  if (typeof block.region !== 'string' || !REGION_RE.test(block.region)) return bad('region');
+  const roleArn = block.roleArn ?? null;
+  if (roleArn !== null && (typeof roleArn !== 'string' || !ROLE_ARN_RE.test(roleArn))) return bad('roleArn');
+  const credentials = credentialSource(block.credentials);
+  if (credentials === undefined) return bad('credentials');
+  return { value: { bucket: block.bucket, region: block.region, roleArn, credentials }, problem: null };
 }
 
 // The optional consolidation block: `{ value, problem }`. An absent block gives no value and no
@@ -67,11 +86,13 @@ function parseConsolidate(block) {
     maxBudgetUsd: typeof budget === 'number' && budget > 0 && budget <= 100 ? budget : undefined,
   };
   for (const [name, value] of Object.entries(fields)) if (value === undefined) return bad(name);
+  const agents = parseAgents(block.agents);
+  if (agents.problem !== null) return bad(agents.problem);
   const { extract, organize, maxProjects, maxTranscriptBytes, maxTurns, maxBudgetUsd, timeoutMinutes } = fields;
   return {
     value: {
       command, model, env: { ...env }, extract, organize, maxProjects, maxTranscriptBytes, maxTurns,
-      maxBudgetUsd, timeoutMinutes,
+      maxBudgetUsd, timeoutMinutes, agents: agents.value,
     },
     problem: null,
   };

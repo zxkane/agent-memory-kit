@@ -11,6 +11,11 @@
 //                                        immutable form, repo:<owner>@<owner-id>/<repository>@<repository-id>:ref:refs/heads/main. When set, the same two
 //                                        roles also trust those jobs through the account's existing GitHub
 //                                        OIDC provider, which must exist. Either variable creates the roles.
+//   AGENT_MEMORY_ORGANIZER_ROLE_ARNS     optional, comma-separated ARNs of IAM roles that may assume the organizer
+//                                        role, which organizes the agent scopes (organize --agents): it may change
+//                                        and delete agent notes, with conditional writes only.
+//   AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS optional, comma-separated exact GitHub Actions subjects that may do the
+//                                        same. Either variable creates the role; without both it does not exist.
 //   AGENT_MEMORY_INVOKER_ROLE_ARNS       optional, comma-separated ARNs of the IAM roles that may invoke the
 //                                        function directly, for example the execution role of an AgentCore
 //                                        gateway. When set, the deployment serves direct invocation only:
@@ -69,6 +74,7 @@ export default $config({
     }
 
     await import("./infra/workstation.ts");
+    await import("./infra/organizer.ts");
 
     return outputs;
   },
