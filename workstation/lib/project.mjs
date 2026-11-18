@@ -40,7 +40,7 @@ export function memoryLinkPath(claudeDir, root) {
 // Reduces a remote URL to `host/path`: no scheme, user, password or port, host
 // in lower case, no trailing `.git` or `/`. Returns null for anything that does
 // not name a remote host (local paths, file URLs, Windows drive paths).
-function normalizeRemote(url) {
+export function normalizeRemote(url) {
   let host;
   let path;
   const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/(.*)$/.exec(url);
