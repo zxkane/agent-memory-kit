@@ -1,3 +1,12 @@
 node.local.path
 node_modules/
 .superpowers/
+# Machine-local files, never committed: local settings (such as Claude Code's
+# .claude/settings.local.json and CLAUDE.local.md) and environment files.
+*.local.*
+.local.json
+CLAUDE.local.md
+.env
+.env.*
+# Worktrees of the development workflow.
+.worktrees/
