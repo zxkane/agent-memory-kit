@@ -16,6 +16,11 @@
 //                                        and delete agent notes, with conditional writes only.
 //   AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS optional, comma-separated exact GitHub Actions subjects that may do the
 //                                        same. Either variable creates the role; without both it does not exist.
+//   AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS optional, comma-separated workflow files
+//                                        (<owner>/<repository>/.github/workflows/<file>.yml@refs/heads/<branch>) a
+//                                        job of those subjects must be defined in (GitHub's job_workflow_ref;
+//                                        commercial Regions). Set it with the subjects: a later deploy without
+//                                        it silently lets every job of the branch assume the role again.
 //   AGENT_MEMORY_INVOKER_ROLE_ARNS       optional, comma-separated ARNs of the IAM roles that may invoke the
 //                                        function directly, for example the execution role of an AgentCore
 //                                        gateway. When set, the deployment serves direct invocation only:

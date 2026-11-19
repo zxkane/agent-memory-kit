@@ -8,6 +8,7 @@ import {
   functionPolicy,
   logsPolicy,
   isGithubSubject,
+  isGithubWorkflowRef,
   isManagedPolicyArn,
   isRoleArn,
   jobsTrustPolicy,
@@ -235,7 +236,7 @@ describe('jobsTrustPolicy', () => {
   const PROVIDER = 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com';
   const SUBJECT = 'repo:o/r:ref:refs/heads/main';
   const roleStatement = { Effect: 'Allow', Principal: { AWS: [ROLE_A, ROLE_B] }, Action: 'sts:AssumeRole' };
-  const githubStatement = (subjects: string[]) => ({
+  const githubStatement = (subjects: string[], workflowRefs: string[] = []) => ({
     Effect: 'Allow',
     Principal: { Federated: PROVIDER },
     Action: 'sts:AssumeRoleWithWebIdentity',
@@ -243,6 +244,7 @@ describe('jobsTrustPolicy', () => {
       StringEquals: {
         'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
         'token.actions.githubusercontent.com:sub': subjects,
+        ...(workflowRefs.length > 0 ? { 'token.actions.githubusercontent.com:job_workflow_ref': workflowRefs } : {}),
       },
     },
   });
@@ -322,6 +324,60 @@ describe('jobsTrustPolicy', () => {
 
   it('still validates the role ARNs', () => {
     assert.throws(() => jobsTrustPolicy({ roleArns: ['*'], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER }), /role/i);
+  });
+
+  describe('workflow files', () => {
+    const WORKFLOW = 'o/r/.github/workflows/organize.yml@refs/heads/main';
+
+    it('binds the GitHub statement to the listed workflow files (job_workflow_ref) as a third condition', () => {
+      const doc = jobsTrustPolicy({ roleArns: [ROLE_A], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER, githubWorkflowRefs: [WORKFLOW] });
+      assert.deepEqual(doc.Statement[1], githubStatement([SUBJECT], [WORKFLOW]));
+      // The role statement is not affected.
+      assert.deepEqual(doc.Statement[0], { Effect: 'Allow', Principal: { AWS: [ROLE_A] }, Action: 'sts:AssumeRole' });
+    });
+
+    it('without workflow files the document is byte for byte the one without the condition', () => {
+      const before = JSON.stringify({ Version: '2012-10-17', Statement: [githubStatement([SUBJECT])] });
+      for (const githubWorkflowRefs of [undefined, []]) {
+        assert.equal(
+          JSON.stringify(jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER, githubWorkflowRefs })),
+          before,
+        );
+      }
+    });
+
+    it('refuses workflow files without subjects, and malformed ones', () => {
+      assert.throws(() => jobsTrustPolicy({ roleArns: [ROLE_A], githubSubjects: [], githubWorkflowRefs: [WORKFLOW] }), /subject/i);
+      for (const bad of [
+        'o/r/.github/workflows/*.yml@refs/heads/main',
+        'o/r/.github/workflows/organize.yml@refs/heads/*',
+        'o/r/.github/workflows/organize.yml@refs/tags/v1',
+        'o/r/.github/workflows/organize.yml',
+        'o/r/.github/workflows/sub/organize.yml@refs/heads/main',
+        'o/r/workflows/organize.yml@refs/heads/main',
+        'o/*/.github/workflows/organize.yml@refs/heads/main',
+        'o/r/.github/workflows/organize.sh@refs/heads/main',
+        '',
+      ]) {
+        assert.throws(
+          () => jobsTrustPolicy({ roleArns: [], githubSubjects: [SUBJECT], githubProviderArn: PROVIDER, githubWorkflowRefs: [WORKFLOW, bad] }),
+          /workflow/i,
+          bad,
+        );
+      }
+    });
+  });
+});
+
+describe('isGithubWorkflowRef', () => {
+  it('accepts one workflow file of one repository on one branch, .yml or .yaml', () => {
+    for (const ok of [
+      'o/r/.github/workflows/organize.yml@refs/heads/main',
+      'o-1/r_2.x/.github/workflows/a.b-c_d.yaml@refs/heads/release/1.0',
+    ]) assert.equal(isGithubWorkflowRef(ok), true, ok);
+    for (const bad of ['o/r/.github/workflows/organize.yml@refs/heads/', 'o/r/.github/workflows/.yml@refs/heads/main', ' o/r/.github/workflows/organize.yml@refs/heads/main']) {
+      assert.equal(isGithubWorkflowRef(bad), false, bad);
+    }
   });
 });
 

@@ -135,6 +135,8 @@ describe('infrastructure source', () => {
     assert.match(src, /jobsTrustPolicy\(/);
     assert.doesNotMatch(src, /workstationTrustPolicy/);
     assert.doesNotMatch(src, /OpenIdConnectProvider/);
+    // The bridge and canary roles take nothing of the organizer's inputs (its workflow files included).
+    assert.doesNotMatch(src, /WorkflowRefs|mode\.organizer/);
     // The two data sources are read only in the arm taken when subjects are given.
     const split = src.match(/^(.*?)githubSubjects\.length===0\?(.*?):(\$interpolate.*)$/);
     assert.ok(split, 'the choice on the subjects');
@@ -182,6 +184,9 @@ describe('infrastructure source', () => {
     }
     assert.match(src, /constroleArns=mode\.organizerRoleArns;/);
     assert.match(src, /constgithubSubjects=mode\.organizerGithubSubjects;/);
+    assert.match(src, /constgithubWorkflowRefs=mode\.organizerGithubWorkflowRefs;/);
+    // Both trust documents name the workflow files (the subject arm is the one that uses them).
+    assert.equal((src.match(/jobsTrustPolicy\(\{roleArns,githubSubjects,githubWorkflowRefs(,githubProviderArn)?\}\)/g) ?? []).length, 2);
     assert.doesNotMatch(src, /mode\.workstationRoleArns|mode\.githubSubjects|process\.env/);
     assert.match(body, /name:`\$\{\$app\.name\}-\$\{\$app\.stage\}-organizer`/);
     assert.match(body, /maxSessionDuration:3600/);
@@ -198,10 +203,11 @@ describe('infrastructure source', () => {
   });
 
   describe('deployment switches', () => {
-    it('parses the four variables in mode.ts only, before any resource', () => {
+    it('parses the deployment variables in mode.ts only, before any resource', () => {
       for (const name of [
         'AGENT_MEMORY_INVOKER_ROLE_ARNS', 'AGENT_MEMORY_WORKSTATION_ROLE_ARNS', 'AGENT_MEMORY_GITHUB_SUBJECTS',
-        'AGENT_MEMORY_ORGANIZER_ROLE_ARNS', 'AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS', 'AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN',
+        'AGENT_MEMORY_ORGANIZER_ROLE_ARNS', 'AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS', 'AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS',
+        'AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN',
       ]) {
         assert.match(read('infra/mode.ts'), new RegExp(name));
         for (const f of files.filter((f) => f !== 'infra/mode.ts')) {
