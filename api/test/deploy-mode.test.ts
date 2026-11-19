@@ -7,6 +7,7 @@ delete process.env.AGENT_MEMORY_WORKSTATION_ROLE_ARNS;
 delete process.env.AGENT_MEMORY_GITHUB_SUBJECTS;
 delete process.env.AGENT_MEMORY_ORGANIZER_ROLE_ARNS;
 delete process.env.AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS;
+delete process.env.AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS;
 delete process.env.AGENT_MEMORY_PERMISSIONS_BOUNDARY_ARN;
 const { parseDeployMode } = await import('../infra/mode.ts');
 
@@ -16,13 +17,13 @@ const ROLE_B = 'arn:aws:iam::123456789012:role/path/gateway-b';
 describe('parseDeployMode', () => {
   it('is the HTTP deployment when the variable is not set or holds only blanks', () => {
     for (const env of [{}, { AGENT_MEMORY_INVOKER_ROLE_ARNS: '' }, { AGENT_MEMORY_INVOKER_ROLE_ARNS: ' , ' }]) {
-      assert.deepEqual(parseDeployMode(env), { direct: false, invokerRoleArns: [], workstationRoleArns: [], githubSubjects: [], organizerRoleArns: [], organizerGithubSubjects: [], permissionsBoundaryArn: null });
+      assert.deepEqual(parseDeployMode(env), { direct: false, invokerRoleArns: [], workstationRoleArns: [], githubSubjects: [], organizerRoleArns: [], organizerGithubSubjects: [], organizerGithubWorkflowRefs: [], permissionsBoundaryArn: null });
     }
   });
 
   it('is direct invocation when roles are given, trimmed, without empty entries or duplicates', () => {
     const mode = parseDeployMode({ AGENT_MEMORY_INVOKER_ROLE_ARNS: ` ${ROLE_A}, ,${ROLE_B},${ROLE_A}` });
-    assert.deepEqual(mode, { direct: true, invokerRoleArns: [ROLE_A, ROLE_B], workstationRoleArns: [], githubSubjects: [], organizerRoleArns: [], organizerGithubSubjects: [], permissionsBoundaryArn: null });
+    assert.deepEqual(mode, { direct: true, invokerRoleArns: [ROLE_A, ROLE_B], workstationRoleArns: [], githubSubjects: [], organizerRoleArns: [], organizerGithubSubjects: [], organizerGithubWorkflowRefs: [], permissionsBoundaryArn: null });
   });
 
   it('refuses anything that is not an IAM role ARN, without repeating the entry', () => {
@@ -83,6 +84,26 @@ describe('parseDeployMode', () => {
     }
   });
 
+  it('reads the organizer\'s workflow files, which need its GitHub subjects', () => {
+    const subject = 'repo:example-owner@100/example-mirror@300:ref:refs/heads/main';
+    const workflow = 'example-owner/example-mirror/.github/workflows/organize.yml@refs/heads/main';
+    const mode = parseDeployMode({
+      AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS: subject,
+      AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS: ` ${workflow},${workflow}, `,
+    });
+    assert.deepEqual(mode.organizerGithubWorkflowRefs, [workflow]);
+    assert.deepEqual(parseDeployMode({ AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS: subject }).organizerGithubWorkflowRefs, []);
+    const bad = 'example-owner/example-mirror/.github/workflows/*.yml@refs/heads/main';
+    assert.throws(
+      () => parseDeployMode({ AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS: subject, AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS: bad }),
+      (error: Error) => error.message.includes('AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS') && !error.message.includes(bad),
+    );
+    assert.throws(
+      () => parseDeployMode({ AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS: workflow }),
+      /AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS needs AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS/,
+    );
+  });
+
   it('reads the organizer\'s own roles and GitHub subjects, apart from the workstation ones', () => {
     const subject = 'repo:example-owner@100/example-mirror@300:ref:refs/heads/main';
     const mode = parseDeployMode({
@@ -136,6 +157,7 @@ describe('parseDeployMode', () => {
         githubSubjects: [],
         organizerRoleArns: [],
         organizerGithubSubjects: [],
+        organizerGithubWorkflowRefs: [],
         permissionsBoundaryArn: BOUNDARY,
       });
       for (const ok of ['arn:aws-cn:iam::111122223333:policy/b', 'arn:aws-us-gov:iam::111122223333:policy/b']) {

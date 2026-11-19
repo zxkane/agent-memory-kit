@@ -209,16 +209,41 @@ export function isGithubSubject(value: string): boolean {
 const GITHUB_PROVIDER_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/;
 const GITHUB_OIDC = 'token.actions.githubusercontent.com';
 
+// One workflow file directly under .github/workflows of one repository, on one branch: the form of
+// GitHub's job_workflow_ref claim (`<owner>/<repository>/.github/workflows/<file>@refs/heads/<branch>`).
+const WORKFLOW_REF_RE =
+  /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/\.github\/workflows\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.ya?ml@refs\/heads\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+/** True for one workflow file of one repository on one branch, as GitHub's job_workflow_ref claim names it. */
+export function isGithubWorkflowRef(value: string): boolean {
+  return WORKFLOW_REF_RE.test(value);
+}
+
 /**
  * The trust policy of a workstation role: the given IAM roles, and the GitHub Actions jobs whose
  * subject is named exactly (one branch of one repository; an environment subject would not be
  * bound to a branch), through the account's existing GitHub OIDC provider. Each kind that is
- * non-empty gets one statement.
+ * non-empty gets one statement. With `githubWorkflowRefs`, a GitHub job must also be defined in one
+ * of those workflow files (GitHub's `job_workflow_ref` claim): any other job of the same branch is
+ * refused.
  */
-export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: string[]; githubProviderArn?: string }) {
+export function jobsTrustPolicy(input: {
+  roleArns: string[];
+  githubSubjects: string[];
+  githubProviderArn?: string;
+  githubWorkflowRefs?: string[];
+}) {
   const { roleArns, githubSubjects, githubProviderArn } = input;
+  const githubWorkflowRefs = input.githubWorkflowRefs ?? [];
   if (roleArns.length === 0 && githubSubjects.length === 0) {
     throw new Error('Give at least one workstation role ARN or GitHub subject.');
+  }
+  for (const ref of githubWorkflowRefs) {
+    if (!isGithubWorkflowRef(ref)) {
+      throw new Error('Each GitHub workflow must be <owner>/<repository>/.github/workflows/<file>.yml@refs/heads/<branch>.');
+    }
+  }
+  if (githubWorkflowRefs.length > 0 && githubSubjects.length === 0) {
+    throw new Error('GitHub workflow files bind GitHub subjects: give the subjects too.');
   }
   for (const arn of roleArns) {
     if (!isRoleArn(arn)) {
@@ -246,6 +271,7 @@ export function jobsTrustPolicy(input: { roleArns: string[]; githubSubjects: str
         StringEquals: {
           [`${GITHUB_OIDC}:aud`]: 'sts.amazonaws.com',
           [`${GITHUB_OIDC}:sub`]: githubSubjects,
+          ...(githubWorkflowRefs.length > 0 ? { [`${GITHUB_OIDC}:job_workflow_ref`]: githubWorkflowRefs } : {}),
         },
       },
     });

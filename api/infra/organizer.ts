@@ -6,11 +6,12 @@ import { jobsTrustPolicy, organizerRolePolicy, permissionsBoundaryArgs } from ".
 // Read and checked in mode.ts, before any resource is declared.
 const roleArns = mode.organizerRoleArns;
 const githubSubjects = mode.organizerGithubSubjects;
+const githubWorkflowRefs = mode.organizerGithubWorkflowRefs;
 
 // The role of the job that organizes the agent scopes (`run.sh consolidate organize --agents`). It
-// may change and delete agent notes, so it trusts only the principals of its own two variables, not
-// those of the bridge and canary roles. Without either variable nothing here exists. It holds one
-// inline policy and no managed policy.
+// may change and delete agent notes, so it trusts only the principals of its own variables, not
+// those of the bridge and canary roles; with workflow files, only a job defined in one of them.
+// Without roles or subjects nothing here exists. It holds one inline policy and no managed policy.
 if (roleArns.length > 0 || githubSubjects.length > 0) {
   const prefix = `/${$app.name}/${$app.stage}/mcp`;
 
@@ -18,9 +19,9 @@ if (roleArns.length > 0 || githubSubjects.length > 0) {
   // data sources are not read.
   const trustDocument =
     githubSubjects.length === 0
-      ? JSON.stringify(jobsTrustPolicy({ roleArns, githubSubjects }))
+      ? JSON.stringify(jobsTrustPolicy({ roleArns, githubSubjects, githubWorkflowRefs }))
       : $interpolate`arn:${aws.getPartitionOutput().partition}:iam::${aws.getCallerIdentityOutput().accountId}:oidc-provider/token.actions.githubusercontent.com`.apply(
-          (githubProviderArn) => JSON.stringify(jobsTrustPolicy({ roleArns, githubSubjects, githubProviderArn })),
+          (githubProviderArn) => JSON.stringify(jobsTrustPolicy({ roleArns, githubSubjects, githubWorkflowRefs, githubProviderArn })),
         );
 
   const organizerRole = new aws.iam.Role("AgentScopesOrganizerRole", {
