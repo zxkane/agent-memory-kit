@@ -1,8 +1,11 @@
 // Consolidation: lets a model tidy the notes (organize) or add what recent conversations show
-// (extract), one scope at a time, on a private copy. Started through `run.sh consolidate`, which
-// holds consolidate.lock. Everything that reads or writes the clone runs as a locked step
-// (`run.sh consolidate-step scan|snapshot|apply`, under the sync lock); the model only ever sees
-// the work folder, and its result is applied only when the rules in lib/workdir.mjs accept it.
+// (extract), one scope at a time, on a private copy, and gives every note its label (label, also at
+// the end of every organize run). Started through `run.sh consolidate`, which holds
+// consolidate.lock. Everything that reads or writes the clone runs as a locked step
+// (`run.sh consolidate-step scan|snapshot|apply`, and `label-read|label-apply` for the labels, under
+// the sync lock); the model only ever sees the work folder, and its result is applied only when the
+// rules in lib/workdir.mjs accept it. The label model sees only the notes it labels, and code writes
+// the labels.
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -12,12 +15,20 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { labelAgentScopes } from './lib/agent-labels.mjs';
 import {
   AGENT_RE, AgentScopeError, agentScopeProblems, agentScopesS3, applyAgentScope, copyAgentScope, listAgentScopes,
   noteCount, readOrganizerState, recordOrganizerState, repairAgentEntries, scopeDigest,
 } from './lib/agent-scopes.mjs';
-import { AwsError } from './lib/aws.mjs';
 import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
+import { readLabelInputs } from './lib/domains.mjs';
+import { labelBatch, tokenForRun } from './lib/label-client.mjs';
+import {
+  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, digestsOf, fileDigests, folderDigest, labelEntryProblem,
+} from './lib/label-notes.mjs';
+import {
+  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, plannedLabels, selectTouched, unreadScopeResults,
+} from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
@@ -44,7 +55,7 @@ const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
-const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]';
+const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run]';
 const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
 const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -54,7 +65,6 @@ const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 const isMissing = (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
-const firstLine = (err) => String(err?.message ?? err).split('\n')[0] || 'failed';
 const usd = (value) => `USD ${value === null || value === undefined ? 'unknown' : value.toFixed(2)}`;
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const out = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -81,11 +91,6 @@ function lstatOrNull(path) {
   }
 }
 
-// SHA-256 over the sorted `name:hash` lines of a folder's note files.
-function folderDigest(dir) {
-  return sha256([...noteFiles(dir)].map(([name, buf]) => `${name}:${sha256(buf)}`).join('\n'));
-}
-
 function scopeInfo(dir) {
   const files = noteFiles(dir);
   const index = files.get(INDEX);
@@ -95,7 +100,7 @@ function scopeInfo(dir) {
     notes: names.filter((n) => n !== INDEX).length,
     overLimit: stats.lines > INDEX_MAX_LINES || stats.bytes > INDEX_MAX_BYTES,
     conflict: names.some((n) => CONFLICT_RE.test(n)),
-    digest: sha256(names.map((n) => `${n}:${sha256(files.get(n))}`).join('\n')),
+    digest: digestOfFiles(digestsOf(files)),
   };
 }
 
@@ -181,12 +186,17 @@ function parseConversationArg(value) {
 
 // ---- Locked steps ----
 
-function parseStepArgs(rest, valued, flags = []) {
+// `valued` arguments are required, each once; `flags` may be given once; `repeated` arguments take
+// a value each time they are given and become a list.
+function parseStepArgs(rest, valued, flags = [], repeated = []) {
   const opts = Object.create(null);
+  for (const a of repeated) opts[a] = [];
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (flags.includes(a) && !(a in opts)) {
       opts[a] = true;
+    } else if (repeated.includes(a) && i + 1 < rest.length) {
+      opts[a].push(rest[++i]);
     } else if (valued.includes(a) && !(a in opts) && i + 1 < rest.length) {
       opts[a] = rest[++i];
     } else {
@@ -482,7 +492,7 @@ function stepApply(config, rest) {
   } catch (err) {
     // Before the first write nothing was applied: something moved since evaluate. After it, part
     // of the result is live and uncommitted (the next sync commits it); say so, never "nothing".
-    out({ ...result, outcome: err.partial ? 'apply-interrupted' : 'changed-meanwhile', reason: firstLine(err) });
+    out({ ...result, outcome: err.partial ? 'apply-interrupted' : 'changed-meanwhile', reason: errorText(err) });
     return;
   }
   const digest = folderDigest(pairs[0].liveDir);
@@ -491,24 +501,153 @@ function stepApply(config, rest) {
     writeReport(config, `${date}-${config.host}-${kind}-${scope}.md`, report());
     if (kind === 'organize') pruneReports(config, now);
   } catch (err) {
-    reportError = firstLine(err);
+    reportError = errorText(err);
   }
   const where = scope === GLOBAL ? GLOBAL : `projects/${scope}`;
   const sync = syncInfo(writeStatus(config, runSync(config, { message: `consolidate(${config.host}): ${kind} ${where}` })));
   out({ ...result, outcome: 'applied', digest, reportError, sync });
 }
 
+// The two locked steps of the label step. A scope is named as consolidate.json names it (`global`
+// or the project's folder name); the paths of its notes start with its folder (`global/`,
+// `projects/<name>/`).
+const scopeFolder = (name) => (name === GLOBAL ? GLOBAL : `projects/${name}`);
+const scopeOfPath = (path) => (path.startsWith('projects/') ? path.split('/')[1] : GLOBAL);
+// A scope folder of the clone (`global` or `projects/<name>`), not one of the agent scopes.
+const isCloneScope = (folder) => folder === GLOBAL || folder.startsWith('projects/');
+
+// Writes `<work>/label-notes.json`: the notes of the named scopes (of every scope without
+// `--scope`) as collectScopeNotes lists them, and the names of the scopes it read. A named scope whose folder
+// is missing or may not be touched is left out.
+function stepLabelRead(config, rest) {
+  const a = parseStepArgs(rest, ['--work'], [], ['--scope']);
+  const named = [...new Set(a['--scope'])];
+  if (!named.every((name) => name === GLOBAL || isPlainName(name))) throw new Error('invalid scope');
+  const work = checkWork(config, a['--work']);
+  if (readdirSync(work).length > 0) throw new Error('the work folder is not empty');
+  // A label run has no scan step before it, which would say this.
+  const problem = cloneProblem(config);
+  if (problem) throw new Error(problem);
+  const sync = syncInfo(writeStatus(config, runSync(config)));
+  if (!sync.ok) {
+    out({ outcome: 'sync-failed', sync });
+    return;
+  }
+  const scopes = (named.length > 0 ? named : [GLOBAL, ...listProjects(config)])
+    .map((name) => ({ name, dir: liveFolder(config, name) })).filter((s) => s.dir);
+  const notes = scopes.flatMap((s) => collectScopeNotes(s.dir, scopeFolder(s.name)));
+  writeFileSync(join(work, 'label-notes.json'), `${JSON.stringify({ notes, scopes: scopes.map((s) => s.name) }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  out({ outcome: 'label-read', notes: notes.length, sync });
+}
+
+// Why a label plan may not be applied, or null.
+function labelPlanProblem(plan) {
+  if (!isObject(plan) || !Array.isArray(plan.entries) || typeof plan.report !== 'string') {
+    return 'label-plan.json does not hold an entries list and a report text';
+  }
+  const seen = new Set();
+  for (const [i, entry] of plan.entries.entries()) {
+    let problem = labelEntryProblem(entry);
+    // A project folder that no run takes: hidden, or named like the global scope.
+    if (!problem && entry.path.startsWith('projects/') && !isPlainName(entry.path.split('/')[1])) {
+      problem = 'a project folder of that name is never labeled';
+    }
+    if (!problem && seen.has(entry.path)) problem = 'the note is listed twice';
+    if (problem) return `label-plan.json entry ${i + 1}: ${problem}`;
+    seen.add(entry.path);
+  }
+  return null;
+}
+
+// The report: the pass's text, then the notes that this step left as they were, and why.
+function labelReportText(report, skipped) {
+  const parts = [report.trimEnd()];
+  if (skipped.length > 0) parts.push(['## Not written', ...skipped.map((s) => `- ${shown(s.path)}: ${s.reason}`)].join('\n'));
+  return `${parts.filter((part) => part !== '').join('\n\n')}\n`;
+}
+
+// Writes the labels that `<work>/label-plan.json` names (`{ entries: [{ path, label, sha256 }],
+// report }`, whose SHA-256 the driver gives) and commits them with the report. The plan is checked
+// whole before anything else: one that is not well formed is rejected and nothing is written.
+// `digests` holds, for each scope the entries name, its digest after the first sync (`before`, right
+// before writing) and right after writing (`after`); `after` is null when anything but this step's
+// writes changed in the folder in between, so that the scope stays due for Organize. `sync` is the
+// last sync the step ran.
+function stepLabelApply(config, rest) {
+  const a = parseStepArgs(rest, ['--work', '--plan-sha256']);
+  const work = checkWork(config, a['--work']);
+  const none = { written: [], unchanged: [], skipped: [], digests: {}, reportError: null, sync: null };
+  const reject = (reason) => out({ outcome: 'rejected', reason, ...none });
+  const planBuf = readRegular(join(work, 'label-plan.json'));
+  if (!planBuf || sha256(planBuf) !== a['--plan-sha256']) {
+    reject('label-plan.json was changed after it was written');
+    return;
+  }
+  let plan;
+  try {
+    plan = JSON.parse(planBuf.toString('utf8'));
+  } catch {
+    reject('label-plan.json is not valid JSON');
+    return;
+  }
+  const problem = labelPlanProblem(plan);
+  if (problem) {
+    reject(problem);
+    return;
+  }
+  // Commits what sessions wrote meanwhile under the usual subject, so that the label commit holds
+  // only this step's changes. When it fails, nothing is written.
+  const preSync = syncInfo(writeStatus(config, runSync(config)));
+  if (!preSync.ok) {
+    out({ outcome: 'sync-failed', ...none, sync: preSync });
+    return;
+  }
+  const scopes = [...new Set(plan.entries.map((e) => scopeOfPath(e.path)))]
+    .map((name) => ({ name, dir: liveFolder(config, name) })).filter((s) => s.dir)
+    .map((s) => ({ ...s, before: fileDigests(s.dir) }));
+  let applied;
+  try {
+    applied = applyLabelEntries(config.repoDir, plan.entries);
+  } catch (err) {
+    // Before the first write nothing was written: a plain error. After it, some labels are live and
+    // uncommitted (the next sync commits them); say so, never "nothing".
+    if (!err.partial) throw err;
+    out({ outcome: 'apply-interrupted', reason: errorText(err), ...none, ...err.result, sync: preSync });
+    return;
+  }
+  // Each written note goes from the digest it was read with (the entry's) to the one written.
+  const readAs = new Map(plan.entries.map((e) => [e.path, e.sha256]));
+  const writesIn = (name) => applied.written.filter((w) => scopeOfPath(w.path) === name)
+    .map((w) => ({ file: basename(w.path), from: readAs.get(w.path), to: w.sha256 }));
+  const digests = Object.fromEntries(scopes.map((s) => [s.name, {
+    before: digestOfFiles(s.before), after: digestAfterLabels(s.before, writesIn(s.name), folderDigest(s.dir)),
+  }]));
+  const { written, unchanged, skipped } = applied;
+  if (written.length === 0) {
+    out({ outcome: 'no-change', ...none, unchanged, skipped, digests, sync: preSync });
+    return;
+  }
+  let reportError = null;
+  try {
+    writeReport(config, `${new Date().toISOString().slice(0, 10)}-${config.host}-label.md`, labelReportText(plan.report, skipped));
+  } catch (err) {
+    reportError = errorText(err);
+  }
+  const sync = syncInfo(writeStatus(config, runSync(config, { message: `consolidate(${config.host}): label ${written.length} note(s)` })));
+  out({ outcome: 'applied', written, unchanged, skipped, digests, reportError, sync });
+}
+
 function stepMain(args) {
   const [name, ...rest] = args;
-  // Once Node runs the apply step, it finishes and reports, even after Ctrl-C (which reaches the
-  // whole process group), SIGTERM or SIGHUP: killed part-way, it could have written or committed
-  // changes that the driver would then not know of. The handlers come first, before anything
-  // else runs (the imported modules only define functions and constants, and nothing before this
-  // line reads or writes the clone), so an apply step that dies from one of these signals has
-  // done nothing. It is bounded by the Git network time limits; the lock wait in run.sh comes
-  // before Node starts. A Git command killed by the same signal is a failed sync, reported as
-  // such. scan and snapshot change nothing and may die.
-  if (name === 'apply') for (const signal of INTERRUPT_SIGNALS) process.on(signal, () => {});
+  // Once Node runs an apply step (apply, label-apply), it finishes and reports, even after Ctrl-C
+  // (which reaches the whole process group), SIGTERM or SIGHUP: killed part-way, it could have
+  // written or committed changes that the driver would then not know of. The handlers come first,
+  // before anything else runs (the imported modules only define functions and constants, and
+  // nothing before this line reads or writes the clone), so an apply step that dies from one of
+  // these signals has done nothing. It is bounded by the Git network time limits; the lock wait in
+  // run.sh comes before Node starts. A Git command killed by the same signal is a failed sync,
+  // reported as such. scan, snapshot and label-read change nothing and may die.
+  if (name === 'apply' || name === 'label-apply') for (const signal of INTERRUPT_SIGNALS) process.on(signal, () => {});
   const config = loadConfig();
   if (!config || !config.consolidate) {
     out({ outcome: 'error', error: 'consolidation is not configured' });
@@ -518,25 +657,35 @@ function stepMain(args) {
     if (name === 'scan') stepScan(config, rest);
     else if (name === 'snapshot') stepSnapshot(config, rest);
     else if (name === 'apply') stepApply(config, rest);
-    else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ...');
+    else if (name === 'label-read') stepLabelRead(config, rest);
+    else if (name === 'label-apply') stepLabelApply(config, rest);
+    else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ... | label-read ... | label-apply ...');
     return 0;
   } catch (err) {
-    process.stderr.write(`agent-memory consolidate-step ${String(name).slice(0, 20)}: ${firstLine(err)}\n`);
-    out({ outcome: 'error', error: firstLine(err) });
+    process.stderr.write(`agent-memory consolidate-step ${String(name).slice(0, 20)}: ${errorText(err)}\n`);
+    out({ outcome: 'error', error: errorText(err) });
     return 1;
   }
 }
 
 // ---- Driver ----
 
+// The kinds of run the driver starts: the model runs on the notes (KINDS, which the locked steps
+// take too) and `label`, the label pass on its own.
+const DRIVER_KINDS = [...KINDS, 'label'];
+
 function parseDriverArgs(argv) {
   const [kind, ...rest] = argv;
-  if (!KINDS.includes(kind)) return null;
-  const opts = { kind, projects: [], agents: false, agentNames: [], dryRun: false, keep: false, model: undefined, minRetention: undefined };
+  if (!DRIVER_KINDS.includes(kind)) return null;
+  const opts = {
+    kind, projects: [], agents: false, agentNames: [], all: false, dryRun: false, keep: false, model: undefined, minRetention: undefined,
+  };
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === '--dry-run') {
       opts.dryRun = true;
+    } else if (arg === '--all') {
+      opts.all = true;
     } else if (arg === '--keep') {
       opts.keep = true;
     } else if (arg === '--project') {
@@ -563,8 +712,13 @@ function parseDriverArgs(argv) {
     }
   }
   if (kind === 'extract' && opts.projects.includes(GLOBAL)) return null;
-  // The agent scopes are organized only, and never together with the clone's scopes.
-  if (opts.agents && (kind !== 'organize' || opts.projects.length > 0)) return null;
+  // --all (a full relabel) belongs to label, --min-retention to Extract and Organize.
+  if (opts.all && kind !== 'label') return null;
+  if (kind === 'label' && opts.minRetention !== undefined) return null;
+  // The agent scopes are organized and labeled, never together with the clone's scopes. Their
+  // label pass keeps no work folder and labels with the label block's model.
+  if (opts.agents && (kind === 'extract' || opts.projects.length > 0)) return null;
+  if (opts.agents && kind === 'label' && (opts.keep || opts.model !== undefined)) return null;
   return opts;
 }
 
@@ -748,7 +902,7 @@ function removeTree(dir) {
   try {
     rmSync(dir, { recursive: true, force: true });
   } catch (err) {
-    process.stderr.write(`agent-memory consolidate: could not remove ${dir}: ${firstLine(err)}\n`);
+    process.stderr.write(`agent-memory consolidate: could not remove ${dir}: ${errorText(err)}\n`);
   }
 }
 
@@ -958,9 +1112,6 @@ async function runScope({ config, opts, model, runDir, scope, digest, folder = s
 
 // ---- Agent scopes: agents/<agent>/ in the memory API's bucket (organize --agents) ----
 
-// What an AWS or agent-scope error may print: its own fixed message; anything else is one line.
-const awsText = (err) => (err instanceof AwsError || err instanceof AgentScopeError ? err.message : firstLine(err));
-
 // For a repair run: a reference copy of the scope's notes as they were taken, in original/ of the
 // work folder. Whatever the model left there is removed first, without following a link.
 function copyOriginal(work, liveDir) {
@@ -985,7 +1136,7 @@ function agentSteps({ config, opts, model, agent, s3For, runDir }) {
       } catch (err) {
         if (await signalsHandled()) return { done: { outcome: 'aborted' } };
         if (err instanceof AgentScopeError && err.skip) return { done: { outcome: 'skipped', reason: err.message } };
-        return { done: { outcome: 'error', step: 'snapshot', error: awsText(err) } };
+        return { done: { outcome: 'error', step: 'snapshot', error: errorText(err) } };
       }
       if (await signalsHandled()) return { done: { outcome: 'aborted' } };
       pairs = [{ label: 'notes', liveDir, workDir: join(work, 'notes') }];
@@ -1032,7 +1183,7 @@ function agentSteps({ config, opts, model, agent, s3For, runDir }) {
       try {
         res = await applyAgentScope({ s3: await s3For(), agent, plan, changes: ev.changes, liveDir, workDir });
       } catch (err) {
-        return err.partial ? { ...result, outcome: 'apply-interrupted', reason: awsText(err) } : { ...result, outcome: 'error', error: awsText(err) };
+        return err.partial ? { ...result, outcome: 'apply-interrupted', reason: errorText(err) } : { ...result, outcome: 'error', error: errorText(err) };
       }
       if (res.outcome === 'changed-meanwhile') return { ...result, outcome: res.outcome, liveChanged: res.liveChanged.map(shown) };
       if (res.outcome === 'rejected') return { ...result, outcome: res.outcome, errors: res.errors };
@@ -1112,15 +1263,10 @@ async function agentsMain({ config, opts, model, started }) {
       process.stdout.write(`organize: interrupted by ${interrupted}; nothing was applied\n`);
       return SIGNAL_CODES[interrupted];
     }
-    process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${awsText(err)})\n`);
+    process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${errorText(err)})\n`);
     return 1;
   }
-  for (const name of opts.agentNames) {
-    if (!scopes.has(name)) {
-      process.stderr.write(`agent-memory consolidate: ${JSON.stringify(name)} is not an agent scope of the bucket.\n${USAGE}\n`);
-      return 2;
-    }
-  }
+  if (unknownAgent(scopes, opts)) return 2;
   const list = agentScopesDue(scopes, state, opts);
   const limit = opts.agentNames.length > 0 ? Infinity : c.maxProjects;
   const ceiling = (opts.agentNames.length > 0 ? opts.agentNames.length : c.maxProjects) * c.maxBudgetUsd;
@@ -1145,7 +1291,7 @@ async function agentsMain({ config, opts, model, started }) {
         try {
           if (await steps.repairEntries()) res.entriesRepaired = true;
         } catch (err) {
-          res.reason = `the search entries of the scope could not be rewritten: ${awsText(err)}`;
+          res.reason = `the search entries of the scope could not be rewritten: ${errorText(err)}`;
           failed = true;
         }
       }
@@ -1153,7 +1299,7 @@ async function agentsMain({ config, opts, model, started }) {
         try {
           await recordAgent(s3For, item.agent, res, started, item.digest);
         } catch (err) {
-          res.recordError = awsText(err);
+          res.recordError = errorText(err);
           failed = true;
         }
       }
@@ -1175,12 +1321,82 @@ async function agentsMain({ config, opts, model, started }) {
   } finally {
     if (runDir && !opts.keep) removeTree(runDir);
   }
+  // Every run that was not interrupted ends with the label pass over the agent scopes (the named
+  // ones, or every one), whatever Organize did. A failed pass fails the run.
+  if (!(await signalsHandled())) {
+    if (list.length === 0) process.stdout.write('organize: nothing to do\n');
+    if (c.label && (await agentLabelPass({ config, opts, s3For, started })).failed) failed = true;
+  }
   if (await signalsHandled()) {
     process.stdout.write(`organize: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
-  if (list.length === 0) process.stdout.write('organize: nothing to do\n');
   return failed ? 1 : 0;
+}
+
+// An agent named with --agent that has no scope in the bucket: a usage error, said so.
+function unknownAgent(scopes, opts) {
+  const name = opts.agentNames.find((agent) => !scopes.has(agent));
+  if (name === undefined) return false;
+  process.stderr.write(`agent-memory consolidate: ${JSON.stringify(name)} is not an agent scope of the bucket.\n${USAGE}\n`);
+  return true;
+}
+
+// The label pass over the agent scopes, with the S3 clients of the agent-scope organizer (`s3For`)
+// and the label block's model and token, which only the label requests get: never the model
+// client of Organize. Without a notes clone (a GitHub Actions job) the label block must name both
+// input files. Prints the pass's lines; `failed` as labelAgentScopes says, or for missing inputs.
+async function agentLabelPass({ config, opts, s3For, started }) {
+  const label = config.consolidate.label;
+  let inputs;
+  if (cloneProblem(config) !== null && (label.domainsFile === null || label.personaFile === null)) {
+    inputs = { problem: label.domainsFile === null ? 'label.domainsFile' : 'label.personaFile' };
+  } else {
+    inputs = labelInputs(config);
+  }
+  if (inputs.problem) {
+    process.stdout.write(`label: the label inputs are missing or invalid (${inputs.problem}); no label was written.\n`);
+    return { failed: true };
+  }
+  const pass = await labelAgentScopes({
+    config, opts, s3For, started, domains: inputs.domains, persona: inputs.persona,
+    token: () => tokenForRun(label), labelBatch, signal: abort.signal,
+  });
+  if (pass.lines.length > 0) process.stdout.write(`${pass.lines.join('\n')}\n`);
+  return pass;
+}
+
+// `run.sh consolidate label --agents`: the label pass over the agent scopes on its own.
+async function labelAgentsMain({ config, opts, started }) {
+  const c = config.consolidate;
+  if (!c.label) {
+    process.stdout.write(`agent-memory: labeling needs "label" in the consolidate block of ${configPath()}; nothing was run.\n`);
+    return 1;
+  }
+  if (!c.agents) {
+    process.stdout.write(`agent-memory: labeling the agent scopes needs "agents" in the consolidate block of ${configPath()}; nothing was run.\n`);
+    return 1;
+  }
+  const s3For = agentScopesS3(c.agents);
+  let pass = { failed: false };
+  if (opts.agentNames.length > 0) {
+    let scopes = null;
+    try {
+      scopes = await listAgentScopes(await s3For({ signal: abort.signal }));
+    } catch (err) {
+      if (!(await signalsHandled())) {
+        process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${errorText(err)})\n`);
+        return 1;
+      }
+    }
+    if (scopes !== null && unknownAgent(scopes, opts)) return 2;
+  }
+  if (!(await signalsHandled())) pass = await agentLabelPass({ config, opts, s3For, started });
+  if (await signalsHandled()) {
+    process.stdout.write(`label: interrupted by ${interrupted}; nothing more was applied\n`);
+    return SIGNAL_CODES[interrupted];
+  }
+  return pass.failed ? 1 : 0;
 }
 
 // The figures of a first run and its repair run together: costs, turns and denials summed (unknown
@@ -1306,6 +1522,245 @@ function printScope(kind, scope, res, opts, repoDir) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
+// ---- The label pass: a label for the notes of the clone (`label`, and the end of `organize`) ----
+
+// The pass's work folder in the run folder. A project folder's name never starts with a dot
+// (isPlainName), so it is never the work folder of an Organize scope of the same run.
+const LABEL_WORK = '.label';
+
+// The record of what the label pass last saw (`labels` in consolidate.json): path -> SHA-256 of the
+// note as the pass wrote, found or confirmed it. Null without one, or with one of another version:
+// the run is then a first run.
+function labelRecordOf(state) {
+  const labels = state.labels;
+  if (!isObject(labels) || labels.version !== 1 || !isObject(labels.notes)) return null;
+  return Object.fromEntries(Object.entries(labels.notes).filter(([, digest]) => typeof digest === 'string' && HASH_RE.test(digest)));
+}
+
+// The two label inputs, read and checked: the files the label block names, else those under
+// .agent-memory/ in the notes clone.
+function labelInputs(config) {
+  const label = config.consolidate.label;
+  return readLabelInputs({
+    domainsFile: label.domainsFile ?? join(config.repoDir, '.agent-memory', 'domains.json'),
+    personaFile: label.personaFile ?? join(config.repoDir, '.agent-memory', 'persona.md'),
+  });
+}
+
+// The label pass over the clone's scopes: `scopes` names some (`global` or project folders), none
+// means every scope. It reads the notes (label-read), sends the touched ones to the label model in
+// batches until it has sent them all or must stop (askLabelModel: the cost ceiling maxBudgetUsd,
+// the age of the token, batches in a row that did not reach the model), writes the labels given
+// and the exceptions' (label-apply), records what it saw in `state.labels`, and moves Organize's
+// record of each scope it wrote into, where that was the content it found. Prints what it did.
+// `failed`: the inputs are missing or invalid, no token could be made, a batch failed, or a step
+// failed. A signal stops it before label-apply, with nothing written.
+async function labelPass({ config, opts, state, scopes, runFolder }) {
+  const c = config.consolidate;
+  // In an Organize run --model names the Organize model; in a label run, the label model.
+  const label = { ...c.label, model: opts.kind === 'label' ? opts.model ?? c.label.model : c.label.model };
+  const say = (line) => process.stdout.write(`${line}\n`);
+  const inputs = labelInputs(config);
+  if (inputs.problem) {
+    say(`label: the label inputs are missing or invalid (${inputs.problem}); no label was written.`);
+    return { failed: true };
+  }
+  const work = join(runFolder(), LABEL_WORK);
+  mkdirSync(work, { mode: 0o700 });
+  chmodSync(work, 0o700);
+  try {
+    return await labelScopes({ config, opts, state, scopes, label, ...inputs, work, say });
+  } finally {
+    if (opts.keep) say(`  work folder kept: ${work}\n  it holds the text of the notes; delete it when you are done`);
+  }
+}
+
+async function labelScopes({ config, opts, state, scopes, label, domains, persona, work, say }) {
+  const record = labelRecordOf(state);
+  // A first run reads every scope, whatever the run names, so that it records every label it finds.
+  const readAll = scopes.length === 0 || record === null;
+  const readStep = runStep(['label-read', '--work', work, ...(readAll ? [] : scopes.flatMap((name) => ['--scope', name]))]);
+  if (await signalsHandled()) return { failed: false };
+  const read = readStep.result;
+  if (read?.outcome === 'sync-failed') {
+    say(`label: sync-failed, no label was written\n  - the sync before reading the notes failed: ${read.sync?.error ?? 'unknown error'}`);
+    return { failed: false };
+  }
+  if (read?.outcome !== 'label-read') {
+    if (read?.outcome === 'error') say(`label: error, no label was written\n  - the label-read step failed: ${read.error ?? 'unknown error'}`);
+    else say(`label: step-failed, no label was written\n  - the label-read step could not run${lockTimedOut(readStep) ? ': the wait for the sync lock timed out' : ''}`);
+    return { failed: true };
+  }
+  const data = JSON.parse(readFileSync(join(work, 'label-notes.json'), 'utf8'));
+  if (!Array.isArray(data?.notes) || !Array.isArray(data.scopes)) throw new Error('label-notes.json does not hold what label-read writes');
+  const listed = data.notes.map((n) => ({
+    path: n.path, scope: n.scope, digest: n.sha256, domain: n.domain, name: n.name, description: n.description, body: n.body, skip: n.skip,
+  }));
+  const readNames = data.scopes;
+  for (const name of scopes) if (!readNames.includes(name)) say(`label: no folder for project ${name}; nothing labeled there.`);
+  const runScopes = (scopes.length === 0 ? readNames : readNames.filter((name) => scopes.includes(name))).map(scopeFolder);
+  const inRun = (n) => runScopes.includes(n.scope);
+  // Only notes whose frontmatter the pass can edit go to the model or take an exception.
+  const editable = listed.filter((n) => n.skip === null);
+  const runNotes = editable.filter(inRun);
+  const { touched } = selectTouched({ notes: runNotes, record, all: opts.all });
+  const touchedPaths = new Set(touched.map((n) => n.path));
+  // On a first run the labeled notes of every scope read are recorded as they are, except those
+  // that --all sends to the model.
+  const confirmed = selectTouched({ notes: editable, record, all: false }).confirmed.filter((x) => !touchedPaths.has(x.path));
+  const { exceptions, batches } = planLabelBatches({ notes: runNotes, touched, domains, batchNotes: label.batchNotes });
+
+  const asked = await askLabelModel({
+    batches, ceiling: config.consolidate.maxBudgetUsd, now: () => Date.now(), signal: abort.signal, token: () => tokenForRun(label),
+    labelBatch: (notes, token) => labelBatch({ notes, persona, label, token, signal: abort.signal }),
+  });
+  if (asked.line) say(asked.line);
+  // Interrupted: nothing is written, and every note stays as it is.
+  if (asked.stop === 'interrupted' || (await signalsHandled())) return { failed: asked.failed };
+  let failed = asked.failed;
+  const planned = plannedLabels(exceptions, asked.labels);
+  const results = [
+    ...labelResults({ scopes: runScopes, notes: listed.filter(inRun), planned, left: asked.left, exceptions: domains.exceptions }),
+    // A run over every scope also names the exceptions of folders it did not read: a typo there is never applied.
+    ...(scopes.length === 0 ? unreadScopeResults({ scopes: runScopes, exceptions: domains.exceptions, own: isCloneScope }) : []),
+  ];
+  const sections = labelReport(results, { reasons: true });
+  const report = [
+    `# Labels — ${new Date().toISOString().slice(0, 10)} on ${config.host}`, '',
+    `- Model: ${label.model}; requests: ${asked.requests}; cost: ${usd(asked.spent)}`,
+    `- Notes: ${touched.length} touched, ${asked.sent} sent to the model, ${exceptions.length} with an exception, ${confirmed.length} recorded as they were`,
+    ...(sections === '' ? [] : ['', sections.trimEnd()]),
+  ].join('\n').concat('\n');
+  const figures = `${usd(asked.spent)}, ${asked.requests} request(s)`;
+  // The plan: every label planned, in the order the notes were read, each with the digest it was
+  // read with. An exception whose note holds its label already stays out of it, so that a run with
+  // nothing else to write starts no label-apply; it is recorded as it was read.
+  const domainOf = new Map(runNotes.map((n) => [n.path, n.domain]));
+  const held = exceptions.filter((e) => domainOf.get(e.path) === e.label);
+  const heldPaths = new Set(held.map((e) => e.path));
+  const order = new Map(runNotes.map((n, i) => [n.path, i]));
+  const digestOf = new Map(runNotes.map((n) => [n.path, n.digest]));
+  const entries = [...planned].filter(([path]) => !heldPaths.has(path)).sort(([a], [b]) => order.get(a) - order.get(b))
+    .map(([path, p]) => ({ path, label: p.label, sha256: digestOf.get(path) }));
+  const nothing = batches.length === 0 && entries.length === 0;
+  if (opts.dryRun) {
+    const changes = results.reduce((n, r) => n + r.labels.length, 0);
+    say(nothing ? 'label: nothing to do' : `label: dry-run, ${changes} label(s) to set or change, ${figures}`);
+    process.stdout.write(report);
+    return { failed };
+  }
+
+  let outcome = { applied: null, headline: nothing ? 'label: nothing to do' : `label: nothing written, ${figures}`, details: [], failed: false };
+  if (entries.length > 0) {
+    if (await signalsHandled()) return { failed };
+    outcome = await applyLabelPlan({ config, work, entries, report, figures, held: held.length });
+    if (outcome.interrupted) return { failed };
+  }
+  failed ||= outcome.failed;
+  const { applied } = outcome;
+
+  // The record: what label-apply wrote or found labeled, the exceptions that held, and on a first
+  // run what was labeled already. A note the run took but did not record (a failed batch, a stop, a
+  // failed step) loses its entry, which still matches it after --all, so that the next run sends
+  // it. A run that read only some scopes keeps the entries of the others.
+  const done = ['applied', 'no-change', 'apply-interrupted'].includes(applied?.outcome) ? applied : { written: [], unchanged: [] };
+  const recorded = (list) => (list ?? []).map((x) => ({ path: x.path, digest: x.sha256 }));
+  const unchanged = [...held.map((e) => ({ path: e.path, digest: e.digest })), ...recorded(done.unchanged)];
+  const kept = new Set([...(done.written ?? []), ...unchanged].map((x) => x.path));
+  const readFolders = readNames.map(scopeFolder);
+  const elsewhere = readAll ? [] : Object.keys(record ?? {}).filter((path) => !readFolders.includes(dirname(path)));
+  state.labels = {
+    version: 1,
+    notes: nextLabelRecord(record, {
+      present: [...listed.map((n) => n.path), ...elsewhere], written: recorded(done.written), unchanged, confirmed,
+      left: touched.map((n) => n.path).filter((path) => !kept.has(path)),
+    }),
+  };
+  // Labels never make a scope due for Organize: its record moves with them where it was the
+  // content label-apply found before writing. `after` is null when anything else changed the
+  // folder meanwhile; the scope then stays due, as does a scope that was due already.
+  if (applied?.outcome === 'applied' || applied?.outcome === 'no-change') {
+    for (const [name, d] of Object.entries(applied.digests ?? {})) {
+      const entry = state.projects[name];
+      if (entry && isObject(d) && HASH_RE.test(d.after ?? '') && entry.organizedDigest === d.before) entry.organizedDigest = d.after;
+    }
+  }
+  writeState(config, state);
+  say(outcome.headline);
+  // After a label-apply that failed, the plan's labels were not written (or which were is not
+  // known): the lists would say otherwise. The headline and its reason say what happened.
+  const planApplied = entries.length === 0 || applied?.outcome === 'applied' || applied?.outcome === 'no-change';
+  if (sections !== '' && planApplied) process.stdout.write(labelReport(results, { reasons: false }));
+  for (const line of outcome.details) say(line);
+  return { failed };
+}
+
+// Writes the plan and runs label-apply on it: the step's result (`applied`, null when it ended
+// without one), the headline and the lines to print, and whether the step failed the pass. `held`:
+// the exceptions left out of the plan because their notes hold their labels; the headline counts
+// them as unchanged.
+// `interrupted` when a signal killed the step, which is possible only before its handlers existed,
+// so before it did anything (see stepMain). A step that finished stands, signal or not.
+async function applyLabelPlan({ config, work, entries, report, figures, held }) {
+  const planText = `${JSON.stringify({ entries, report }, null, 2)}\n`;
+  writeFileSync(join(work, 'label-plan.json'), planText, { mode: 0o600, flag: 'wx' });
+  const step = runStep(['label-apply', '--work', work, '--plan-sha256', sha256(planText)]);
+  await signalsHandled();
+  const applied = step.result;
+  if (!applied && !lockTimedOut(step) && INTERRUPT_SIGNALS.includes(step.signal)) {
+    onSignal(step.signal);
+    return { interrupted: true };
+  }
+  const o = applied?.outcome;
+  const nothing = `no label was written, ${figures}`;
+  if (o === 'applied' || o === 'no-change') {
+    const notWritten = applied.skipped.length > 0 ? `, ${applied.skipped.length} not written` : '';
+    const details = applied.skipped.map((s) => `  - not written: ${shown(s.path)} (${s.reason})`);
+    if (applied.reportError) details.push(`  - the report could not be written: ${applied.reportError}`);
+    if (o === 'applied' && applied.sync && !applied.sync.ok) {
+      details.push(`  - push pending: the sync after writing failed (${applied.sync.error ?? 'unknown error'}); the next sync retries`);
+    }
+    const headline = `label: ${o}, ${applied.written.length} label(s) written, ${applied.unchanged.length + held} unchanged${notWritten}, ${figures}`;
+    return { applied, headline, details, failed: false };
+  }
+  if (o === 'sync-failed') {
+    return { applied, headline: `label: sync-failed, ${nothing}`, details: [`  - the sync before writing failed: ${applied.sync?.error ?? 'unknown error'}`], failed: false };
+  }
+  const fail = (headline, line) => ({ applied, headline, details: [line], failed: true });
+  if (!applied && lockTimedOut(step)) return fail(`label: step-failed, ${nothing}`, '  - the label-apply step could not run: the wait for the sync lock timed out');
+  if (!applied) {
+    return fail(`label: apply interrupted, labels may have been written, ${figures}`, '  - the label-apply step ended without reporting its result;'
+      + ` look at the log of the notes repository (git -C ${config.repoDir} log) for a consolidate(...) commit, and at its working tree`);
+  }
+  if (o === 'apply-interrupted') {
+    return fail(`label: apply interrupted, labels may have been written, ${figures}`,
+      `  - ${applied.reason ?? 'a write failed'}; the labels written before it are committed by the next sync`);
+  }
+  if (o === 'rejected') return fail(`label: rejected, ${nothing}`, `  - ${applied.reason ?? 'the plan was refused'}`);
+  return fail(`label: error, ${nothing}`, `  - the label-apply step failed: ${applied.error ?? 'unknown error'}`);
+}
+
+// `run.sh consolidate label`: the label pass on its own.
+async function labelMain({ config, opts, started }) {
+  if (!config.consolidate.label) {
+    process.stdout.write(`agent-memory: labeling needs "label" in the consolidate block of ${configPath()}; nothing was run.\n`);
+    return 1;
+  }
+  const state = readState(config, started);
+  let runDir = null;
+  let pass;
+  try {
+    pass = await labelPass({ config, opts, state, scopes: opts.projects, runFolder: () => (runDir ??= makeRunDir(config, started, opts.keep)) });
+  } finally {
+    if (runDir && !opts.keep) removeTree(runDir);
+  }
+  if (await signalsHandled()) {
+    process.stdout.write(`label: interrupted by ${interrupted}; nothing more was applied\n`);
+    return SIGNAL_CODES[interrupted];
+  }
+  return pass.failed ? 1 : 0;
+}
+
 async function driverMain(argv) {
   const opts = parseDriverArgs(argv);
   if (!opts) {
@@ -1329,7 +1784,9 @@ async function driverMain(argv) {
   const started = new Date();
   const now = started.getTime();
   removeStaleRuns(config, now);
+  if (opts.agents && opts.kind === 'label') return labelAgentsMain({ config, opts, started });
   if (opts.agents) return agentsMain({ config, opts, model, started });
+  if (opts.kind === 'label') return labelMain({ config, opts, started });
   if (opts.kind === 'extract' && config.codexDir === null) {
     process.stdout.write(`agent-memory consolidate: codexDir in ${configPath()} is not an absolute path; Codex sessions are not read.\n`);
   }
@@ -1366,6 +1823,7 @@ async function driverMain(argv) {
   let calls = 0;
   let spent = 0;
   let runDir = null;
+  const runFolder = () => (runDir ??= makeRunDir(config, started, opts.keep));
   let failed = false;
   try {
     for (const item of list) {
@@ -1386,9 +1844,8 @@ async function driverMain(argv) {
           continue;
         }
       }
-      runDir ??= makeRunDir(config, started, opts.keep);
       calls += 1;
-      const res = await runScope({ config, opts, model, runDir, scope: item.scope, digest });
+      const res = await runScope({ config, opts, model, runDir: runFolder(), scope: item.scope, digest });
       if (digest) res.conversation = conversationOf(digest);
       digest = null;
       spent += spentBy(res, c);
@@ -1413,6 +1870,15 @@ async function driverMain(argv) {
         }
       }
     }
+    if (!(await signalsHandled())) {
+      if (list.length === 0) process.stdout.write(`${opts.kind}: nothing to do\n`);
+      // Every Organize run that was not interrupted ends with the label pass over its scopes,
+      // whatever Organize did. A failed pass fails the run.
+      if (opts.kind === 'organize' && c.label) {
+        const pass = await labelPass({ config, opts, state, scopes: opts.projects, runFolder });
+        if (pass.failed) failed = true;
+      }
+    }
   } finally {
     if (runDir && !opts.keep) removeTree(runDir);
   }
@@ -1420,7 +1886,6 @@ async function driverMain(argv) {
     process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
-  if (list.length === 0) process.stdout.write(`${opts.kind}: nothing to do\n`);
   return failed ? 1 : 0;
 }
 
@@ -1431,7 +1896,7 @@ if (argv[0] === '--step') {
   driverMain(argv).then((code) => {
     process.exitCode = code;
   }, (err) => {
-    process.stderr.write(`agent-memory consolidate failed: ${firstLine(err)}\n`);
+    process.stderr.write(`agent-memory consolidate failed: ${errorText(err)}\n`);
     process.exitCode = 1;
   });
 }

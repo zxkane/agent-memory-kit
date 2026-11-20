@@ -3,8 +3,8 @@ import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync,
-  writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync,
+  utimesSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -2308,4 +2308,1220 @@ test('organize --agents: usage errors, a missing agents block and missing creden
   assert.equal(r.status, 1);
   assert.match(r.stdout, /organizing the agent scopes needs "agents" in the consolidate block/);
   assert.deepEqual(plain.calls(), []);
+});
+
+// ---- The label steps: run.sh consolidate-step label-read | label-apply ----
+
+// A note whose metadata block carries `domain: <label>`, as label-apply writes it.
+const labeledNote = (name, description, body, label) =>
+  note(name, description, body).replace('  type: project\n', `  type: project\n  domain: ${label}\n`);
+
+const liveText = (f, rel) => readFileSync(join(f.repo, rel), 'utf8');
+
+// Runs a step through run.sh, under the sync lock, as the driver does: its exit status and its JSON line.
+function runLabelStep(f, ...args) {
+  const r = spawnSync(RUN_SH, ['consolidate-step', ...args], { env: f.env, encoding: 'utf8' });
+  const line = r.stdout.trim().split('\n').at(-1);
+  return { status: r.status, stderr: r.stderr, result: line ? JSON.parse(line) : null };
+}
+
+// A new, empty work folder where the driver makes one: <stateDir>/consolidate/<run>/<folder>.
+function labelWork(f) {
+  const run = join(f.workRoot(), 'run');
+  mkdirSync(run, { recursive: true, mode: 0o700 });
+  return mkdtempSync(join(run, 'label-'));
+}
+
+// label-read in a new work folder: the folder, the step's line and what it wrote to label-notes.json.
+function labelRead(f, ...args) {
+  const work = labelWork(f);
+  const r = runLabelStep(f, 'label-read', '--work', work, ...args);
+  assert.equal(r.status, 0, r.stderr);
+  return { work, result: r.result, ...JSON.parse(readFileSync(join(work, 'label-notes.json'), 'utf8')) };
+}
+
+// Writes label-plan.json (an object as JSON, a string as it is) and returns its SHA-256.
+function writeLabelPlan(work, plan) {
+  const text = typeof plan === 'string' ? plan : `${JSON.stringify(plan, null, 2)}\n`;
+  writeFileSync(join(work, 'label-plan.json'), text, { mode: 0o600 });
+  return sha(text);
+}
+
+// The plan entry that gives `label` to the note at `path` as label-read listed it.
+const entryFor = (notes, path, label) => ({ path, label, sha256: notes.find((n) => n.path === path).sha256 });
+
+const labelApply = (f, work, planSha) => runLabelStep(f, 'label-apply', '--work', work, '--plan-sha256', planSha);
+
+test('label-read lists the notes of every scope', (t) => {
+  const f = fixture(t);
+  f.seed({
+    'global/MEMORY.md': index('a.md'),
+    'global/a.md': labeledNote('a', 'About a', 'Alpha.', 'work'),
+    'projects/p/MEMORY.md': index('b.md'),
+    'projects/p/b.md': note('b', 'About b', 'Beta.'),
+    'projects/p/old.md': 'MOVED TO [[b]]\n',
+    'projects/p/x.conflict-host.md': note('b', 'About b', 'Beta, as another machine wrote it.'),
+  });
+  const { work, result, notes, scopes } = labelRead(f);
+  assert.equal(result.outcome, 'label-read');
+  assert.equal(result.notes, 2);
+  assert.equal(result.sync.ok, true);
+  const digestOf = (rel) => sha(readFileSync(join(f.repo, rel)));
+  assert.deepEqual(notes, [
+    {
+      path: 'global/a.md', scope: 'global', file: 'a.md', sha256: digestOf('global/a.md'), domain: 'work',
+      name: 'a', description: 'About a', body: '\nAlpha.\n', skip: null,
+    },
+    {
+      path: 'projects/p/b.md', scope: 'projects/p', file: 'b.md', sha256: digestOf('projects/p/b.md'), domain: null,
+      name: 'b', description: 'About b', body: '\nBeta.\n', skip: null,
+    },
+  ]);
+  assert.deepEqual(scopes, ['global', 'p']);
+  assert.equal(statSync(join(work, 'label-notes.json')).mode & 0o777, 0o600);
+});
+
+test('label-read takes only the named scopes', (t) => {
+  const f = fixture(t);
+  f.seed({
+    'global/g.md': note('g', 'G', 'General.'),
+    'projects/p/b.md': note('b', 'B', 'Beta.'),
+    'projects/q/c.md': note('c', 'C', 'Gamma.'),
+  });
+  // A session's note that is not committed yet: the step's sync commits it before the notes are read.
+  write(f.repo, 'projects/p/d.md', note('d', 'D', 'Delta.'));
+  const { work, result, notes, scopes } = labelRead(f, '--scope', 'p', '--scope', 'gone', '--scope', 'p');
+  assert.equal(result.notes, 2);
+  assert.equal(result.sync.committed, 1);
+  assert.deepEqual(notes.map((n) => n.path), ['projects/p/b.md', 'projects/p/d.md']);
+  // A named scope without a folder is left out.
+  assert.deepEqual(scopes, ['p']);
+  // A work folder that is not empty, or a scope name no scope folder may have, is an error before anything is read.
+  assert.equal(runLabelStep(f, 'label-read', '--work', work).result.outcome, 'error');
+  for (const bad of [['--scope', '../p'], ['--scope', '.p'], ['--scope', 'a/b'], ['--scope'], ['--other', 'x']]) {
+    const w = labelWork(f);
+    const r = runLabelStep(f, 'label-read', '--work', w, ...bad);
+    assert.equal(r.status, 1, bad.join(' '));
+    assert.equal(r.result.outcome, 'error', bad.join(' '));
+    assert.deepEqual(readdirSync(w), [], bad.join(' '));
+  }
+});
+
+test('label-apply writes the labels and commits them', (t) => {
+  const f = fixture(t);
+  f.seed({
+    'global/MEMORY.md': index('a.md'),
+    'global/a.md': note('a', 'A', 'Alpha.'),
+    'projects/p/MEMORY.md': index('b.md', 'c.md'),
+    'projects/p/b.md': note('b', 'B', 'Beta.'),
+    'projects/p/c.md': labeledNote('c', 'C', 'Gamma.', 'general'),
+  });
+  const { work, notes } = labelRead(f);
+  const before = { global: folderDigest(join(f.repo, 'global')), p: folderDigest(join(f.repo, 'projects/p')) };
+  const report = '# Labels — test\n\n- global/a.md: personal\n- projects/p/b.md: work\n';
+  const planSha = writeLabelPlan(work, {
+    entries: [
+      entryFor(notes, 'global/a.md', 'personal'), entryFor(notes, 'projects/p/b.md', 'work'),
+      entryFor(notes, 'projects/p/c.md', 'general'),
+    ],
+    report,
+  });
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  const res = r.result;
+  assert.equal(res.outcome, 'applied');
+  assert.equal(liveText(f, 'global/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+  const digestOf = (rel) => sha(readFileSync(join(f.repo, rel)));
+  assert.deepEqual(res.written, [
+    { path: 'global/a.md', sha256: digestOf('global/a.md') },
+    { path: 'projects/p/b.md', sha256: digestOf('projects/p/b.md') },
+  ]);
+  assert.deepEqual(res.unchanged, [{ path: 'projects/p/c.md', sha256: digestOf('projects/p/c.md') }]);
+  assert.deepEqual(res.skipped, []);
+  assert.deepEqual(res.digests, {
+    global: { before: before.global, after: folderDigest(join(f.repo, 'global')) },
+    p: { before: before.p, after: folderDigest(join(f.repo, 'projects/p')) },
+  });
+  assert.notEqual(res.digests.p.before, res.digests.p.after);
+  assert.equal(res.reportError, null);
+  assert.deepEqual(res.sync, { ok: true, error: null, committed: 3, pushed: true });
+  // The subject given to the sync, which adds the file count as it does for every consolidate commit.
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 2 note(s) (3 file(s))');
+  const reportFile = `_reports/${today()}-alpha-label.md`;
+  assert.deepEqual(sh(f.repo, 'git', ['show', '--name-only', '--format=', 'HEAD']).trim().split('\n').sort(),
+    [reportFile, 'global/a.md', 'projects/p/b.md']);
+  assert.equal(liveText(f, reportFile), report);
+  assert.equal(f.head(), sh(f.remote, 'git', ['rev-parse', 'main']).trim());
+});
+
+test('label-apply skips a note changed after the read', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/d.md': note('d', 'D', 'Delta.') });
+  const { work, notes } = labelRead(f);
+  // A session edits b.md and removes d.md after the read.
+  const edited = note('b', 'B', 'Beta, edited by a session.');
+  write(f.repo, 'projects/p/b.md', edited);
+  rmSync(join(f.repo, 'projects/p/d.md'));
+  const planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'projects/p/b.md', 'work'), entryFor(notes, 'projects/p/d.md', 'work')],
+    report: '# Labels\n',
+  });
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'no-change');
+  assert.deepEqual(r.result.written, []);
+  assert.deepEqual(r.result.skipped, [
+    { path: 'projects/p/b.md', reason: 'changed since it was read' },
+    { path: 'projects/p/d.md', reason: 'gone' },
+  ]);
+  assert.equal(liveText(f, 'projects/p/b.md'), edited);
+  assert.equal(r.result.digests.p.before, r.result.digests.p.after);
+  // Nothing was written: no report and no label commit. The step's first sync committed the session's changes.
+  assert.deepEqual(f.reports(), []);
+  assert.equal(f.subjects()[0], 'sync(alpha): 2 file(s)');
+});
+
+test('label-apply names a note it cannot edit', (t) => {
+  const f = fixture(t);
+  const inline = '---\nname: c\ndescription: C\nmetadata: {}\n---\n\nGamma.\n';
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/c.md': inline });
+  const { work, notes } = labelRead(f);
+  // label-read names it already, so that the pass can keep it away from the model.
+  assert.equal(notes.find((n) => n.path === 'projects/p/c.md').skip, 'metadata is not a block');
+  const planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'projects/p/b.md', 'work'), entryFor(notes, 'projects/p/c.md', 'personal')],
+    report: '# Labels\n',
+  });
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'applied');
+  assert.deepEqual(r.result.skipped, [{ path: 'projects/p/c.md', reason: 'metadata is not a block' }]);
+  assert.equal(liveText(f, 'projects/p/c.md'), inline);
+  assert.equal(liveText(f, `_reports/${today()}-alpha-label.md`),
+    '# Labels\n\n## Not written\n- projects/p/c.md: metadata is not a block\n');
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (2 file(s))');
+});
+
+test('label-apply commits the labels when the report cannot be written', (t) => {
+  const f = fixture(t);
+  f.seed({ '_reports': 'a file where the report folder would be\n', 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const r = labelApply(f, work, writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'applied');
+  assert.equal(r.result.reportError, '_reports is not a folder');
+  assert.equal(r.result.sync.ok, true);
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (1 file(s))');
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+});
+
+test('label-apply refuses a plan changed after it was written', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const planSha = writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' });
+  writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'personal')], report: '# Labels\n' });
+  // A session's note that is not committed yet: a step that synced would commit it.
+  write(f.repo, 'projects/p/s.md', note('s', 'S', 'From a session.'));
+  const head = f.head();
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.result, {
+    outcome: 'rejected', reason: 'label-plan.json was changed after it was written',
+    written: [], unchanged: [], skipped: [], digests: {}, reportError: null, sync: null,
+  });
+  // A plan that is gone is refused the same way.
+  rmSync(join(work, 'label-plan.json'));
+  assert.equal(labelApply(f, work, planSha).result.outcome, 'rejected');
+  assert.equal(liveText(f, 'projects/p/b.md'), note('b', 'B', 'Beta.'));
+  assert.equal(f.head(), head);
+  assert.match(sh(f.repo, 'git', ['status', '--porcelain']), /^\?\? projects\/p\/s\.md$/m);
+  assert.deepEqual(f.reports(), []);
+});
+
+test('label-apply rejects a plan that is not well formed and writes nothing', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/MEMORY.md': index('b.md'), 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const good = entryFor(notes, 'projects/p/b.md', 'work');
+  const shape = /^label-plan\.json does not hold an entries list and a report text$/;
+  const second = (what) => new RegExp(`^label-plan\\.json entry 2: ${what}$`);
+  const notInScope = second('the path is not a note of global/ or of a project folder');
+  const cases = [
+    ['not JSON', '{"entries": [', /^label-plan\.json is not valid JSON$/],
+    ['a list', '[]', shape],
+    ['no report', { entries: [good] }, shape],
+    ['entries that are not a list', { entries: good, report: '' }, shape],
+    ['an entry that is not an object', { entries: [good, 'projects/p/b.md'], report: '' }, second('not an object')],
+    ['the index', { entries: [good, { ...good, path: 'projects/p/MEMORY.md' }], report: '' }, second('MEMORY\\.md is the index, not a note')],
+    ...['p/b.md', 'agents/a/b.md', 'projects/b.md', 'projects/p/sub/b.md', 'projects/../b.md', 'global/../b.md',
+      '/projects/p/b.md', 'projects/p/b.txt']
+      .map((path) => [path, { entries: [good, { ...good, path }], report: '' }, notInScope]),
+    ...['projects/.p/b.md', 'projects/global/b.md']
+      .map((path) => [path, { entries: [good, { ...good, path }], report: '' }, second('a project folder of that name is never labeled')]),
+    ['an unknown label', { entries: [good, { ...good, label: 'Work' }], report: '' }, second('the label is not work, personal or general')],
+    ['a digest that is not SHA-256', { entries: [good, { ...good, sha256: good.sha256.toUpperCase() }], report: '' },
+      second('sha256 is not 64 hexadecimal characters')],
+    ['a note listed twice', { entries: [good, { ...good, label: 'personal' }], report: '' }, second('the note is listed twice')],
+  ];
+  const head = f.head();
+  for (const [what, plan, reason] of cases) {
+    const r = labelApply(f, work, writeLabelPlan(work, plan));
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`);
+    assert.equal(r.result.outcome, 'rejected', what);
+    assert.match(r.result.reason, reason, what);
+    assert.deepEqual([r.result.written, r.result.unchanged, r.result.skipped, r.result.sync], [[], [], [], null], what);
+  }
+  assert.equal(liveText(f, 'projects/p/b.md'), note('b', 'B', 'Beta.'));
+  assert.equal(f.head(), head);
+  assert.deepEqual(f.reports(), []);
+});
+
+test('label-apply that fails after its first write is apply-interrupted; before it, an error', { skip: asRoot && 'runs as root' }, (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.'), 'global/a.md': note('a', 'A', 'Alpha.') });
+  const globalDir = join(f.repo, 'global');
+  const withGlobalReadOnly = (fn) => {
+    chmodSync(globalDir, 0o555);
+    try {
+      return fn();
+    } finally {
+      chmodSync(globalDir, 0o755);
+    }
+  };
+  let { work, notes } = labelRead(f);
+  let planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'projects/p/b.md', 'work'), entryFor(notes, 'global/a.md', 'work')],
+    report: '# Labels\n',
+  });
+  const head = f.head();
+  let r = withGlobalReadOnly(() => labelApply(f, work, planSha));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'apply-interrupted');
+  assert.match(r.result.reason, /EACCES/);
+  // b.md was written and stays uncommitted (the next sync commits it); a.md was not.
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+  assert.deepEqual(r.result.written, [{ path: 'projects/p/b.md', sha256: sha(readFileSync(join(f.repo, 'projects/p/b.md'))) }]);
+  assert.equal(liveText(f, 'global/a.md'), note('a', 'A', 'Alpha.'));
+  assert.equal(f.head(), head);
+  assert.deepEqual(f.reports(), []);
+  assert.deepEqual(readdirSync(globalDir), ['a.md']);
+
+  ({ work, notes } = labelRead(f));
+  planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'global/a.md', 'work'), entryFor(notes, 'projects/p/b.md', 'personal')],
+    report: '# Labels\n',
+  });
+  r = withGlobalReadOnly(() => labelApply(f, work, planSha));
+  assert.equal(r.status, 1);
+  assert.equal(r.result.outcome, 'error');
+  assert.match(r.result.error, /EACCES/);
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+});
+
+test('label-apply finishes after SIGTERM, SIGINT or SIGHUP and reports its result', async (t) => {
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    const f = fixture(t);
+    f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.') });
+    const { work, notes } = labelRead(f);
+    const planSha = writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' });
+    // The second fetch from here on is the sync after writing.
+    const step = slowFetch(f, 2);
+    const child = spawn(RUN_SH, ['consolidate-step', 'label-apply', '--work', work, '--plan-sha256', planSha],
+      { env: f.env, stdio: ['ignore', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
+    t.after(() => {
+      step.release();
+      child.kill('SIGKILL');
+    });
+    assert.ok(await waitFor(step.ready), `${signal}: the sync after writing is running`);
+    process.kill(child.pid, signal);
+    step.release();
+    assert.deepEqual(await exited, { code: 0, signal: null }, signal);
+    const res = JSON.parse(stdout.trim().split('\n').at(-1));
+    assert.equal(res.outcome, 'applied', signal);
+    assert.equal(res.sync.ok, true, signal);
+    assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (2 file(s))', signal);
+  }
+});
+
+test('label-read and label-apply stop when their first sync fails', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const planSha = writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' });
+  sh(f.repo, 'git', ['remote', 'set-url', 'origin', join(f.tmp, 'no-such-remote.git')]);
+  const read = labelWork(f);
+  let r = runLabelStep(f, 'label-read', '--work', read);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'sync-failed');
+  assert.equal(r.result.sync.ok, false);
+  assert.deepEqual(readdirSync(read), []);
+  r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'sync-failed');
+  assert.equal(r.result.sync.ok, false);
+  assert.deepEqual([r.result.written, r.result.unchanged, r.result.skipped], [[], [], []]);
+  assert.equal(liveText(f, 'projects/p/b.md'), note('b', 'B', 'Beta.'));
+  assert.deepEqual(f.reports(), []);
+});
+
+// ---- The label pass: run.sh consolidate label, and the pass at the end of every organize run ----
+
+const LABEL_BLOCK = {
+  model: 'example-label-model', region: 'us-east-1', credentials: 'environment', inputUsdPerMillion: 1.1, outputUsdPerMillion: 5.5,
+};
+const PERSONA = 'The owner works for an example company and has a family. Notes about the job are work.\n';
+const NO_EXCEPTIONS = { version: 1, defaults: {}, exceptions: {} };
+const LABEL_AWS_ENV = {
+  AWS_ACCESS_KEY_ID: 'ASIAEXAMPLEKEYID0001', AWS_SECRET_ACCESS_KEY: 'example-signing-value', AWS_SESSION_TOKEN: 'example-session-value',
+};
+
+// A clone with both label inputs under .agent-memory/, a label block whose endpoint is the default
+// Mantle host, and the fake Mantle of fake-mantle-preload.mjs in front of every run's fetch.
+function labelFixture(t, { label = {}, consolidate = {}, domains = NO_EXCEPTIONS, persona = PERSONA } = {}) {
+  const f = fixture(t, { consolidate: { label: { ...LABEL_BLOCK, ...label }, ...consolidate } });
+  const mantleFile = join(f.tmp, 'mantle.json');
+  const mantleLog = join(f.tmp, 'mantle.jsonl');
+  writeFileSync(mantleFile, JSON.stringify({ labels: {} }));
+  const inputs = {};
+  if (domains !== null) inputs['.agent-memory/domains.json'] = `${JSON.stringify(domains)}\n`;
+  if (persona !== null) inputs['.agent-memory/persona.md'] = persona;
+  f.seed(inputs);
+  const mantleEnv = {
+    NODE_OPTIONS: `--import ${join(PKG, 'test', 'fake-mantle-preload.mjs')}`, FAKE_MANTLE_FILE: mantleFile, FAKE_MANTLE_LOG: mantleLog,
+  };
+  const labelEnv = { ...mantleEnv, ...LABEL_AWS_ENV };
+  return {
+    ...f, mantleEnv, labelEnv,
+    mantle: (spec) => writeFileSync(mantleFile, JSON.stringify(spec)),
+    requests: () => (existsSync(mantleLog) ? readFileSync(mantleLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []),
+    label: (...args) => f.runWith(labelEnv, 'label', ...args),
+    organize: (...args) => f.runWith(labelEnv, 'organize', ...args),
+    labelReport: () => liveText(f, `_reports/${today()}-alpha-label.md`),
+  };
+}
+
+const digestIn = (f, rel) => sha(readFileSync(join(f.repo, rel)));
+
+test('the first label run sends only unlabeled notes', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'projects/p/MEMORY.md': index('a.md', 'b.md', 'c.md'),
+    'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'),
+    'projects/p/b.md': labeledNote('b', 'B', 'Beta.', 'general'),
+    'projects/p/c.md': note('c', 'C', 'Gamma.'),
+  });
+  f.mantle({ labels: { 'projects/p/c.md': 'personal' } });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['projects/p/c.md'], auth: true }]);
+  assert.equal(liveText(f, 'projects/p/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha.', 'work'));
+  assert.deepEqual(f.readState().labels, {
+    version: 1,
+    notes: {
+      'projects/p/a.md': digestIn(f, 'projects/p/a.md'),
+      'projects/p/b.md': digestIn(f, 'projects/p/b.md'),
+      'projects/p/c.md': digestIn(f, 'projects/p/c.md'),
+    },
+  });
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (2 file(s))');
+  assert.equal(f.head(), sh(f.remote, 'git', ['rev-parse', 'main']).trim());
+  assert.match(r.stdout, /^label: applied, 1 label\(s\) written, 0 unchanged, USD 0\.00, 1 request\(s\)$/m);
+  // The terminal gets the labels without the model's reasons; the report in the clone has them.
+  assert.match(r.stdout, /^- projects\/p\/c\.md: unlabeled → personal$/m);
+  const report = f.labelReport();
+  assert.match(report, new RegExp(`^# Labels — ${today()} on alpha$`, 'm'));
+  assert.match(report, /^- Model: example-label-model; requests: 1; cost: USD 0\.00$/m);
+  assert.match(report, /^- Notes: 1 touched, 1 sent to the model, 0 with an exception, 2 recorded as they were$/m);
+  assert.match(report, /^## projects\/p\n\nLabels set or changed:\n- projects\/p\/c\.md: unlabeled → personal — fake reason for projects\/p\/c\.md$/m);
+  assert.match(report, /^Labels after this run: 1 work, 1 personal, 1 general$/m);
+  assert.doesNotMatch(r.stdout + r.stderr + report, /ASIAEXAMPLE|example-signing|example-session/);
+  assert.deepEqual(readdirSync(f.workRoot()), []);
+});
+
+test('an unchanged store sends nothing', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'), 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  assert.equal(f.label().status, 0);
+  assert.equal(f.requests().length, 1);
+  const head = f.head();
+  const state = readFileSync(f.stateFile(), 'utf8');
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(r.stdout, 'label: nothing to do\n');
+  assert.equal(f.requests().length, 1);
+  assert.equal(f.head(), head);
+  assert.equal(readFileSync(f.stateFile(), 'utf8'), state);
+});
+
+test('a persona change sends nothing', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  assert.equal(f.label().status, 0);
+  f.seed({ '.agent-memory/persona.md': `${PERSONA}Notes about the family are personal.\n` });
+  const head = f.head();
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(r.stdout, 'label: nothing to do\n');
+  assert.equal(f.requests().length, 1);
+  assert.equal(f.head(), head);
+});
+
+test('an edited note is sent again', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'), 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  assert.equal(f.label().status, 0);
+  // A session edits a.md: it is touched, whatever label it carries. c.md is deleted.
+  rmSync(join(f.repo, 'projects/p/c.md'));
+  f.seed({ 'projects/p/a.md': labeledNote('a', 'A', 'Alpha, now about the family.', 'work') });
+  f.mantle({ labels: { 'projects/p/a.md': 'personal' } });
+  const r = f.label('--model', 'other-label-model');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/c.md'], ['projects/p/a.md']]);
+  assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha, now about the family.', 'personal'));
+  // The record follows: the new digest of a.md, and no entry for the note that is gone.
+  assert.deepEqual(f.readState().labels.notes, { 'projects/p/a.md': digestIn(f, 'projects/p/a.md') });
+  // --model names the label model of this run.
+  assert.match(f.labelReport(), /^- Model: other-label-model; requests: 1;/m);
+  assert.match(f.labelReport(), /^- projects\/p\/a\.md: work → personal — fake reason for projects\/p\/a\.md$/m);
+});
+
+test('label --all sends every note', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': labeledNote('g', 'G', 'General.', 'general'),
+    'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'),
+    'projects/p/c.md': note('c', 'C', 'Gamma.'),
+  });
+  assert.equal(f.label().status, 0);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/c.md']]);
+  // The model gives every note the label it has: nothing is written.
+  f.mantle({ labels: { 'projects/p/a.md': 'work' } });
+  const head = f.head();
+  const r = f.label('--all');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests().slice(1).map((q) => q.paths), [['global/g.md'], ['projects/p/a.md', 'projects/p/c.md']]);
+  assert.match(r.stdout, /^label: no-change, 0 label\(s\) written, 3 unchanged, USD 0\.00, 2 request\(s\)$/m);
+  assert.equal(f.head(), head);
+  // A named scope only; the record keeps the entries of the scopes the run did not read.
+  const p = f.label('--all', '--project', 'p');
+  assert.equal(p.status, 0, p.stdout + p.stderr);
+  assert.deepEqual(f.requests().at(-1).paths, ['projects/p/a.md', 'projects/p/c.md']);
+  assert.equal(f.requests().length, 4);
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md', 'projects/p/a.md', 'projects/p/c.md']);
+});
+
+test('an exception labels its note without the model', (t) => {
+  const domains = {
+    version: 1, defaults: {},
+    exceptions: { 'projects/p/a.md': 'personal', 'projects/p/c.md': 'work', 'projects/p/gone.md': 'general', 'projects/q/x.md': 'work' },
+  };
+  const f = labelFixture(t, { domains });
+  f.seed({
+    'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'),
+    'projects/p/b.md': labeledNote('b', 'B', 'Beta.', 'general'),
+    'projects/p/c.md': note('c', 'C', 'Gamma.'),
+    'projects/q/y.md': labeledNote('y', 'Y', 'Why.', 'work'),
+  });
+  // No AWS credentials: with no batch to send, no token is asked for.
+  const r = f.runWith(f.mantleEnv, 'label', '--project', 'p');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), []);
+  assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
+  assert.equal(liveText(f, 'projects/p/c.md'), labeledNote('c', 'C', 'Gamma.', 'work'));
+  assert.match(r.stdout, /^label: applied, 2 label\(s\) written, 0 unchanged, USD 0\.00, 0 request\(s\)$/m);
+  const report = f.labelReport();
+  assert.match(report, /^- projects\/p\/a\.md: work → personal \(exception\)$/m);
+  assert.match(report, /^- projects\/p\/c\.md: unlabeled → work \(exception\)$/m);
+  assert.match(report, /^Exceptions that name no note:\n- projects\/p\/gone\.md$/m);
+  // projects/q is not a scope of this run: its exception is not reported.
+  assert.doesNotMatch(report, /projects\/q/);
+  // The first run records every label of the store as it is, also outside the named scopes.
+  assert.deepEqual(f.readState().labels.notes, {
+    'projects/p/a.md': digestIn(f, 'projects/p/a.md'),
+    'projects/p/b.md': digestIn(f, 'projects/p/b.md'),
+    'projects/p/c.md': digestIn(f, 'projects/p/c.md'),
+    'projects/q/y.md': digestIn(f, 'projects/q/y.md'),
+  });
+  // The model never sees a note with an exception, not even with --all.
+  const all = f.label('--all', '--project', 'p');
+  assert.equal(all.status, 0, all.stdout + all.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['projects/p/b.md'], auth: true }]);
+  assert.match(all.stdout, /^label: no-change, 0 label\(s\) written, 3 unchanged, USD 0\.00, 1 request\(s\)$/m);
+});
+
+test('labels do not make a scope due for Organize', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'projects/p/MEMORY.md': index('a.md', 'b.md'),
+    'projects/p/a.md': note('a', 'A', 'Alpha.'),
+    'projects/p/b.md': labeledNote('b', 'B', 'Beta.', 'work'),
+  });
+  // The model finds nothing to change; the label pass at the end of the run labels a.md.
+  let r = f.organize();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^organize p: no-change/m);
+  assert.match(r.stdout, /^label: applied, 1 label\(s\) written/m);
+  assert.equal(f.readState().projects.p.organizedDigest, folderDigest(join(f.repo, 'projects/p')));
+  r = f.organize();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^organize: nothing to do$/m);
+  assert.equal(f.calls().length, 1);
+  // An exception added later: label writes it, and Organize's record moves with it.
+  f.seed({ '.agent-memory/domains.json': `${JSON.stringify({ ...NO_EXCEPTIONS, exceptions: { 'projects/p/b.md': 'personal' } })}\n` });
+  r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'personal'));
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (2 file(s))');
+  r = f.organize();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^organize: nothing to do$/m);
+  assert.equal(f.calls().length, 1);
+});
+
+test('a scope that was due before labeling stays due', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/b.md': note('b', 'B', 'Beta.') });
+  assert.equal(f.organize().status, 0);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'q']);
+  // A session rewrites b.md without its label: q is due for Organize, and b.md is touched.
+  f.seed({ 'projects/q/b.md': note('b', 'B', 'Beta, rewritten.') });
+  f.mantle({ labels: { 'projects/q/b.md': 'work' } });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(liveText(f, 'projects/q/b.md'), labeledNote('b', 'B', 'Beta, rewritten.', 'work'));
+  assert.equal(f.organize().status, 0);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'q', 'q']);
+});
+
+test('organize ends with the label pass', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/MEMORY.md': index('a.md'), 'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work') });
+  // The model adds a note; the label pass that follows sends it.
+  f.instruct({ p: { writes: { 'notes/n.md': note('n', 'New', 'A new note.'), 'notes/MEMORY.md': index('a.md', 'n.md') } } });
+  f.mantle({ labels: { 'projects/p/n.md': 'personal' } });
+  const r = f.organize('--model', 'other-model');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const [call] = f.calls();
+  assert.equal(f.calls().length, 1);
+  assert.equal(call.args[call.args.indexOf('--model') + 1], 'other-model');
+  assert.deepEqual(f.requests(), [{ paths: ['projects/p/n.md'], auth: true }]);
+  assert.match(r.stdout, /^organize p: applied, 2 change\(s\)[^\n]*\nlabel: applied, 1 label\(s\) written/m);
+  assert.equal(liveText(f, 'projects/p/n.md'), labeledNote('n', 'New', 'A new note.', 'personal'));
+  // --model of an organize run names the Organize model only.
+  assert.match(f.labelReport(), /^- Model: example-label-model;/m);
+  assert.match(f.subjects()[0], /^consolidate\(alpha\): label 1 note\(s\) \(2 file\(s\)\)$/);
+  assert.match(f.subjects()[1], /^consolidate\(alpha\): organize projects\/p /);
+});
+
+test('missing inputs stop the pass', (t) => {
+  const f = labelFixture(t, { persona: null });
+  f.seed({ 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  const line = 'label: the label inputs are missing or invalid (personaFile); no label was written.\n';
+  const head = f.head();
+  let r = f.label();
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, line);
+  assert.equal(f.head(), head);
+  // After an Organize run that succeeded, too.
+  r = f.organize();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^organize p: no-change/m);
+  assert.ok(r.stdout.endsWith(line), r.stdout);
+  assert.deepEqual(f.requests(), []);
+  assert.equal(liveText(f, 'projects/p/c.md'), note('c', 'C', 'Gamma.'));
+  assert.equal(f.readState().labels, undefined);
+  // A domains file that is not valid is named with its problem.
+  f.seed({ '.agent-memory/persona.md': PERSONA, '.agent-memory/domains.json': '{"version": 2}\n' });
+  r = f.label();
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, 'label: the label inputs are missing or invalid (domainsFile: version); no label was written.\n');
+  // Inputs named in the label block are read from there instead.
+  const domainsFile = join(f.tmp, 'domains.json');
+  const personaFile = join(f.tmp, 'persona.md');
+  writeFileSync(domainsFile, JSON.stringify(NO_EXCEPTIONS));
+  writeFileSync(personaFile, PERSONA);
+  f.setConfig({ label: { ...LABEL_BLOCK, domainsFile, personaFile } });
+  r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['projects/p/c.md'], auth: true }]);
+  // A clone that is missing is the read step's error.
+  const config = JSON.parse(readFileSync(f.configFile, 'utf8'));
+  writeFileSync(f.configFile, JSON.stringify({ ...config, repoDir: join(f.tmp, 'nowhere') }));
+  r = f.label();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^ {2}- the label-read step failed: the notes clone \S+ does not exist$/m);
+});
+
+test('a failed batch leaves its notes for the next run', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/c.md': note('c', 'C', 'Gamma.') });
+  // The first batch (global/) fails on each of its attempts; the pass goes on with the two others.
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'personal', 'projects/q/c.md': 'personal' }, fail: { status: 500, times: 3 } });
+  const r = f.label();
+  assert.equal(r.status, 1);
+  assert.deepEqual(f.requests().map((q) => q.paths),
+    [['global/g.md'], ['global/g.md'], ['global/g.md'], ['projects/p/a.md'], ['projects/q/c.md']]);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.equal(liveText(f, 'global/g.md'), note('g', 'G', 'General.'));
+  assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
+  assert.equal(liveText(f, 'projects/q/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/p/a.md', 'projects/q/c.md']);
+  assert.match(r.stdout, /^label: applied, 2 label\(s\) written, 0 unchanged, USD 0\.00, 3 request\(s\)$/m);
+  assert.match(r.stdout, /^- global\/g\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  const report = f.labelReport();
+  assert.match(report, /^Left for the next run:\n- global\/g\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  assert.doesNotMatch(r.stdout + r.stderr + report, /FAKE-MANTLE-BODY/);
+  // The next run sends what was left, and only that.
+  f.mantle({ labels: { 'global/g.md': 'work' } });
+  const again = f.label();
+  assert.equal(again.status, 0, again.stdout + again.stderr);
+  assert.equal(f.requests().length, 6);
+  assert.deepEqual(f.requests().at(-1).paths, ['global/g.md']);
+  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
+});
+
+test('two failed batches in a row stop the pass', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'),
+    'projects/q/b.md': note('b', 'B', 'Beta.'), 'projects/r/c.md': note('c', 'C', 'Gamma.'),
+  });
+  // The first batch is answered; the next two fail on each of their attempts.
+  f.mantle({ labels: { 'global/g.md': 'work' }, fail: { status: 500, times: 6, after: 1 } });
+  const r = f.label();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
+  // The fourth batch is never sent.
+  assert.deepEqual(f.requests().map((q) => q.paths),
+    [['global/g.md'], ...Array(3).fill(['projects/p/a.md']), ...Array(3).fill(['projects/q/b.md'])]);
+  // The batch answered before is written and recorded; the others stay touched.
+  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
+  assert.equal(liveText(f, 'projects/r/c.md'), note('c', 'C', 'Gamma.'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md']);
+  const report = f.labelReport();
+  assert.match(report, /^- projects\/p\/a\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  assert.match(report, /^- projects\/q\/b\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  assert.match(report, /^- projects\/r\/c\.md: not sent; 2 batches in a row failed$/m);
+  assert.doesNotMatch(r.stdout + r.stderr + report, /FAKE-MANTLE-BODY/);
+});
+
+test('the token age stops the pass', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/b.md': note('b', 'B', 'Beta.') });
+  // Each request moves the driver's clock 30 minutes on: the third batch would start with a token an hour old.
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'personal' }, advanceMs: 30 * 60 * 1000 });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: stopped; the label token of this run is near the end of its hour$/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md'], ['projects/p/a.md']]);
+  assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
+  assert.equal(liveText(f, 'projects/q/b.md'), note('b', 'B', 'Beta.'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md', 'projects/p/a.md']);
+  assert.match(f.labelReport(), /^- projects\/q\/b\.md: not sent; the label token of this run was near the end of its hour$/m);
+});
+
+test('an --all run that stops leaves its notes to the next run', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': labeledNote('g', 'G', 'General.', 'general'),
+    'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'),
+    'projects/q/b.md': labeledNote('b', 'B', 'Beta.', 'personal'),
+  });
+  // A first run records the three labels as they are.
+  assert.equal(f.label().status, 0);
+  assert.deepEqual(f.requests(), []);
+  // A full relabel whose first batch reaches the ceiling.
+  f.setConfig({ maxBudgetUsd: 0.001 });
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'work', 'projects/q/b.md': 'personal' } });
+  const all = f.label('--all');
+  assert.equal(all.status, 0, all.stdout + all.stderr);
+  assert.match(all.stdout, /^label: stopped; the model cost of this run reached its ceiling of USD 0\.00$/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md']]);
+  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
+  // The notes it did not reach lose their entries, which still matched them.
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md']);
+  // A plain run sends exactly those notes.
+  f.setConfig();
+  const next = f.label();
+  assert.equal(next.status, 0, next.stdout + next.stderr);
+  assert.deepEqual(f.requests().slice(1).map((q) => q.paths), [['projects/p/a.md'], ['projects/q/b.md']]);
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md', 'projects/p/a.md', 'projects/q/b.md']);
+});
+
+test('a dry run writes nothing', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'), 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  f.mantle({ labels: { 'projects/p/c.md': 'personal' } });
+  const head = f.head();
+  const r = f.label('--dry-run', '--keep');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: dry-run, 1 label\(s\) to set or change, USD 0\.00, 1 request\(s\)$/m);
+  assert.match(r.stdout, /^- projects\/p\/c\.md: unlabeled → personal — fake reason for projects\/p\/c\.md$/m);
+  assert.deepEqual(f.requests(), [{ paths: ['projects/p/c.md'], auth: true }]);
+  assert.equal(liveText(f, 'projects/p/c.md'), note('c', 'C', 'Gamma.'));
+  assert.equal(f.head(), head);
+  assert.deepEqual(f.reports(), []);
+  assert.equal(existsSync(f.stateFile()), false);
+  // --keep keeps the work folder: the notes as they were read, and no plan.
+  const kept = /^ {2}work folder kept: (.+)$/m.exec(r.stdout)?.[1];
+  assert.ok(kept && existsSync(join(kept, 'label-notes.json')), r.stdout);
+  assert.equal(existsSync(join(kept, 'label-plan.json')), false);
+});
+
+test('the cost ceiling stops the pass', (t) => {
+  const f = labelFixture(t, { consolidate: { maxBudgetUsd: 0.001 } });
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/q/c.md': note('c', 'C', 'Gamma.') });
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/q/c.md': 'personal' } });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: stopped; the model cost of this run reached its ceiling of USD 0\.00$/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md']]);
+  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
+  assert.equal(liveText(f, 'projects/q/c.md'), note('c', 'C', 'Gamma.'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md']);
+  assert.match(f.labelReport(), /^- projects\/q\/c\.md: not sent; the model cost of this run reached its ceiling$/m);
+});
+
+test('label without the block says so', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  const head = f.head();
+  const r = f.run('label');
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, `agent-memory: labeling needs "label" in the consolidate block of ${f.configFile}; nothing was run.\n`);
+  assert.equal(f.head(), head);
+  // An organize run without the block ends without a label pass.
+  const o = f.run('organize');
+  assert.equal(o.status, 0, o.stdout + o.stderr);
+  assert.doesNotMatch(o.stdout, /^label/m);
+});
+
+test('a note that Organize must repair first is never sent to the model', (t) => {
+  const f = labelFixture(t);
+  const latin1 = Buffer.concat([Buffer.from(note('l', 'L', 'Caf').trimEnd()), Buffer.from([0xe9, 0x0a])]);
+  f.seed({ 'projects/p/plain.md': 'Just a line, no frontmatter.\n', 'projects/p/latin.md': latin1, 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['projects/p/c.md'], auth: true }]);
+  assert.equal(liveText(f, 'projects/p/plain.md'), 'Just a line, no frontmatter.\n');
+  assert.ok(readFileSync(join(f.repo, 'projects/p/latin.md')).equals(latin1));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/p/c.md']);
+  const repair = /^Left for Organize's repair:\n- projects\/p\/latin\.md: not UTF-8 text\n- projects\/p\/plain\.md: no frontmatter$/m;
+  assert.match(f.labelReport(), repair);
+  // They are named on every run until Organize repairs them, and never sent.
+  const again = f.label();
+  assert.equal(again.status, 0, again.stdout + again.stderr);
+  assert.match(again.stdout, /^label: nothing to do$/m);
+  assert.match(again.stdout, repair);
+  assert.equal(f.requests().length, 1);
+});
+
+test('a signal during the label model call writes nothing', async (t) => {
+  for (const [args, kind] of [[['label'], 'label'], [['organize'], 'organize']]) {
+    const f = labelFixture(t);
+    f.seed({ 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+    f.mantle({ labels: { 'projects/p/c.md': 'work' }, delayMs: 20000 });
+    const child = spawn(RUN_SH, ['consolidate', ...args], { env: { ...f.env, ...f.labelEnv }, stdio: ['ignore', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
+    t.after(() => child.kill('SIGKILL'));
+    assert.ok(await waitFor(() => f.requests().length === 1), `${kind}: the model was asked`);
+    const head = f.head();
+    child.kill('SIGTERM');
+    assert.deepEqual(await exited, { code: 143, signal: null }, kind);
+    assert.match(stdout, new RegExp(`^${kind}: interrupted by SIGTERM; nothing more was applied$`, 'm'));
+    assert.doesNotMatch(stdout, /^label: (applied|no-change|nothing)/m, kind);
+    assert.equal(liveText(f, 'projects/p/c.md'), note('c', 'C', 'Gamma.'), kind);
+    assert.equal(f.head(), head, kind);
+    assert.equal(existsSync(f.stateFile()) ? f.readState().labels : undefined, undefined, kind);
+    assert.deepEqual(readdirSync(f.workRoot()), [], kind);
+    assert.ok(lockIsFree(f), kind);
+  }
+});
+
+test('label: usage errors, and a named project without a folder', (t) => {
+  const f = labelFixture(t);
+  const cases = [
+    ['organize', '--all'], ['extract', '--all'], ['label', '--min-retention', '0.5'], ['label', '--agents', '--project', 'p'],
+    ['label', '--agent', 'example-agent', '--keep'], ['label', '--project'], ['label', '--project', '../p'], ['label', '--model', '-x'],
+  ];
+  for (const args of cases) {
+    const r = f.runWith(f.labelEnv, ...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /^usage: .*\| label \[--project <name>\]\.\.\. \[--all\] \[--dry-run\] \[--keep\] \[--model <id>\] \| label --agents \[--agent <name>\]\.\.\. \[--all\] \[--dry-run\]$/m, args.join(' '));
+  }
+  const r = f.label('--project', 'gone');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(r.stdout, 'label: no folder for project gone; nothing labeled there.\nlabel: nothing to do\n');
+  assert.deepEqual(f.requests(), []);
+});
+
+test('failed answers do not stop the pass', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'),
+    'projects/q/b.md': note('b', 'B', 'Beta.'), 'projects/r/c.md': note('c', 'C', 'Gamma.'),
+  });
+  // The first two batches get an answer that is a failure (HTTP 400, not retried): the endpoint
+  // is in reach, so the batches after them are still sent.
+  f.mantle({ labels: { 'projects/q/b.md': 'work', 'projects/r/c.md': 'personal' }, fail: { status: 400, times: 2 } });
+  const r = f.label();
+  assert.equal(r.status, 1);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md'], ['projects/p/a.md'], ['projects/q/b.md'], ['projects/r/c.md']]);
+  assert.equal(liveText(f, 'projects/q/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+  assert.equal(liveText(f, 'projects/r/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/q/b.md', 'projects/r/c.md']);
+  assert.match(r.stdout, /^- global\/g\.md: the model call failed \(Mantle Responses HTTP 400\)$/m);
+  assert.doesNotMatch(r.stdout + r.stderr, /FAKE-MANTLE-BODY/);
+});
+
+test('a first run with --project records the labels of every scope and sends the named scope\'s notes only', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': labeledNote('g', 'G', 'General.', 'personal'), 'global/h.md': note('h', 'H', 'Hotel.'),
+    'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'), 'projects/p/c.md': note('c', 'C', 'Gamma.'),
+    'projects/q/y.md': labeledNote('y', 'Y', 'Why.', 'general'), 'projects/q/z.md': note('z', 'Z', 'Zulu.'),
+  });
+  f.mantle({ labels: { 'projects/p/c.md': 'personal' } });
+  const r = f.label('--project', 'p');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  // Every scope is read: the labeled notes of all of them are recorded as they are; only the
+  // unlabeled note of the named scope goes to the model.
+  assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/c.md']]);
+  assert.deepEqual(f.readState().labels.notes, {
+    'global/g.md': digestIn(f, 'global/g.md'), 'projects/p/a.md': digestIn(f, 'projects/p/a.md'),
+    'projects/p/c.md': digestIn(f, 'projects/p/c.md'), 'projects/q/y.md': digestIn(f, 'projects/q/y.md'),
+  });
+  assert.equal(liveText(f, 'projects/p/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.equal(liveText(f, 'global/h.md'), note('h', 'H', 'Hotel.'));
+  assert.equal(liveText(f, 'projects/q/z.md'), note('z', 'Z', 'Zulu.'));
+  assert.match(f.labelReport(), /^- Notes: 1 touched, 1 sent to the model, 0 with an exception, 3 recorded as they were$/m);
+  // A run over every scope then sends the notes of the other scopes that have no label, and only those.
+  const next = f.label();
+  assert.equal(next.status, 0, next.stdout + next.stderr);
+  assert.deepEqual(f.requests().slice(1).map((q) => q.paths), [['global/h.md'], ['projects/q/z.md']]);
+});
+
+test('an exception whose note holds its label starts no label-apply', (t) => {
+  const domains = { version: 1, defaults: {}, exceptions: { 'projects/p/a.md': 'personal' } };
+  const f = labelFixture(t, { domains });
+  f.seed({ 'projects/p/a.md': note('a', 'A', 'Alpha.') });
+  let r = f.runWith(f.mantleEnv, 'label');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: applied, 1 label\(s\) written, 0 unchanged, USD 0\.00, 0 request\(s\)$/m);
+  // Later runs find the label there: nothing to do, and no label-apply, so no second sync.
+  const fetches = join(f.tmp, 'fetches');
+  wrapGit(f, `for a in "$@"; do if [[ "$a" == fetch ]]; then echo x >> "${fetches}"; fi; done`);
+  const head = f.head();
+  r = f.runWith(f.mantleEnv, 'label');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(r.stdout, 'label: nothing to do\n');
+  assert.equal(readFileSync(fetches, 'utf8'), 'x\n', 'the sync of label-read only');
+  assert.equal(f.head(), head);
+  // It stays recorded, as it was read.
+  assert.deepEqual(f.readState().labels.notes, { 'projects/p/a.md': digestIn(f, 'projects/p/a.md') });
+});
+
+test('a label-apply that fails prints its headline and reason, not the labels', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'), 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  f.mantle({ labels: { 'projects/p/c.md': 'personal' } });
+  // The fetch of label-read's sync works; the one of label-apply's first sync fails.
+  const count = join(f.tmp, 'fetches');
+  wrapGit(f, `for a in "$@"; do if [[ "$a" == fetch ]]; then n=$(cat "${count}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${count}"; if [[ $n == 2 ]]; then echo "fatal: the remote hung up" >&2; exit 1; fi; fi; done`);
+  const head = f.head();
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(r.stdout, 'label: sync-failed, no label was written, USD 0.00, 1 request(s)\n  - the sync before writing failed: fatal: the remote hung up\n');
+  assert.equal(liveText(f, 'projects/p/c.md'), note('c', 'C', 'Gamma.'));
+  assert.equal(f.head(), head);
+});
+
+test('a run over every scope names the exceptions of folders it did not read', (t) => {
+  const domains = {
+    version: 1, defaults: {},
+    exceptions: { 'projects/typo/x.md': 'work', 'projects/p/gone.md': 'general', 'agents/example-agent/y.md': 'work' },
+  };
+  const f = labelFixture(t, { domains });
+  f.seed({ 'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work') });
+  // A run that names its projects lists only the exceptions of those.
+  let r = f.runWith(f.mantleEnv, 'label', '--project', 'p');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^## projects\/p\n\nLabels after this run: 1 work, 0 personal, 0 general\n\nExceptions that name no note:\n- projects\/p\/gone\.md$/m);
+  assert.doesNotMatch(r.stdout, /typo/);
+  // A run over every scope also names a folder that does not exist, but never an agent scope.
+  r = f.runWith(f.mantleEnv, 'label');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^- projects\/p\/gone\.md\n\n## projects\/typo\n\nExceptions that name no note:\n- projects\/typo\/x\.md$/m);
+  assert.doesNotMatch(r.stdout, /agents\//);
+});
+
+test('a batch whose answer is refused is split, and labels its notes when its halves are answered', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  f.mantle({ labels: { 'projects/p/a.md': 'work', 'projects/p/b.md': 'work', 'projects/p/c.md': 'personal' }, refuse: { times: 1 } });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md'], ['projects/p/a.md', 'projects/p/b.md'], ['projects/p/c.md']]);
+  assert.match(r.stdout, /^label: applied, 3 label\(s\) written, 0 unchanged, USD 0\.00, 3 request\(s\)$/m);
+  assert.equal(liveText(f, 'projects/p/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md']);
+  assert.match(f.labelReport(), /^- Notes: 3 touched, 3 sent to the model, 0 with an exception, 0 recorded as they were$/m);
+});
+
+test('an HTTP error on every request splits no batch; a 404 counts toward the failure stop', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/c.md': note('c', 'C', 'Gamma.'),
+    'projects/q/d.md': note('d', 'D', 'Delta.'), 'projects/r/e.md': note('e', 'E', 'Echo.'),
+  });
+  // A bad parameter fails every request at once: one request per batch, no split, no stop.
+  f.mantle({ labels: {}, fail: { status: 400, times: 10 } });
+  let r = f.label();
+  assert.equal(r.status, 1);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md'], ['projects/q/d.md'], ['projects/r/e.md']]);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.match(r.stdout, /^- projects\/p\/b\.md: the model call failed \(Mantle Responses HTTP 400\)$/m);
+  // An endpoint or a model that is not there: two batches in a row stop the run.
+  f.mantle({ labels: {}, fail: { status: 404, times: 10 } });
+  r = f.label();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
+  assert.equal(f.requests().length, 5);
+  assert.match(r.stdout, /^- projects\/r\/e\.md: not sent; 2 batches in a row failed$/m);
+  assert.doesNotMatch(r.stdout + r.stderr, /FAKE-MANTLE-BODY/);
+  // Every note stays touched for the next run.
+  assert.deepEqual(f.readState().labels.notes, {});
+});
+
+// ---- The label pass over the agent scopes: label --agents, and the end of every organize --agents run ----
+
+// The agent scopes' bucket (fake-s3-preload.mjs) and a label block, with the fake Mantle
+// (fake-mantle-preload.mjs) in front of the same run's fetch. The label inputs are in the clone;
+// `writeConfig` can name them in the label block instead, and leave the run without a clone, as in
+// a GitHub Actions job.
+function agentLabelFixture(t, { label = LABEL_BLOCK, domains = NO_EXCEPTIONS, block = AGENTS_BLOCK } = {}) {
+  const f = agentsFixture(t, { block, consolidate: label === null ? {} : { label } });
+  const mantleFile = join(f.tmp, 'mantle.json');
+  const mantleLog = join(f.tmp, 'mantle.jsonl');
+  writeFileSync(mantleFile, JSON.stringify({ labels: {} }));
+  f.seed({ '.agent-memory/domains.json': `${JSON.stringify(domains)}\n`, '.agent-memory/persona.md': PERSONA });
+  const env = {
+    ...f.awsEnv,
+    NODE_OPTIONS: `--import ${join(PKG, 'test', 'fake-s3-preload.mjs')} --import ${join(PKG, 'test', 'fake-mantle-preload.mjs')}`,
+    FAKE_MANTLE_FILE: mantleFile, FAKE_MANTLE_LOG: mantleLog,
+  };
+  const clientEnv = { FAKE_INSTRUCTIONS: join(f.tmp, 'instructions.json'), FAKE_CALLS: join(f.tmp, 'calls.jsonl'), FAKE_SUMMARY: SUMMARY, FAKE_S3_FILE: f.bucketFile };
+  return {
+    ...f,
+    mantle: (spec) => writeFileSync(mantleFile, JSON.stringify(spec)),
+    requests: () => (existsSync(mantleLog) ? readFileSync(mantleLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []),
+    organizeAgents: (...args) => f.runWith(env, 'organize', '--agents', ...args),
+    labelAgents: (...args) => f.runWith(env, 'label', '--agents', ...args),
+    state: (agent) => JSON.parse(f.bucket()['index/organizer.json']).scopes[agent],
+    entry: (path) => JSON.parse(f.bucket()['index/agents.json']).notes.find((n) => n.path === path),
+    writeConfig({ label: block = label, clone = true } = {}) {
+      f.setConfig({ env: clientEnv, label: block });
+      if (!clone) {
+        const config = JSON.parse(readFileSync(f.configFile, 'utf8'));
+        writeFileSync(f.configFile, JSON.stringify({ ...config, repoDir: join(f.tmp, 'no-notes-clone') }));
+      }
+    },
+    // An agent's write through the memory API: the search entry first, then the note.
+    agentWrites(name, description, content) {
+      const objects = JSON.parse(readFileSync(f.bucketFile, 'utf8'));
+      const path = `agents/codex-alpha/${name}.md`;
+      const doc = JSON.parse(Buffer.from(objects['index/agents.json'].body, 'base64').toString('utf8'));
+      doc.notes = [...doc.notes.filter((n) => n.path !== path), { path, name, description, type: 'reference', body: content }]
+        .sort((x, y) => (x.path < y.path ? -1 : 1));
+      for (const [key, text] of [['index/agents.json', JSON.stringify(doc)], [path, apiNote(name, description, content)]]) {
+        objects[key] = { body: Buffer.from(text).toString('base64'), etag: md5(text) };
+      }
+      writeFileSync(f.bucketFile, JSON.stringify(objects));
+    },
+  };
+}
+
+const agentLabeled = (text, label) => text.replace('  type: reference\n', `  type: reference\n  domain: ${label}\n`);
+
+test('organize --agents ends with the label pass', (t) => {
+  const f = agentLabelFixture(t);
+  // Organize merges the two notes into one; the label pass that follows sends the note it left.
+  f.instruct(agentMerge());
+  f.mantle({ labels: { 'agents/codex-alpha/deploys.md': 'work' } });
+  const r = f.organizeAgents('--model', 'other-model');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const [call] = f.calls();
+  assert.equal(f.calls().length, 1);
+  assert.equal(call.args[call.args.indexOf('--model') + 1], 'other-model');
+  assert.deepEqual(f.requests(), [{ paths: ['agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: applied, 3 change\(s\)/m);
+  assert.ok(r.stdout.indexOf('organize agents/codex-alpha: applied') < r.stdout.indexOf('label agents/codex-alpha:'), r.stdout);
+  assert.match(r.stdout, /^label: 1 note\(s\) sent to the model, USD 0\.00, 1 request\(s\)\nlabel agents\/codex-alpha: applied, 1 label\(s\) written, 0 unchanged$/m);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploys\.md: unlabeled → work$/m);
+  // The label is in the note and in its search entry, and the scope's record holds what the pass saw.
+  const b = f.bucket();
+  assert.equal(b['agents/codex-alpha/deploys.md'], agentLabeled(MERGED_DEPLOYS, 'work'));
+  assert.equal(f.entry('agents/codex-alpha/deploys.md').domain, 'work');
+  const state = f.state('codex-alpha');
+  assert.deepEqual(state.labels, { 'deploys.md': md5(agentLabeled(MERGED_DEPLOYS, 'work')) });
+  assert.match(state.lastLabel, /^\d{4}-\d\d-\d\dT/);
+  assert.equal(state.lastOutcome.outcome, 'applied');
+  // Labels never make the scope due: the next run has nothing to organize and nothing to label.
+  const again = f.organizeAgents();
+  assert.equal(again.status, 0, again.stdout + again.stderr);
+  assert.match(again.stdout, /^organize: nothing to do\nlabel agents\/codex-alpha: nothing to do$/m);
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.requests().length, 1);
+  // Every write was conditional and within what the organizer role may write; the label model's
+  // reasons and the token reach no output, and the model client never saw the token or the job's
+  // credentials.
+  for (const w of writes(f.log())) {
+    assert.ok(w.ifMatch !== null || w.ifNoneMatch === '*', `${w.method} ${w.key}`);
+    assert.match(w.key, /^(?:agents\/[^/]+\/[^/]+\.md|index\/agents\.json|index\/organizer\.json)$/);
+  }
+  assert.doesNotMatch(r.stdout + r.stderr, /fake reason|bedrock-api-key|ASIAEXAMPLE|example-signing/);
+  assert.doesNotMatch(JSON.stringify(f.calls()), /bedrock-api-key|ASIAEXAMPLE|example-signing/);
+  // A dry run of organize --agents ends with a dry run of the pass: the model is asked, nothing is written.
+  f.agentWrites('deploys', 'How deploys go now', 'Deploys now go through a canary first.');
+  f.instruct({});
+  const logged = writes(f.log()).length;
+  const dry = f.organizeAgents('--dry-run');
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /^label agents\/codex-alpha: dry-run, 1 label\(s\) to set or change$/m);
+  assert.equal(f.requests().length, 2);
+  assert.equal(writes(f.log()).length, logged);
+});
+
+test('label --agents --all sends every agent note', (t) => {
+  const exceptions = { 'agents/codex-alpha/deploy-steps.md': 'personal' };
+  const f = agentLabelFixture(t, { domains: { ...NO_EXCEPTIONS, exceptions } });
+  f.mantle({ labels: { 'agents/codex-alpha/deploys.md': 'work' } });
+  // A first run: the note with an exception is labeled by code, the other by the model.
+  let r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.match(r.stdout, /^label agents\/codex-alpha: applied, 2 label\(s\) written, 0 unchanged$/m);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploy-steps\.md: unlabeled → personal \(exception\)$/m);
+  assert.equal(f.calls().length, 0, 'label --agents runs no Organize');
+  // A plain run sends nothing.
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(f.requests().length, 1);
+  assert.match(r.stdout, /^label agents\/codex-alpha: no-change, 0 label\(s\) written, 1 unchanged$/m);
+  // --all sends every note but the exception's, whatever the record says; labels that hold are not written.
+  const notes = () => Object.entries(f.bucket()).filter(([key]) => key.startsWith('agents/'));
+  const before = notes();
+  r = f.labelAgents('--all');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests().slice(1), [{ paths: ['agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.match(r.stdout, /^label agents\/codex-alpha: no-change, 0 label\(s\) written, 2 unchanged$/m);
+  assert.deepEqual(notes(), before);
+  // --all with --dry-run asks the model again and writes nothing.
+  const logged = writes(f.log()).length;
+  f.mantle({ labels: { 'agents/codex-alpha/deploys.md': 'personal' } });
+  r = f.labelAgents('--all', '--dry-run', '--agent', 'codex-alpha');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(f.requests().length, 3);
+  assert.match(r.stdout, /^label agents\/codex-alpha: dry-run, 1 label\(s\) to set or change$/m);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploys\.md: work → personal$/m);
+  assert.equal(writes(f.log()).length, logged);
+  assert.deepEqual(notes(), before);
+});
+
+test('label --agents without a notes clone needs both input files', (t) => {
+  const f = agentLabelFixture(t);
+  // As in a GitHub Actions job: no notes clone, and the label token in a file the job wrote.
+  const tokenFile = join(f.tmp, 'label-token');
+  writeFileSync(tokenFile, 'example-label-token-0001\n', { mode: 0o600 });
+  const { credentials, ...rest } = LABEL_BLOCK;
+  const block = { ...rest, tokenFile };
+  f.writeConfig({ label: block, clone: false });
+  const missing = (what) => `label: the label inputs are missing or invalid (${what}); no label was written.\n`;
+  let r = f.labelAgents();
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, missing('label.domainsFile'));
+  const domainsFile = join(f.tmp, 'domains.json');
+  const personaFile = join(f.tmp, 'persona.md');
+  writeFileSync(domainsFile, JSON.stringify(NO_EXCEPTIONS));
+  writeFileSync(personaFile, PERSONA);
+  f.writeConfig({ label: { ...block, domainsFile }, clone: false });
+  r = f.labelAgents();
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, missing('label.personaFile'));
+  // An organize --agents run fails the same way, after Organize.
+  f.instruct({});
+  r = f.organizeAgents();
+  assert.equal(r.status, 1);
+  assert.ok(r.stdout.endsWith(missing('label.personaFile')), r.stdout);
+  assert.deepEqual(f.requests(), []);
+  assert.deepEqual(writes(f.log()).filter((w) => w.key !== 'index/organizer.json'), []);
+  // With both files named, the run labels the notes with the token of the file.
+  f.writeConfig({ label: { ...block, domainsFile, personaFile }, clone: false });
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.doesNotMatch(r.stdout + r.stderr, /example-label-token/);
+  // The token's age counts from when the job wrote the file: with a file 54 minutes old the first
+  // batch goes, and the next, two minutes later, would start with a token 56 minutes old.
+  f.writeConfig({ label: { ...block, domainsFile, personaFile, batchNotes: 1 }, clone: false });
+  f.mantle({ labels: {}, advanceMs: 2 * 60 * 1000 });
+  const ago = (minutes) => new Date(Date.now() - minutes * 60 * 1000);
+  utimesSync(tokenFile, ago(54), ago(54));
+  f.agentWrites('deploys', 'How deploys go now', 'Deploys now go through a canary first.');
+  f.agentWrites('deploy-steps', 'Deploy steps now', 'Build, canary, deploy, promote.');
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: stopped; the label token of this run is near the end of its hour$/m);
+  assert.deepEqual(f.requests().slice(1).map((q) => q.paths), [['agents/codex-alpha/deploy-steps.md']]);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploys\.md: not sent; the label token of this run was near the end of its hour$/m);
+  // A file already 55 minutes old when the run takes its token holds a long-lived key: its age
+  // stops nothing.
+  utimesSync(tokenFile, ago(55), ago(55));
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.deepEqual(f.requests().slice(2).map((q) => q.paths), [['agents/codex-alpha/deploys.md']]);
+  // Once such a key has expired its requests get 403: the failure stop ends the run, which fails.
+  f.mantle({ labels: {}, fail: { status: 403, times: 3 } });
+  for (const name of ['deploys', 'deploy-steps', 'fresh']) f.agentWrites(name, `About ${name}`, `Text of ${name}.`);
+  r = f.labelAgents();
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
+  assert.equal(f.requests().length, 5);
+  assert.doesNotMatch(r.stdout + r.stderr, /example-label-token|FAKE-MANTLE-BODY/);
+});
+
+test('label --agents: usage errors, missing blocks and an unknown agent', (t) => {
+  const f = agentLabelFixture(t);
+  for (const args of [['--keep'], ['--model', 'other-label-model'], ['--project', 'p'], ['--min-retention', '0.5'], ['--agent', 'Bad_Name']]) {
+    const r = f.labelAgents(...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /^usage: /m);
+  }
+  const unknown = f.labelAgents('--agent', 'nobody');
+  assert.equal(unknown.status, 2);
+  assert.match(unknown.stderr, /"nobody" is not an agent scope of the bucket\./);
+  const noAgents = agentLabelFixture(t, { block: null });
+  let r = noAgents.labelAgents();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^agent-memory: labeling the agent scopes needs "agents" in the consolidate block of \S+; nothing was run\.$/m);
+  const noLabel = agentLabelFixture(t, { label: null });
+  r = noLabel.labelAgents();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^agent-memory: labeling needs "label" in the consolidate block of \S+; nothing was run\.$/m);
+  // organize --agents without a label block ends without a label pass.
+  noLabel.instruct({});
+  r = noLabel.organizeAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /^label/m);
+  assert.deepEqual([...f.requests(), ...noAgents.requests(), ...noLabel.requests()], []);
 });

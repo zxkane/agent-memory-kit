@@ -1,12 +1,15 @@
 // Small helpers for reading notes: frontmatter, index links and "retired note" stubs.
 
 export const INDEX = 'MEMORY.md';
+// Names of the scopes a note lives in: an agent folder and a project folder.
+export const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+export const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 export const NOTE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
 
 const STUB_RE = /^MOVED TO \[\[(?:(global):)?([A-Za-z0-9][A-Za-z0-9._-]{0,193})\]\]$/;
 const LINK_RE = /\]\(([^()\s]+)\)/g;
 
-function unquote(value) {
+export function unquote(value) {
   const v = value.trim();
   if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) return v.slice(1, -1);
   return v;

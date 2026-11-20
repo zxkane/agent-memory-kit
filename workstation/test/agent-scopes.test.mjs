@@ -5,7 +5,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   SNAPSHOT_KEY, STATE_KEY, agentScopeProblems, agentScopesS3, applyAgentScope, copyAgentScope, listAgentScopes,
-  mergeIndex, noteEntry, readOrganizerState, recordOrganizerState, repairAgentEntries, scopeDigest,
+  mergeIndex, noteEntry, readOrganizerState, readSearchEntries, recordOrganizerState, repairAgentEntries, scopeDigest,
+  setNoteEntries,
 } from '../lib/agent-scopes.mjs';
 import { createS3 } from '../lib/s3.mjs';
 import { evaluate, snapshot } from '../lib/workdir.mjs';
@@ -95,6 +96,88 @@ test('a note entry is what the memory API writes for the same file', () => {
   assert.deepEqual(entry, {
     path: 'agents/codex-alpha/deploys.md', name: 'deploys', description: 'Say "hi" — and more', type: 'reference', body: 'Line one.\n\nLine two.',
   });
+});
+
+// A note as apiNote composes it, with `line` added to its metadata block.
+const withLine = (text, line) => text.replace('  type: reference\n', `  type: reference\n${line}\n`);
+
+test('noteEntry carries a valid domain only', () => {
+  const text = apiNote('deploys', 'How deploys go', 'Deploys go through staging.');
+  const plain = noteEntry('codex-alpha', 'deploys.md', text);
+  assert.equal(Object.hasOwn(plain, 'domain'), false);
+  for (const [line, domain] of [['  domain: work', 'work'], ['  domain: "personal"', 'personal'], ["  domain: 'general'", 'general']]) {
+    assert.deepEqual(noteEntry('codex-alpha', 'deploys.md', withLine(text, line)), { ...plain, domain }, line);
+  }
+  // A value that is not a label, or a domain outside metadata:, gives none.
+  for (const other of [withLine(text, '  domain: home'), withLine(text, '  domain:'), text.replace('metadata:\n', 'domain: work\nmetadata:\n')]) {
+    assert.equal(Object.hasOwn(noteEntry('codex-alpha', 'deploys.md', other), 'domain'), false, other);
+  }
+});
+
+test('the search entries keep the labels of every scope when one of them is organized', async (t) => {
+  const b = bucket();
+  // Labeled notes, whose entries carry their labels as the label step leaves them.
+  const labeledNote = (name, description, content, label) => withLine(apiNote(name, description, content), `  domain: ${label}`);
+  b.put('agents/claude-beta/other.md', labeledNote('other', 'Another agent', 'An unrelated fact of another agent.', 'personal'));
+  b.put('agents/codex-alpha/deploys.md', labeledNote('deploys', 'How deploys go', FACTS, 'work'));
+  const doc = b.snapshot();
+  doc.notes.find((n) => n.path === 'agents/claude-beta/other.md').domain = 'personal';
+  doc.notes.find((n) => n.path === 'agents/codex-alpha/deploys.md').domain = 'work';
+  b.put(SNAPSHOT_KEY, JSON.stringify(doc));
+  assert.deepEqual((await readSearchEntries(b.s3)).filter((e) => e.domain).map((e) => [e.path, e.domain]), [
+    ['agents/claude-beta/other.md', 'personal'], ['agents/codex-alpha/deploys.md', 'work'],
+  ]);
+  // Entries that carry the notes' labels are in step with them.
+  const run = await organizeRun(t, b, (w) => {
+    w('deploys.md', labeledNote('deploys', 'How deploys go (merged)', `${FACTS} Steps: build, deploy to staging, check, promote.`, 'work'));
+    w('deploy-steps.md', 'MOVED TO [[deploys]]\n');
+    w('MEMORY.md', `${indexLine('deploys', 'How deploys go, with the steps')}\n`);
+  });
+  assert.equal(run.plan.inStep, true);
+  assert.deepEqual(run.problems, []);
+  const res = await applyAgentScope({ s3: b.s3, agent: 'codex-alpha', plan: run.plan, changes: run.ev.changes, liveDir: run.liveDir, workDir: run.workDir });
+  assert.equal(res.outcome, 'applied');
+  // The organized scope's entry takes its label from the note; another scope's entry keeps its own.
+  const after = b.snapshot().notes;
+  assert.equal(after.find((n) => n.path === 'agents/codex-alpha/deploys.md').domain, 'work');
+  assert.equal(after.find((n) => n.path === 'agents/claude-beta/other.md').domain, 'personal');
+  // A value that is not a label is not kept.
+  const odd = b.snapshot();
+  odd.notes.find((n) => n.path === 'agents/claude-beta/other.md').domain = 'home';
+  b.put(SNAPSHOT_KEY, JSON.stringify(odd));
+  assert.equal(Object.hasOwn((await readSearchEntries(b.s3)).find((e) => e.path === 'agents/claude-beta/other.md'), 'domain'), false);
+});
+
+test('setNoteEntries replaces the entries of the notes it is given, in one conditional update', async () => {
+  const b = bucket();
+  const label = (text, domain) => withLine(text, `  domain: ${domain}`);
+  const deploys = label(apiNote('deploys', 'How deploys go', FACTS), 'work');
+  const steps = label(apiNote('deploy-steps', 'Deploy steps', FACTS), 'personal');
+  // An agent is writing deploy-steps through the API: its entry already holds the new text.
+  const doc = b.snapshot();
+  doc.notes.find((n) => n.path === 'agents/codex-alpha/deploy-steps.md').body = 'An agent is writing this note right now.';
+  // An entry that is missing is added.
+  doc.notes = doc.notes.filter((n) => n.path !== 'agents/codex-alpha/deploys.md');
+  b.put(SNAPSHOT_KEY, JSON.stringify(doc));
+  const before = b.snapshot();
+  await setNoteEntries(b.s3, 'codex-alpha', [{ file: 'deploys.md', text: deploys }, { file: 'deploy-steps.md', text: steps }]);
+  const after = b.snapshot();
+  assert.deepEqual(after.notes.find((n) => n.path === 'agents/codex-alpha/deploys.md'), noteEntry('codex-alpha', 'deploys.md', deploys));
+  assert.equal(after.notes.find((n) => n.path === 'agents/codex-alpha/deploys.md').domain, 'work');
+  // The agent's write wins: an entry that no longer describes the labeled note stays as it is.
+  assert.deepEqual(after.notes.find((n) => n.path === 'agents/codex-alpha/deploy-steps.md'), before.notes.find((n) => n.path === 'agents/codex-alpha/deploy-steps.md'));
+  // Everything else is kept: other scopes, entries that are not notes, other keys; notes stay sorted.
+  assert.deepEqual(after.notes.find((n) => n.path === 'agents/claude-beta/other.md'), before.notes.find((n) => n.path === 'agents/claude-beta/other.md'));
+  assert.deepEqual(after.notes.map((n) => n.path ?? 'odd'), ['agents/claude-beta/other.md', 'agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md', 'odd']);
+  assert.equal(after.extra, 'kept');
+  const puts = b.fake.requests.filter((r) => r.method === 'PUT' && r.key === SNAPSHOT_KEY);
+  assert.equal(puts.length, 1);
+  assert.ok(puts[0].headers['if-match']);
+  // An entry the run left as the API wrote it, apart from the label, is replaced.
+  await setNoteEntries(b.s3, 'claude-beta', [{ file: 'other.md', text: label(apiNote('other', 'Another agent', 'An unrelated fact of another agent.'), 'general') }]);
+  assert.equal(b.snapshot().notes.find((n) => n.path === 'agents/claude-beta/other.md').domain, 'general');
+  await assert.rejects(setNoteEntries(b.s3, '../x', [{ file: 'a.md', text: deploys }]), /invalid agent name/);
+  await assert.rejects(setNoteEntries(b.s3, 'codex-alpha', [{ file: 'MEMORY.md', text: deploys }]), /not a note/);
 });
 
 test('TC-AGENT-ORG-001: two duplicate notes are merged; the retired one is gone from the bucket, MEMORY.md and the snapshot', async (t) => {

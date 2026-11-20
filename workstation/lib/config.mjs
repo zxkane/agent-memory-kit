@@ -24,8 +24,13 @@ function calendar(value) {
 
 const CONSOLIDATE_KEYS = [
   'command', 'model', 'env', 'extract', 'organize', 'maxProjects', 'maxTranscriptBytes', 'maxTurns', 'maxBudgetUsd',
-  'timeoutMinutes', 'agents',
+  'timeoutMinutes', 'agents', 'label',
 ];
+const LABEL_KEYS = [
+  'model', 'region', 'endpoint', 'credentials', 'roleArn', 'tokenFile', 'reasoningEffort', 'inputUsdPerMillion',
+  'outputUsdPerMillion', 'batchNotes', 'domainsFile', 'personaFile',
+];
+const REASONING_EFFORTS = ['low', 'medium', 'high'];
 const AGENTS_KEYS = ['bucket', 'region', 'roleArn', 'credentials'];
 
 // Whether an unknown key may be printed by name (the driver and setup.sh echo the problem field):
@@ -53,6 +58,70 @@ function parseAgents(block) {
   const credentials = credentialSource(block.credentials);
   if (credentials === undefined) return bad('credentials');
   return { value: { bucket: block.bucket, region: block.region, roleArn, credentials }, problem: null };
+}
+
+// An https URL without user, password, query or hash, as stored: no trailing "/", so that
+// `<endpoint>/responses` never holds "//". Undefined when the value is not one.
+function httpsEndpoint(value) {
+  if (typeof value !== 'string' || CONTROL_RE.test(value)) return undefined;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== ''
+    || value.includes('?') || value.includes('#')) return undefined;
+  return value.replace(/\/+$/, '');
+}
+
+const absolutePath = (value) => (typeof value === 'string' && isAbsolute(value) && !CONTROL_RE.test(value) ? value : undefined);
+const priceUsd = (value) => (typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1000 ? value : undefined);
+
+// The optional `label` part of the consolidation block: the model that gives every note its label
+// (`metadata.domain`) through an OpenAI-compatible Responses endpoint. `{ value, problem }`, the
+// problem named `label.<field>`.
+function parseLabel(block) {
+  if (block === undefined || block === null) return { value: null, problem: null };
+  const bad = (field) => ({ value: null, problem: field === null ? 'label' : `label.${field}` });
+  if (typeof block !== 'object' || Array.isArray(block)) return bad(null);
+  const unknown = Object.keys(block).find((key) => !LABEL_KEYS.includes(key));
+  if (unknown !== undefined) return bad(echoable(unknown) ? unknown : '(an unknown key)');
+  if (typeof block.model !== 'string' || !MODEL_RE.test(block.model)) return bad('model');
+  if (typeof block.region !== 'string' || !REGION_RE.test(block.region)) return bad('region');
+  const endpoint = block.endpoint === undefined
+    ? `https://bedrock-mantle.${block.region}.api.aws/openai/v1`
+    : httpsEndpoint(block.endpoint);
+  if (endpoint === undefined) return bad('endpoint');
+  const roleArn = block.roleArn ?? null;
+  if (roleArn !== null && (typeof roleArn !== 'string' || !ROLE_ARN_RE.test(roleArn))) return bad('roleArn');
+  let credentials = credentialSource(block.credentials);
+  if (credentials === undefined) return bad('credentials');
+  const tokenFile = block.tokenFile ?? null;
+  if (tokenFile !== null) {
+    // A token read from a file replaces AWS credentials: giving both is a conflict, not a fallback.
+    if (absolutePath(tokenFile) === undefined || block.credentials !== undefined || roleArn !== null) return bad('tokenFile');
+    credentials = null;
+  }
+  const reasoningEffort = block.reasoningEffort ?? 'low';
+  if (!REASONING_EFFORTS.includes(reasoningEffort)) return bad('reasoningEffort');
+  const inputUsdPerMillion = priceUsd(block.inputUsdPerMillion);
+  if (inputUsdPerMillion === undefined) return bad('inputUsdPerMillion');
+  const outputUsdPerMillion = priceUsd(block.outputUsdPerMillion);
+  if (outputUsdPerMillion === undefined) return bad('outputUsdPerMillion');
+  const batchNotes = intIn(block.batchNotes, 19, 1, 50);
+  if (batchNotes === undefined) return bad('batchNotes');
+  const domainsFile = block.domainsFile ?? null;
+  if (domainsFile !== null && absolutePath(domainsFile) === undefined) return bad('domainsFile');
+  const personaFile = block.personaFile ?? null;
+  if (personaFile !== null && absolutePath(personaFile) === undefined) return bad('personaFile');
+  return {
+    value: {
+      model: block.model, region: block.region, endpoint, credentials, roleArn, tokenFile, reasoningEffort,
+      inputUsdPerMillion, outputUsdPerMillion, batchNotes, domainsFile, personaFile,
+    },
+    problem: null,
+  };
 }
 
 // The optional consolidation block: `{ value, problem }`. An absent block gives no value and no
@@ -88,11 +157,13 @@ function parseConsolidate(block) {
   for (const [name, value] of Object.entries(fields)) if (value === undefined) return bad(name);
   const agents = parseAgents(block.agents);
   if (agents.problem !== null) return bad(agents.problem);
+  const label = parseLabel(block.label);
+  if (label.problem !== null) return bad(label.problem);
   const { extract, organize, maxProjects, maxTranscriptBytes, maxTurns, maxBudgetUsd, timeoutMinutes } = fields;
   return {
     value: {
       command, model, env: { ...env }, extract, organize, maxProjects, maxTranscriptBytes, maxTurns,
-      maxBudgetUsd, timeoutMinutes, agents: agents.value,
+      maxBudgetUsd, timeoutMinutes, agents: agents.value, label: label.value,
     },
     problem: null,
   };

@@ -234,7 +234,7 @@ There are two jobs, each run per folder of notes (a "scope": one project folder,
 - **Extract** reads the recent conversations of one project, from Claude Code and from Codex, and corrects or adds notes for what they show. It works on project folders only, never on `global/`, and it never retires a note.
 - **Organize** tidies a folder: it merges notes that say the same thing, repairs frontmatter that is missing or broken (a complete frontmatter block is left alone, and its `name` need not equal the file name), marks facts that cannot both be true, turns relative dates into absolute ones, and keeps `MEMORY.md` complete and within 200 lines and 25,000 bytes. When the index is over its limit, that comes first: the model is shown the current size and asked to shorten the hooks before it merges notes. It never translates: every fact stays in the language it is written in. For a project it also sees `global/`, as a destination only: it may move a note about the person there, but the notes already in `global/` are organized only by a run on the `global` scope (see the rules below). It may retire a note (see below).
 
-Both are started with `workstation/run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]`. The scopes that agents write through the memory API have an Organize run of their own (see "The agent scopes of the memory API").
+Both are started with `workstation/run.sh consolidate extract|organize [--project <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]`. The scopes that agents write through the memory API have an Organize run of their own (see "The agent scopes of the memory API"). With a `label` part in the block, every Organize run ends with the label step, which gives each new or changed note a label (see "Labels: work, personal, general"); so does every Organize run for the agent scopes, over those scopes.
 
 ### How a run is kept safe
 
@@ -290,6 +290,7 @@ Add a `consolidate` block to `~/.config/agent-memory/config.json`. `command` and
 | `maxBudgetUsd` | 5 | Spending limit for one scope, a number above 0 and at most 100. It is passed to the client as the client's own limit, which may be overshot slightly. |
 | `timeoutMinutes` | 30 | Time limit for one scope, 1 to 240. The driver stops the client when it is reached. A repair run has the same limit again, so a scope with a repair run can take twice as long. |
 | `agents` | absent | Where the Organize run for agent scopes finds them (`bucket`, `region`, optional `roleArn` and `credentials`); see "The agent scopes of the memory API". |
+| `label` | absent | The label step's model and endpoint; see "Labels: work, personal, general". |
 
 The cost is bounded three ways: at most `maxProjects` scopes per run, at most `maxBudgetUsd` for each (a repair run gets what is left of it, so one scope's two runs together stay within it), and a ceiling for the whole run of `maxProjects` times `maxBudgetUsd`, or, for a run that names its projects with `--project`, the number of named projects times `maxBudgetUsd` (a scope whose cost is not reported counts at its full limit). The ceiling is checked between scopes, so a scope that overshoots its own limit is not cut off by it. When the ceiling is reached the run stops with a message and the remaining scopes wait for the next run. Start with a dry run on one project (see "Try it first").
 
@@ -365,7 +366,7 @@ Each scope prints one headline with details beneath it. Most outcomes read `<kin
 
 Other lines: *`<kind>`: nothing to do*; *stopped; the model cost of this run reached its ceiling*; *stopped; the sync failed...*; *stopped; the model command could not be started*; *interrupted by SIGINT; nothing more was applied* (a signal during the first scan reads *nothing was applied*); *agent-memory: consolidation is not configured.* (no `consolidate` block; exit 0); *agent-memory: the consolidate block in `<file>` is invalid (`<field>`); nothing was run.* (exit 1); an error line when the scan of the notes cannot run; and an error for a `--project` name that is not a project folder. A project folder named `global` is never consolidated.
 
-**Exit codes.** A green unit does not mean the notes were tidied: `applied`, `no-change`, `no-session`, `skipped`, `rejected`, `changed-meanwhile` and `sync-failed` all leave the run at exit 0, so read the lines (`journalctl --user -u agent-memory-organize.service`). Exit 1: a step failure (`step-failed`, `error`, `apply-interrupted`), any `model-failed` scope, a scan that could not run, or an invalid `consolidate` block. Exit 2: a usage error or an unknown `--project`. 130, 143 and 129 after Ctrl-C, SIGTERM and SIGHUP.
+**Exit codes.** A green unit does not mean the notes were tidied: `applied`, `no-change`, `no-session`, `skipped`, `rejected`, `changed-meanwhile` and `sync-failed` all leave the run at exit 0, so read the lines (`journalctl --user -u agent-memory-organize.service`). Exit 1: a step failure (`step-failed`, `error`, `apply-interrupted`), any `model-failed` scope, a scan that could not run, an invalid `consolidate` block, or a label step that failed (see "Labels: work, personal, general"), also after an Organize run that succeeded. Exit 2: a usage error, an unknown `--project` of `extract` or `organize`, or an unknown `--agent`; in a `label` run a named project without a folder is not an error (see "Labels: work, personal, general"). 130, 143 and 129 after Ctrl-C, SIGTERM and SIGHUP.
 
 ### Why the model stopped
 
@@ -401,9 +402,116 @@ An Organize run you revert will be done again: the folder's content then differs
 
 What was checked: the options the driver passes were checked against Claude Code's command-line client in its restricted mode, with a full model ID. The test suite runs the whole pipeline against a stand-in for the model, not a real one. A run with a real model and your notes is your own dry run (see "Try it first"): do it before you enable a timer, and check that the report shows `denials: 0`. A model alias (a short name such as a family name) may not resolve in restricted mode, so put the full ID in `model`. Another client needs to accept the same options: `-p`, `--restricted`, `--tools`, `--permission-mode acceptEdits`, `--permission-prompts none`, `--strict-mcp-config`, `--no-session-persistence`, `--output-format json`, `--model`, `--max-turns`, `--max-budget-usd` and `--add-dir`, and report its cost and turns in the JSON result.
 
+### Labels: work, personal, general
+
+A note can carry a label in its frontmatter, `domain` under `metadata:`:
+
+```
+---
+name: release-steps
+description: How a release reaches production
+metadata:
+  type: project
+  domain: work
+---
+```
+
+`work` is a note about your job, `personal` one about your life outside it, and `general` one that serves both, such as a fact about a public tool or a preference about how agents should work. The label tells a reader which scene a note belongs to; nothing filters by it. Only the label step writes it, by code, with the label that a model gives. A label that a session, an agent or Organize writes, changes or removes makes the note touched, and the next run labels it again.
+
+**When it runs.** At the end of every Organize run that was not interrupted, whatever Organize did, over the run's scopes (the `--project` names, otherwise `global/` and every project folder), and on its own (the agent scopes have a pass of their own, `label --agents`; see "The agent scopes of the memory API"):
+
+```
+workstation/run.sh consolidate label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>]
+```
+
+Nothing about it runs until the `consolidate` block has a `label` part; without one, `label` prints *agent-memory: labeling needs "label" in the consolidate block of `<config file>`; nothing was run.* and exits with 1. `--all` belongs to `label` only. `--model` names the label model for that run; in an `organize` run it names the Organize model only, and the label step keeps its own. `organize --dry-run` ends with a dry run of the label step.
+
+**Which notes go to the model.** Only touched notes: one that the record (below) has no entry for, or whose file changed since the step last wrote, found or confirmed its label. A change of the persona, the defaults or the kit's label prompt sends no note. `--all` sends every note of the chosen scopes, whatever the record says: a full relabel. The notes are the note files of `global/` and of each project folder, without `MEMORY.md`, retired `MOVED TO` notes and `.conflict-` copies. A note whose frontmatter the step cannot edit (no frontmatter, a block that is not closed, an inline `metadata:` value) or whose bytes are not UTF-8 text is never sent: the report lists it as left for Organize's repair, and it gets its label once it is repaired.
+
+**The first run.** Without a record, the step records every note that already carries a label as it is, in every scope, also when the run names projects, and sends the notes without one: those of the named scopes when the run names projects.
+
+**The model.** The step makes one request per batch, a scope at a time, with at most `batchNotes` notes: `POST <endpoint>/responses`, an OpenAI-compatible Responses API (by default the Amazon Bedrock Mantle endpoint of `<region>`), with a bearer token. The request holds the kit's fixed prompt (`workstation/prompts/label.md`), your persona, and for each note its path, name, description, the default label of its scope and its text up to 6,000 characters. The model answers with a label and a short reason for each note. An answer that fails the check is asked for once more; a request that gets 429 or 5xx, or no answer, is tried three times. A batch of several notes whose answer is about its notes and fails (a refusal, an incomplete answer, or two answers that fail the check) is split in two halves, its first half of the notes (rounded up) and the rest, both sent at once as batches of their own before the next batch: the batches go in the same order every run, so one note that the model cannot label would otherwise hold up the others of its batch on every run. When one half fails, it is split again the same way, down to single notes; when both fail, the batch failed as a whole: their notes stay touched, and the run splits no other batch. No other failure splits a batch: not another HTTP error status, an answer that is not JSON or is too large, an interruption, or a request that did not reach the model. A wrong model ID or parameter fails every request at once, unbilled, and splitting would only multiply the requests. The split requests count toward the requests and the cost, and the limits below apply before each of them. A batch that still fails is left: its notes keep what they have and stay touched for the next run, the other batches go on and are written, and the run exits with 1. A batch whose halves are all answered is not a failure. When 2 batches in a row do not reach the model (a network error or a timeout, HTTP 429 or 5xx after the tries, 401 or 403, or 404, an endpoint or a model that is not there), the endpoint is taken as out of reach: the step stops before the next batch with *label: stopped; 2 batches in a row failed*, writes and records what the batches before gave, and the run exits with 1. A failed answer does not count toward that stop, and it ends a row of batches that did not reach the model: two such batches side by side would otherwise stop every run at the same place. No line or report holds a response body. The step makes one token per run, and only when it has a batch to send: from the token file, or a short-term token signed with the AWS credentials of `credentials` (of the role of `roleArn`, when given). A token signed with a role's session lasts an hour. One signed with instance credentials, or read from a token file, may stop working earlier, when the credentials that signed it expire; its requests then get 401 or 403, and the stop after 2 such batches ends the step. Those credentials need the permission to call the model through the endpoint with a short-term bearer token.
+
+**Limits.** The label step of a run spends at most `maxBudgetUsd` on the model, counted from the tokens each answer reports at the block's prices. The ceiling is checked before each batch, so the last batch may take the cost past it. When the cost reaches it, the step stops before the next batch with *label: stopped; the model cost of this run reached its ceiling of USD `<n>`*. It is the label step's own ceiling: Organize's spending in the same run does not count. No batch starts either once the run's token is 55 minutes old, as a token lasts an hour at most: the step stops with *label: stopped; the label token of this run is near the end of its hour*. The age of a signed token counts from its signing, that of a token file from the file's modification time: the job that issues a token writes the file at once, which may be long before the step starts. Neither is a failure: the batches before are written and recorded, the notes not reached stay touched, the report says why, and the next run goes on with them. A token file that is already 55 minutes old when the step takes its token was not issued for the run: it holds a token of unknown lifetime, such as a long-lived key, which the step accepts and never stops on for its age; once such a key has expired, its requests get 401 or 403, and the stop after 2 such batches ends the step and fails the run.
+
+**Writing.** Code sets the field, under the sync lock, and leaves the rest of the file as it is. A note that changed since it was read is not written (*changed since it was read*) and stays touched. The labels are committed with the report as `consolidate(<host>): label <n> note(s) (<m> file(s))`, and the next sync pushes them. Labels never make a scope due for Organize: when a scope's content, as the step found it right before writing, was the content Organize last organized, Organize's record moves to the content the labels left. A scope that was due stays due, and so does one that a session wrote into while the labels were written.
+
+Configure it in the `consolidate` block:
+
+```json
+{
+  "consolidate": {
+    "command": "/path/to/claude",
+    "model": "<model-id>",
+    "label": {
+      "model": "<label-model-id>",
+      "region": "<region>",
+      "inputUsdPerMillion": 2.5,
+      "outputUsdPerMillion": 10
+    }
+  }
+}
+```
+
+| Field of `label` | Default | Meaning and rules |
+|---|---|---|
+| `model` | required | The label model's ID at the endpoint, with the same rule as `model`. `--model <id>` of a `label` run overrides it. |
+| `region` | required | The endpoint's region, which the token is signed for. |
+| `endpoint` | `https://bedrock-mantle.<region>.api.aws/openai/v1` | The base URL of the Responses API: `https`, without user, password, query or fragment. |
+| `credentials` | `instance` | Where the AWS credentials that sign the token come from: `instance` (the instance metadata service) or `environment` (the temporary credentials of a job), as for the bridge; never both, no fallback. |
+| `roleArn` | absent | A role that those credentials are exchanged for first (session `agent-memory-label`, one hour). |
+| `tokenFile` | absent | Absolute path of a file that holds the bearer token (a regular file of at most 16 KiB, never a link), instead of a token signed with AWS credentials; not together with `credentials` or `roleArn`. Write it when the token is issued: the token's age counts from the file's modification time. A file that is already 55 minutes old when the step takes the token holds a long-lived key, which is accepted with no age limit (see Limits). |
+| `reasoningEffort` | `low` | `low`, `medium` or `high`. |
+| `inputUsdPerMillion`, `outputUsdPerMillion` | required | The model's prices in USD per million input and output tokens, above 0 and at most 1000. The cost ceiling counts with them. |
+| `batchNotes` | 19 | Notes per request, 1 to 50. |
+| `domainsFile`, `personaFile` | `<repoDir>/.agent-memory/domains.json`, `<repoDir>/.agent-memory/persona.md` | Absolute paths of the two input files. |
+
+A value that breaks a rule makes the whole `consolidate` block invalid, named `label.<field>`, as for the block's own fields.
+
+**The two input files.** Both live in the notes repository under `.agent-memory/` (or where `domainsFile` and `personaFile` say). The sync carries them to every machine like any other file, and bridge up never sends them to the bucket, which takes only notes under `global/` and `projects/`.
+
+- `persona.md`: your own text, at most 20,000 characters: who you are in each scene, what counts as work, personal and general for you, how to decide, with examples. The prompt includes it as your text.
+- `domains.json`:
+
+  ```json
+  {
+    "version": 1,
+    "defaults": { "agents/example-agent": "work" },
+    "exceptions": { "projects/example-project/release-steps.md": "general" }
+  }
+  ```
+
+  `defaults` gives a scope (`global`, `projects/<name>` or `agents/<agent>`) its default label, which the model gives only when a note's content does not decide; a scope that is not listed defaults to `general`. `exceptions` gives a note, by its path, its label: code applies it on every run, to every note of the run's scopes that it names, and the model never sees that note. An exception that names no note of the run's scopes is listed in the report; a run over every scope (no `--project` or `--agent`) also lists, under their scope, the exceptions of a project folder or an agent scope that does not exist, such as a name with a typo. Nothing else may be in the file: an unknown key, a scope or note name that breaks the naming rules, or another label makes it invalid.
+
+A missing or invalid input file, or a persona that is empty or longer than 20,000 characters, turns the step off for that run: it prints *label: the label inputs are missing or invalid (`<what>`); no label was written.*, where `<what>` is `personaFile` or `domainsFile`, with the problem for an invalid domains file (for example `domainsFile: version`). The step then reads and writes nothing, and the run exits with 1. To correct a label, change the persona (it applies to notes touched from then on, or to every note with `--all`) or add an exception (it applies at the next run); a label edited in the note is labeled again.
+
+**The record.** `~/.local/state/agent-memory/consolidate.json` holds `labels: { "version": 1, "notes": { "<path>": "<sha256>" } }`: for each note the step wrote, found with the label already, or recorded as it was on its first run, the SHA-256 of its file then. A note the step left (a failed batch, a stop, a note to repair, a note changed since it was read) gets no new entry, so it stays touched; a note that `--all` took but that the run did not label also loses its old entry, which still matched it, so that the next run sends it and a full relabel that stops at a limit goes on at the next runs; a note that is gone loses its entry; a run that names projects keeps the entries of the other scopes. A dry run moves no record. A lost record makes the next run a first run: notes that have a label keep it, and changes since the last run go unseen until a note changes again. So does moving the step to another machine: run it on the machine that runs Organize.
+
+**The report.** `_reports/<date>-<host>-label.md`, committed with the labels: the model, the number of requests (a retried request counts once, each half of a split batch as one) and the cost; how many notes were touched, sent to the model (each once, also when its batch was split), given an exception's label and recorded as they were; then, for each scope with something to say, the labels set or changed (old → new, with the model's reason), the counts of the scope's labels after the run, the notes left for the next run and why, the notes left for Organize's repair, and the exceptions that name no note. A note the step did not write after all is listed at the end, under "Not written". A run that writes no label commits no report. The terminal, and the journal of the Organize unit, get a headline and the same lines for each scope, without the model's reasons (after a write step that failed, the headline and its reason only):
+
+```
+label: applied, 1 label(s) written, 0 unchanged, USD 0.01, 1 request(s)
+## projects/example-project
+
+Labels set or changed:
+- projects/example-project/release-steps.md: unlabeled → work
+
+Labels after this run: 12 work, 0 personal, 3 general
+```
+
+The headline is `label: applied` or `no-change`, then `<n> label(s) written, <n> unchanged`, `, <n> not written` when label-apply left notes, the cost and the requests; `label: nothing to do` when nothing was touched and no exception changes a label (an exception whose note has its label already starts no write); `label: nothing written, ...` when no batch was answered and no exception changes a label; or the step's trouble, as for Organize: `sync-failed` (exit 0), `step-failed`, `error`, `rejected` or `apply interrupted` (exit 1). A named project without a folder prints *label: no folder for project `<name>`; nothing labeled there.* and is not an error. *label: the label token could not be made (`<reason>`); no note was sent to the model.* and *label: stopped; 2 batches in a row failed* fail the run; the exceptions and the labels given before are still written.
+
+**Try it first.** Run a dry run and keep the work folder:
+
+```
+workstation/run.sh consolidate label --dry-run --keep
+```
+
+The model runs for real (and costs what a real run costs), but no label, report or record is written. It prints `label: dry-run, <n> label(s) to set or change, USD <cost>, <n> request(s)` and the whole report, with the model's reasons. The kept work folder, under `~/.local/state/agent-memory/consolidate/`, holds the notes as the step read them (`label-notes.json`): delete it when you are done.
+
 ### The agent scopes of the memory API
 
-Notes that agents write through the memory API (`agents/<agent>/` in the bucket, see "Memory API") are not in the notes clone, so the runs above never see them. `workstation/run.sh consolidate organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]` organizes those scopes with the same model, prompt and rules as Organize: it merges duplicates, repairs frontmatter, keeps `MEMORY.md` complete and within 200 lines and 25,000 bytes, retires a note only into an existing target, checks content retention and refuses credentials. Facts about one project stay in the agent's scope: an agent note carries no `.project`, so the run does not move it into `projects/<name>/`. Nothing about it runs until the `consolidate` block has an `agents` part, and no timer starts it: it runs where it can reach the bucket with the organizer role (below), for example in a GitHub Actions job.
+Notes that agents write through the memory API (`agents/<agent>/` in the bucket, see "Memory API") are not in the notes clone, so the runs above never see them. `workstation/run.sh consolidate organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]` organizes those scopes with the same model, prompt and rules as Organize: it merges duplicates, repairs frontmatter, keeps `MEMORY.md` complete and within 200 lines and 25,000 bytes, retires a note only into an existing target, checks content retention and refuses credentials. Facts about one project stay in the agent's scope: an agent note carries no `.project`, so the run does not move it into `projects/<name>/`. Nothing about it runs until the `consolidate` block has an `agents` part, and no timer starts it: it runs where it can reach the bucket with the organizer role (below), for example in a GitHub Actions job. With a `label` part too, every such run ends with the label pass over the agent scopes ("Labels of the agent notes" below).
 
 ```json
 {
@@ -436,9 +544,41 @@ How such a run is kept safe:
 
 **Output and outcomes.** Each scope prints `organize agents/<agent>: <outcome>, ...` with the same outcomes and exit codes as Organize; the report is printed (there is no notes clone to commit it to). An error of an S3 step before the snapshot update applied nothing (`error`); one after it may have left part of the result in the bucket (`apply-interrupted`), and the next run finds the scope changed and organizes it again.
 
+**Labels of the agent notes.** The label step (see "Labels: work, personal, general") has a pass over the agent scopes. It runs at the end of every `organize --agents` run that was not interrupted, whatever Organize did, when the `consolidate` block has a `label` part, over every agent scope (or the `--agent` names), and on its own:
+
+```
+workstation/run.sh consolidate label --agents [--agent <name>]... [--all] [--dry-run]
+```
+
+Run on its own, it needs both the `label` and the `agents` part: without `label` it prints *agent-memory: labeling needs "label" in the consolidate block of `<config file>`; nothing was run.*, without `agents` *agent-memory: labeling the agent scopes needs "agents" in the consolidate block of `<config file>`; nothing was run.*, and exits with 1. It labels with the `label` block's model and keeps no work folder, so `--model` and `--keep` are usage errors with `label --agents`; in an `organize --agents` run `--model` names the Organize model only.
+
+- **Which notes go to the model**: as in the notes clone, touched notes only, and `--all` sends every note of the chosen scopes. A note's digest is its object's ETag. A scope's first run (its entry in `index/organizer.json` has no `labels` yet) reads every note of the scope: the ones that carry a label are recorded as they are, the others go to the model. Later runs read only the notes whose ETag is not the one recorded, the notes with an exception, which code labels on every run without the model, and the notes whose search entry carries no `domain` (an older kit's Organize rewrites the entries without one), which go to no model: their entries get their note's label back. A note whose frontmatter the step cannot edit, or whose bytes are not UTF-8 text, is listed as left for Organize's repair and gets no record entry.
+- **Writing**: code sets the field and leaves the rest of the note as it is. Each note is written only over the version that was listed and read (If-Match), as a Markdown object. A note that an agent wrote meanwhile keeps the agent's version (*not written; an agent wrote it meanwhile*) and is labeled at the next run. Then the written notes' search entries in `index/agents.json` get the note's `domain`, and so does the entry of every note read whose entry does not carry its note's label (a labeled note found on a first run, one whose label held under `--all` or an exception, an entry an older kit rewrote), in one conditional update; an entry that no longer describes the note apart from the label, because an agent's write is under way, is left as the agent's write makes it.
+- **The memory API's limits**: a label is not written when the scope's entries in `index/agents.json` would then take more than the 240,000 bytes the API allows a scope, or when the note's text after the frontmatter is already over its 50,000 bytes. A touched note for which that holds with any label, its text being over 50,000 bytes or the scope's entries going past 240,000 bytes with the longest label (`personal`, 20 bytes in its entry), is not sent to the model at all. The note keeps what it has, stays touched, and the report says why; an entry that would get its label without a write of the note keeps what it has too. So labels do not take a scope past what `memory_write` accepts, but for one race: a `memory_write` between the pass's read of `index/agents.json`, right before its writes, and its update of the entries can leave the scope about 20 bytes per label written over the 240,000 bytes, and the API then refuses a `memory_write` to that scope that does not make it smaller (`scope_full`).
+- **The record**: each scope's entry of `index/organizer.json` gets `labels: { "<file>": "<ETag>" }`, for every note the pass labeled, found labeled or recorded as it was, with its ETag after the run, and `lastLabel`, when the run started. A note that is gone loses its entry; a note that `--all` took but did not label loses it too, as in the clone. Labels never make a scope due for Organize: when the digest Organize recorded for a scope is that of the notes as the pass listed them, it moves to that listing with the ETags of the pass's own writes. A scope that was due stays due, and so does one that an agent wrote into during the pass, or whose search entries could not be updated (Organize then rewrites them).
+- **Limits**: the pass spends at most `maxBudgetUsd` on the model, counted from its own requests only, and stops as the step does in the clone: at that ceiling, once its token is 55 minutes old, or after 2 batches in a row that did not reach the model. `--dry-run` asks the model and writes nothing: no note, entry or record.
+
+The pass prints one line per scope, `label agents/<agent>: applied, <n> label(s) written, <n> unchanged` (with `, <n> not written` when some were not written), `no-change, ...`, `nothing written` when the scope's batches failed, `nothing to do`, `no label written, <n> search entry(ies) refreshed` when the pass only gave search entries their note's label, or with `--dry-run` `dry-run, <n> label(s) to set or change`; before them `label: <n> note(s) sent to the model, USD <cost>, <n> request(s)`, and after them the report of the clone's step for each scope with something to say. It never prints the model's reasons, as its output is the job's log. A scope whose writes failed adds a line saying which, and fails the run with exit 1, as do a token that could not be made, a failed batch and a bucket that could not be read.
+
+In a job without a notes clone, the `label` part must name both input files, `domainsFile` and `personaFile`; otherwise the pass prints *label: the label inputs are missing or invalid (`label.domainsFile`); no label was written.* (or `label.personaFile`) and the run exits with 1. Give such a job the label token as a `tokenFile`, written when the token is issued: its age counts from the file's modification time, and a file already 55 minutes old holds a long-lived key (see the clone's Limits). The token reaches only the label requests, never the model client of Organize. For example:
+
+```json
+{
+  "label": {
+    "model": "<label-model-id>",
+    "region": "<region>",
+    "tokenFile": "<absolute path of the token file>",
+    "domainsFile": "<absolute path of domains.json>",
+    "personaFile": "<absolute path of persona.md>",
+    "inputUsdPerMillion": 2.5,
+    "outputUsdPerMillion": 10
+  }
+}
+```
+
 **The bucket is not versioned**: a note that a run deleted or replaced has no earlier copy in the bucket. The agents repository keeps one when bridge down copied it before the run (see "Down: the agents repository is a mirror"); its next run mirrors the result, so a retired note disappears from the repository too, and its history keeps the old file. To bring a note back, write it again through the API's `memory_write`.
 
-**Where it runs.** Run it in one place only, where the organizer role can be assumed: with `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS` a GitHub Actions job of the listed repository and branch (and, with `AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS`, of the listed workflow file); with `AGENT_MEMORY_ORGANIZER_ROLE_ARNS` a machine whose instance role is listed (`credentials: "instance"` and `roleArn`). A machine without the organizer role cannot run it, and a pull-only bridge machine needs nothing of it. The job's model client needs credentials for its model service of its own; never give it the job's AWS credentials, which may delete agent notes. In a GitHub Actions job the credentials of the login step last at most the role's hour and are not renewed, so let a run fit into it: for example one scope per run (`maxProjects: 1`) and a `timeoutMinutes` that leaves room for a repair run. A step that starts with expired credentials fails before anything is written.
+**Where it runs.** Run it in one place only, where the organizer role can be assumed: with `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS` a GitHub Actions job of the listed repository and branch (and, with `AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS`, of the listed workflow file); with `AGENT_MEMORY_ORGANIZER_ROLE_ARNS` a machine whose instance role is listed (`credentials: "instance"` and `roleArn`). A machine without the organizer role cannot run it, and a pull-only bridge machine needs nothing of it. The job's model client needs credentials for its model service of its own; never give it the job's AWS credentials, which may delete agent notes. In a GitHub Actions job the credentials of the login step last at most the role's hour and are not renewed, so let a run fit into it, the label pass at its end included: for example one scope per run (`maxProjects: 1`) and a `timeoutMinutes` that leaves room for a repair run. A step that starts with expired credentials fails before anything is written.
 
 ```yaml
 name: agent-memory organize agent scopes
@@ -961,7 +1101,7 @@ The notes in the bucket are meant to be a replica of the workstation notes. The 
 
   `path` is the note's path in the client-scope form that `memory_read` takes (`global/<file>.md` or `projects/<project>/<file>.md`, without the `mem/` prefix). `MEMORY.md` files are not listed. Entries outside `global/` and `projects/` are ignored.
 
-The API writes the matching agent-side objects itself: `agents/<agent>/<name>.md`, `agents/<agent>/MEMORY.md` and `index/agents.json`. The only other writer of these is the Organize run for agent scopes (see "The agent scopes of the memory API"), which also keeps its record in `index/organizer.json`.
+The API writes the matching agent-side objects itself: `agents/<agent>/<name>.md`, `agents/<agent>/MEMORY.md` and `index/agents.json`. The only other writer of these is the Organize run for agent scopes, with its label pass, which writes notes and `index/agents.json` only (see "The agent scopes of the memory API"); both keep their record in `index/organizer.json`.
 
 ### Operations
 
@@ -1027,7 +1167,7 @@ Every later deploy of the stage must pass the same variable. Adding or removing 
 
 Without either variable the deployment creates neither role, no role-ARN parameter and no grant. Pass the list at deploy time in the environment of the deploy command, for example `AGENT_MEMORY_WORKSTATION_ROLE_ARNS=arn:aws:iam::<aws-account-id>:role/<role-name> AGENT_MEMORY_REGION=<region> npx sst deploy --stage <stage>`; separate several ARNs with commas. **Every later deploy of the stage must pass the variable again**: a deploy without it (and without the subjects) deletes the two roles, and a bridge or canary configured with `roleArn` then fails with `sts failed: 403 AccessDenied` until the next deploy that has it. IAM records a trusted role by its internal ID, not by its name. If a workstation role is deleted and created again under the same name, the two roles no longer trust it, and the exchange fails with `sts failed: 403 AccessDenied`. To repair it, run `npx sst refresh --stage <stage>` and then deploy again with the variable, so that the trust policies are written anew. The names of the two roles carry the stage and not the region, and IAM role names are shared by the whole account: deploy a stage name in one region per account. A stage that an earlier release deployed with the variable gave the workstation role its S3 grants through the bucket policy. After a deployment of this release a bridge without `roleArn` is refused (`list failed: 403 AccessDenied` or similar) unless that role has its own grants, so set `roleArn` in the `bridge` and `canary` blocks when you deploy. The function itself cannot write under `mem/`. The `prod` stage keeps its resources when removed; every other stage deletes them.
 
-`AGENT_MEMORY_ORGANIZER_ROLE_ARNS` and `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS` optionally hold, with the same rules as the two variables above, the IAM roles and the exact GitHub Actions subjects that may assume the organizer role `agent-memory-<stage>-organizer`, which the Organize run for agent scopes uses (see "The agent scopes of the memory API"). Either one creates the role and the plain parameter `/agent-memory/<stage>/mcp/organizer/role-arn`; without both they do not exist. The role has its own trust, never that of the bridge and canary roles, because it may delete agent notes: list only the one repository and branch (or the one machine role) that runs the job. A subject names a branch, not a workflow: every job on that branch could ask for the role, including one that runs other code (a bridge job of the same repository, or a workflow added later). `AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS` closes that; set it whenever you set the subjects. It holds comma-separated workflow files, each `<owner>/<repository>/.github/workflows/<file>.yml@refs/heads/<branch>` (`.yaml` too), and the role then also requires GitHub's `job_workflow_ref` claim to be one of them. That claim names the file that defines the job, compared exactly, case included: list the organize workflow on the subject's branch. The condition binds a file, not a job, so every job of that file with `id-token: write` gets the role: give that permission to the organize job only. A job that calls a reusable workflow carries the called file's claim, at the ref it is called with. The variable needs `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS`, and a malformed entry stops the deployment. AWS checks this claim in the commercial Regions only; elsewhere the role cannot be assumed with it. **A later deploy that passes the subjects without this variable removes the condition without a warning: every job of the branch can then assume the role again.** The role has a maximum session of one hour, no managed policy and one inline policy, in both set-ups:
+`AGENT_MEMORY_ORGANIZER_ROLE_ARNS` and `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS` optionally hold, with the same rules as the two variables above, the IAM roles and the exact GitHub Actions subjects that may assume the organizer role `agent-memory-<stage>-organizer`, which the Organize run for agent scopes and its label pass use (see "The agent scopes of the memory API"). Either one creates the role and the plain parameter `/agent-memory/<stage>/mcp/organizer/role-arn`; without both they do not exist. The role has its own trust, never that of the bridge and canary roles, because it may delete agent notes: list only the one repository and branch (or the one machine role) that runs the job. A subject names a branch, not a workflow: every job on that branch could ask for the role, including one that runs other code (a bridge job of the same repository, or a workflow added later). `AGENT_MEMORY_ORGANIZER_GITHUB_WORKFLOW_REFS` closes that; set it whenever you set the subjects. It holds comma-separated workflow files, each `<owner>/<repository>/.github/workflows/<file>.yml@refs/heads/<branch>` (`.yaml` too), and the role then also requires GitHub's `job_workflow_ref` claim to be one of them. That claim names the file that defines the job, compared exactly, case included: list the organize workflow on the subject's branch. The condition binds a file, not a job, so every job of that file with `id-token: write` gets the role: give that permission to the organize job only. A job that calls a reusable workflow carries the called file's claim, at the ref it is called with. The variable needs `AGENT_MEMORY_ORGANIZER_GITHUB_SUBJECTS`, and a malformed entry stops the deployment. AWS checks this claim in the commercial Regions only; elsewhere the role cannot be assumed with it. **A later deploy that passes the subjects without this variable removes the condition without a warning: every job of the branch can then assume the role again.** The role has a maximum session of one hour, no managed policy and one inline policy, in both set-ups:
 
 - read objects under `agents/`, `index/agents.json` and `index/organizer.json`;
 - write the same objects only with a precondition (`s3:if-match` or `s3:if-none-match` present), and delete objects under `agents/` only with `If-Match`. The policy requires the header, not a particular value: a request with `If-Match: *`, or with an ETag the role first read, passes. It keeps the job from writing or deleting blindly; it does not keep a holder of the role from deleting notes, which is why only the job may assume it. The job itself always sends the ETag of the version it copied;

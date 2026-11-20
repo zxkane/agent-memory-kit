@@ -66,7 +66,7 @@ case "$mode" in
     consolidate)
         # A step writes into the clone and runs only through consolidate-step, under the sync lock.
         if [[ "${2:-}" == --step* ]]; then
-            printf '%s\n' 'usage: run.sh consolidate extract|organize [options]' >&2
+            printf '%s\n' 'usage: run.sh consolidate extract|organize|label [options]' >&2
             exit 2
         fi
         require_node
@@ -106,7 +106,7 @@ case "$mode" in
         exec "$node_path" "$root/bridge-run.mjs" "${@:2}"
         ;;
     *)
-        printf '%s\n' 'usage: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate extract|organize [options] | canary | bridge [--time-limit <seconds>]' >&2
+        printf '%s\n' 'usage: run.sh session-start [claude|codex|kiro] | pre-write | sync | migrate | consolidate extract|organize|label [options] | canary | bridge [--time-limit <seconds>]' >&2
         exit 2
         ;;
 esac

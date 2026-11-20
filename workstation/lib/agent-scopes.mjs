@@ -1,6 +1,8 @@
 // The agent scopes of the memory API's bucket: `agents/<agent>/<name>.md` notes, each scope's
 // MEMORY.md, and the search snapshot `index/agents.json`. The memory API writes them. This module
-// lets an Organize run copy one scope into a local folder and write an accepted result back.
+// lets an Organize run copy one scope into a local folder and write an accepted result back, and
+// the label step give the notes it labeled their search entries. An entry carries the note's
+// label (`domain`) when the note has one.
 //
 // Writing back follows the API's own order: the search snapshot first, in one conditional update
 // that also checks the API's limits, then the notes, then the scope's MEMORY.md. Every write is
@@ -17,7 +19,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AwsError, assumeRole, environmentCredentials, imdsCredentials } from './aws.mjs';
-import { INDEX, parseNote } from './notes.mjs';
+import { LABELS, readDomain } from './domains.mjs';
+import { AGENT_RE, INDEX, PROJECT_RE, parseNote } from './notes.mjs';
 import { createS3 } from './s3.mjs';
 import { readRegular } from './workdir.mjs';
 
@@ -26,9 +29,8 @@ export const SNAPSHOT_KEY = 'index/agents.json';
 // What the runs remember about each agent scope; in the bucket, so that a run in a GitHub Actions
 // job, which keeps no state of its own, knows what is already organized.
 export const STATE_KEY = 'index/organizer.json';
-export const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+export { AGENT_RE };
 export const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
-const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
 // The memory API's limits (api/src/ops/write.ts and api/src/validate.ts; a test of the API checks
 // that both sides agree).
@@ -43,10 +45,11 @@ export const API_LIMITS = Object.freeze({
 const NOTE_TYPES = new Set(['user', 'feedback', 'project', 'reference']);
 const LINE_BREAK_RE = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/;
 // A copied object larger than this is not a note the API wrote: the scope is skipped.
-const MAX_OBJECT_BYTES = 1_000_000;
+export const MAX_OBJECT_BYTES = 1_000_000;
 const ATTEMPTS = 5;
 const LINK_RE = /\]\(([^()\s]+\.md)\)/;
-const MARKDOWN = 'text/markdown; charset=utf-8';
+// The content type of every note and MEMORY.md written.
+export const MARKDOWN = 'text/markdown; charset=utf-8';
 // Credentials are taken again after this long, inside the 15 minutes an assumed role lasts.
 const CREDENTIALS_REUSE_MS = 10 * 60 * 1000;
 
@@ -132,8 +135,9 @@ export function isNotePath(path) {
 }
 
 // The search snapshot as the API reads it: `{ doc, notes, others }`. `notes` are the well-formed
-// note entries, `others` every other entry, kept as they are, after the notes. Text that is not a
-// snapshot throws: a write must never replace what it cannot read.
+// note entries, with their label when it is a valid one, `others` every other entry, kept as they
+// are, after the notes. Text that is not a snapshot throws: a write must never replace what it
+// cannot read.
 function parseSnapshot(text) {
   if (text === null) return { doc: { version: 1, notes: [] }, notes: [], others: [] };
   let doc;
@@ -144,11 +148,15 @@ function parseSnapshot(text) {
   }
   if (!isObject(doc) || !Array.isArray(doc.notes)) throw new AgentScopeError('the search snapshot of the agent scopes is unreadable');
   const isNote = (e) => isObject(e) && ['path', 'name', 'description', 'type', 'body'].every((k) => typeof e[k] === 'string') && isNotePath(e.path);
-  return {
-    doc,
-    notes: doc.notes.filter(isNote).map(({ path, name, description, type, body }) => ({ path, name, description, type, body })),
-    others: doc.notes.filter((e) => !isNote(e)),
-  };
+  const entry = ({ path, name, description, type, body, domain }) => ({
+    path, name, description, type, body, ...(LABELS.includes(domain) ? { domain } : {}),
+  });
+  return { doc, notes: doc.notes.filter(isNote).map(entry), others: doc.notes.filter((e) => !isNote(e)) };
+}
+
+// The note entries of the search snapshot, every scope's, as the API reads them.
+export async function readSearchEntries(s3) {
+  return parseSnapshot((await readText(s3, SNAPSHOT_KEY))?.text ?? null).notes;
 }
 
 const serialize = (parsed, notes) => JSON.stringify({ ...parsed.doc, version: 1, notes: [...[...notes].sort(byPath), ...parsed.others] });
@@ -183,14 +191,17 @@ function bodyOf(text) {
   return (end < 0 ? lines : lines.slice(end + 1)).join('\n').replace(/^\n+/, '').trimEnd();
 }
 
-// The search snapshot entry of a note file, as the API would write it.
+// The search snapshot entry of a note file, as the API would write it, with the note's label
+// (`domain`) when it has a valid one.
 export function noteEntry(agent, file, text) {
+  const domain = readDomain(text);
   return {
     path: `${scopeOf(agent)}${file}`,
     name: file.slice(0, -'.md'.length),
     description: (descriptionOf(text) ?? '').trim(),
     type: parseNote(text).type ?? '',
     body: bodyOf(text),
+    ...(domain === null ? {} : { domain }),
   };
 }
 
@@ -485,6 +496,31 @@ async function writeResult({ s3, agent, plan, changes, bodies, liveDir }) {
 
   const digest = scopeDigest([...after].filter(([, etag]) => etag !== null).map(([file, etag]) => ({ file, etag })));
   return { outcome: 'applied', written, deleted, keptNewer: keptNewer.sort(), kept: kept.sort(), digest };
+}
+
+// ---- The label step: the search entries of the notes it labeled ----
+
+const unlabeled = ({ domain: _label, ...entry }) => entry;
+
+// Gives the notes of `agent` that the label step wrote (`notes`: `{ file, text }`, each with the
+// text written) their search entries, noteEntry(agent, file, text), in one conditional update of
+// the search snapshot; a missing entry is added. The memory API writes a note's entry before the
+// note: an entry that describes another text than the one labeled (an agent's write under way,
+// which wins) is left as it is.
+export async function setNoteEntries(s3, agent, notes) {
+  if (!AGENT_RE.test(agent)) throw new AgentScopeError('invalid agent name');
+  if (notes.some(({ file }) => file === INDEX || !FILE_RE.test(file))) throw new AgentScopeError('not a note file of the scope');
+  const fresh = new Map(notes.map(({ file, text }) => [`${scopeOf(agent)}${file}`, noteEntry(agent, file, text)]));
+  if (fresh.size === 0) return;
+  await updateObject(s3, SNAPSHOT_KEY, (text) => {
+    const parsed = parseSnapshot(text);
+    const labeled = parsed.notes.map((n) => {
+      const entry = fresh.get(n.path);
+      return entry !== undefined && sameEntries([unlabeled(n)], [unlabeled(entry)]) ? entry : n;
+    });
+    const added = [...fresh.values()].filter((entry) => !parsed.notes.some((n) => n.path === entry.path));
+    return serialize(parsed, [...labeled, ...added]);
+  }, 'application/json');
 }
 
 // ---- What the runs remember: index/organizer.json ----
