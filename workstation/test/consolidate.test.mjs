@@ -3350,7 +3350,7 @@ test('label: usage errors, and a named project without a folder', (t) => {
   for (const args of cases) {
     const r = f.runWith(f.labelEnv, ...args);
     assert.equal(r.status, 2, args.join(' '));
-    assert.match(r.stderr, /^usage: .*\| label \[--project <name>\]\.\.\. \[--all\] \[--dry-run\] \[--keep\] \[--model <id>\] \| label --agents \[--agent <name>\]\.\.\. \[--all\] \[--dry-run\]$/m, args.join(' '));
+    assert.match(r.stderr, /^usage: .*\| label \[--project <name>\]\.\.\. \[--all\] \[--dry-run\] \[--keep\] \[--model <id>\] \| label --agents \[--agent <name>\]\.\.\. \[--all\] \[--dry-run\] \| report \[--since <YYYY-MM-DD> \| --days <n>\] \[--format json\|md\]$/m, args.join(' '));
   }
   const r = f.label('--project', 'gone');
   assert.equal(r.status, 0, r.stdout + r.stderr);

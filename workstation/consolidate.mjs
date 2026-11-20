@@ -24,7 +24,7 @@ import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
 import { readLabelInputs } from './lib/domains.mjs';
 import { labelBatch, tokenForRun } from './lib/label-client.mjs';
 import {
-  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, folderDigest, labelEntryProblem,
+  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, folderDigest, labelEntryProblem, labelRecordOf,
 } from './lib/label-notes.mjs';
 import {
   askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, plannedLabels, selectTouched, unreadScopeResults,
@@ -58,7 +58,7 @@ const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
-const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run]';
+const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run] | report [--since <YYYY-MM-DD> | --days <n>] [--format json|md]';
 const HASH_RE = /^[0-9a-f]{64}$/;
 const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const RETENTION_RE = /^(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)$/;
@@ -1440,15 +1440,6 @@ function printScope(kind, scope, res, opts, repoDir) {
 // The pass's work folder in the run folder. A project folder's name never starts with a dot
 // (isPlainName), so it is never the work folder of an Organize scope of the same run.
 const LABEL_WORK = '.label';
-
-// The record of what the label pass last saw (`labels` in consolidate.json): path -> SHA-256 of the
-// note as the pass wrote, found or confirmed it. Null without one, or with one of another version:
-// the run is then a first run.
-function labelRecordOf(state) {
-  const labels = state.labels;
-  if (!isObject(labels) || labels.version !== 1 || !isObject(labels.notes)) return null;
-  return Object.fromEntries(Object.entries(labels.notes).filter(([, digest]) => typeof digest === 'string' && HASH_RE.test(digest)));
-}
 
 // The two label inputs, read and checked: the files the label block names, else those under
 // .agent-memory/ in the notes clone.

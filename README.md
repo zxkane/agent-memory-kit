@@ -353,7 +353,7 @@ Each scope prints one headline with details beneath it. Most outcomes read `<kin
 
 | Outcome | Meaning and what to do |
 |---|---|
-| `applied` | The result was accepted, written, reported in `_reports/<date>-<host>-<kind>-<scope>.md` and committed. *push pending* means the sync after it failed; the next sync retries. *the report could not be written* means the notes changed but the report did not. |
+| `applied` | The result was accepted, written, reported in `_reports/<date>-<host>-<kind>-<scope>.md` (with its JSON twin, see "Run records and `consolidate report`") and committed. *push pending* means the sync after it failed; the next sync retries. *the report could not be written* means the notes changed but the report did not. |
 | `no-change` | The model completed (`stopped: completed`) and found nothing to change. Nothing to do. |
 | `model-failed` | The model did not complete and left nothing to apply, so nothing was applied and no content mark moved; the run exits with 1 once the other scopes are done, and `stopped:` says why (next section). When the command could not be started, the run stops at once with *stopped; the model command could not be started (`<reason>`)*. Run it again with `--keep` to see the client's error output in `model-stderr-<scope>.log`, next to the kept work folder. |
 | `dry-run` | With `--dry-run`: the result would be applied. The report is printed. |
@@ -636,6 +636,33 @@ jobs:
 ```
 
 The run needs no notes clone (`repoDir` must only be an absolute path); the client's own settings go into the block's `env`. Try it first with `--dry-run --keep` and read the kept work folder, as for Organize.
+
+### Run records and `consolidate report`
+
+Runs leave records for programs, so that nothing has to parse the Markdown reports, whose form is the kit's own. Each record has `schemaVersion: 1`; the version changes only with a change that breaks a reader.
+
+**JSON reports.** Beside each report it writes to `_reports/`, a run writes a JSON file of the same name (`<date>-<host>-<kind>-<scope>.json`, `<date>-<host>-label.json`) from the same figures, with the same care (mode 600, written to a temporary file and renamed). It is committed in the same commit as the report and removed with it after 90 days; a dry run writes neither. No text of a note, description, reason of the model or error text is in it.
+
+- Extract and Organize: `host`, `kind`, `scope`, `date`, `model`, `stopReason`, `costUsd`, `turns`, `denials`, `repaired` (the problems the first check found when a repair run followed, otherwise 0), `conversation` (Extract: `truncated`, `bytes`, `sessionsLeftOut`; otherwise null), `folders` (every folder of the run: `folder`, `changed`, `indexBefore` and `indexAfter` with `lines` and `bytes`, `unlistedBefore`, `unlistedAfter`, `notesBytesBefore`, `notesBytesAfter`, `retiredBytes`), `retention` (`termsKept`, `termsBefore`, `share`), `counts` (`added`, `changed`, `retired`, `notApplied`) and `changes` (`{ kind, path, target? }`, `kind` being `add`, `change` or `retire`; paths as the report shows them, relative to the scope's folder).
+- The label step: `host`, `kind: "label"`, `date`, `model`, `stopReason` (`completed`, `ceiling`, `failures` or `token-age`), `costUsd`, `requests`, `sent`, `notes` (`touched`, `exceptions`, `recordedAsTheyWere`), `written`, `unchanged`, `notWritten`, and `scopes`, one per scope of the run (`global`, `projects/<name>`): `set` (a label where the note had none), `changed`, `unchanged`, `left` with `leftReasons` (counts by word: `ceiling`, `failures`, `token-age`, `interrupted`, `token-not-made`, `model-call-failed`, `gone`, `changed-since-read`, `not-utf8`, `frontmatter`, `other`), `needsRepair`, `unmatchedExceptions` and `labelsAfter` (`work`, `personal`, `general`, `unlabeled`, as the report counts them). `turns`, `denials` and `repaired` are null.
+
+**The run log.** Every run of `consolidate extract`, `organize` and `label`, also with `--agents`, adds one JSON line to `~/.local/state/agent-memory/runs.jsonl` when it ends: also a run with nothing to do, a dry run, a run that stopped at a limit, an interrupted run and one that crashed. The file belongs to the machine (mode 600) and is never committed; it is rewritten under the consolidation lock, and lines that ended more than 90 days before are dropped. A line holds `runId` (the name of the run's work folder), `host`, `kind`, `agents`, `dryRun`, `startedAt`, `endedAt`, `exitCode`, `scopes` (each scope the run took: `scope`, `outcome`, `stopReason`, `costUsd`, and for Extract `truncated` and `sessionsLeftOut`), `label` when the run had a label pass (`outcome`, `failed`, `stop`, `costUsd`, `requests`, `sent`, `written`, `unchanged`, `notWritten`, and for the agent scopes `scopes` with each scope's `outcome`), `costUsd` (the whole run's, null when a part of it is not known), and, when there is one, `stop` (`max-projects`, `ceiling`, `sync-failed`, `step-failed`, `model-not-started`, `interrupted`) and `error` (`scan-failed`, `lock-timeout`, `usage`, `agents-not-configured`, `agents-unreadable`, `label-not-configured`, `crash`): fixed words, never a message. A command line that the driver refuses, a configuration without a valid `consolidate` block, a start refused because a consolidation is running, and a run killed outright (SIGKILL) leave no line.
+
+**The report.** One command sums them up:
+
+```
+workstation/run.sh consolidate report [--since <YYYY-MM-DD> | --days <n>] [--format json|md]
+```
+
+It is read-only: no network, no model, no lock (it also runs while a consolidation or a sync does), nothing written. The window ends now and starts `--days` days before (7 by default, at most 365) or at 00:00 UTC on the `--since` day; a report counts by the day in its name, a run by its end. `--format json` prints `schemaVersion`, `generatedAt`, `host`, `window` (`since`, `until`) and:
+
+- `reports`: the JSON reports of the window, from every machine (the clone holds them all), each with its `file` and `source: "json"`. A report that an older kit wrote without one is read from its Markdown (`source: "markdown"`), with null for what the Markdown does not hold (the cost beyond cents, the size of a complete conversation, the sizes of a folder the run did not change; of a label report all but its head).
+- `runs`: this machine's run log lines of the window.
+- `backlog`: for `global/` and each project folder, `notes`, whether it is `due` for Organize by Organize's own rule and why (`dueReason`: `changed`, `never-organized`, `over-limits` or `conflict`), `neverOrganized`, `overLimits` and `lastOrganize`; `totals` (`scopes`, `withNotes`, `notes`, `due`, and of the scopes with notes `neverOrganized` and `overLimits`), `maxProjects`, and `etaWeeks`, the due scopes divided by `maxProjects` and rounded up, when an `organize` schedule is set (otherwise null).
+- `labels`: `counts` of the notes per label, the `unlabeled` notes, `pending` (the notes the next label run takes: new, or changed since the label step last saw them), `needsRepair` and whether the label step has a record yet (`recorded`).
+- `problems`: each file or line that could not be read (`file`, `line` for a line of the run log, `problem`), skipped, never fatal.
+
+`--format md`, the default, prints the same as a short summary. The exit code is 0, also with problems, 1 when agent-memory is not enabled on the machine, and 2 for a usage error.
 
 ## Bridge to S3 and the agents repository (optional)
 
