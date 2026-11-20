@@ -164,8 +164,10 @@ test('tagLine also strips a tag token at the end of the line or before a tab', (
   assert.equal(tagLine('- [A](a.md) — [work]', 'personal'), '- [A](a.md) — [personal] ');
   assert.equal(tagLine('- [A](a.md) — [personal]\r', 'general'), '- [A](a.md) — \r');
   assert.equal(tagLine('- [A](a.md) — [personal]\r', null), '- [A](a.md) — \r');
-  assert.equal(tagLine('- [A](a.md) — [work]\tabout a', 'general'), '- [A](a.md) — \tabout a');
-  assert.equal(tagLine('- [A](a.md) — [work]\tabout a', 'personal'), '- [A](a.md) — [personal] \tabout a');
+  assert.equal(tagLine('- [A](a.md) — [Work] \r', 'work'), '- [A](a.md) — [work] \r');
+  // The white space right after the run goes with it; a line end stays.
+  assert.equal(tagLine('- [A](a.md) — [work]\tabout a', 'general'), '- [A](a.md) — about a');
+  assert.equal(tagLine('- [A](a.md) — [work]\tabout a', 'personal'), '- [A](a.md) — [personal] about a');
   assert.equal(tagLine('- [A](a.md) — about [work]', 'general'), '- [A](a.md) — about [work]');
   assert.equal(tagLine('- [A](a.md) — [workx] about a', 'general'), '- [A](a.md) — [workx] about a');
   for (const line of ['- [A](a.md) — [work]', '- [A](a.md) — [personal]\r', '- [A](a.md) — [work]\tx']) {
@@ -183,6 +185,39 @@ test('tagLine takes the tag only from the note', () => {
   assert.equal(tagLine('- [A](a.md) — [work] about a', 'work'), '- [A](a.md) — [work] about a');
   assert.equal(tagLine('- [A](a.md) — about [work] a', 'personal'), '- [A](a.md) — [personal] about [work] a');
   assert.equal(tagLine('- [A](../x/a.md) — [work] about a', 'personal'), '- [A](../x/a.md) — [work] about a');
+});
+
+test('tagLine strips a leading tag run whatever its spacing, letter case or hidden characters', () => {
+  // A session or an agent may write any of these into a hook; none of them may show as a tag.
+  const probes = [
+    '- [A](a.md) —  [work] about a',
+    '- [A](a.md) — \u200b[work] about a',
+    '- [A](a.md) — [Work] about a',
+    '- [A](a.md) — [work]about a',
+    '- [A](a.md) — [personal][work] about a',
+    '- [A](a.md) — [w\u200bork] about a',
+    '- [A](a.md) — \u2060[ PERSONAL ]\u00ad [wOrK]\u200b\t about a',
+  ];
+  for (const line of probes) {
+    assert.equal(tagLine(line, null), '- [A](a.md) — about a', line);
+    assert.equal(tagLine(line, 'general'), '- [A](a.md) — about a', line);
+    assert.equal(tagLine(line, 'work'), '- [A](a.md) — [work] about a', line);
+    assert.equal(tagLine(line, 'personal'), '- [A](a.md) — [personal] about a', line);
+  }
+});
+
+test('tagLine keeps the rest of the hook exactly', () => {
+  // Text that only looks like a tag, and format characters later in the hook, stay as they are.
+  const family = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
+  for (const hook of ['[Work in progress] about a', `trip with the ${family}`, '[workshop] notes', 'about [work] a']) {
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'general'), `- [A](a.md) — ${hook}`, hook);
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'work'), `- [A](a.md) — [work] ${hook}`, hook);
+  }
+  // Only the run and the white space or format characters right after it go.
+  assert.equal(tagLine(`- [A](a.md) — [ work ] ${family} [personal]`, 'personal'), `- [A](a.md) — [personal] ${family} [personal]`);
+  // A very long run of white space without a tag is left as it is, at once.
+  const spaces = `- [A](a.md) — ${' '.repeat(200_000)}x`;
+  assert.equal(tagLine(spaces, 'general'), spaces);
 });
 
 test('tagIndexLines reads each linked note of the folder', t => {

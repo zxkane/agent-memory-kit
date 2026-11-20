@@ -9,7 +9,14 @@ const MAX_DOMAINS_BYTES = 1024 * 1024;
 const MAX_PERSONA_CHARS = 20000;
 const MAX_NOTE_BYTES = 1024 * 1024;
 const TAG_LINE_RE = /^- \[[^\]]*\]\(([A-Za-z0-9][A-Za-z0-9._-]*\.md)\) — /;
-const TAG_RUN_RE = /^(?:\[(?:work|personal)\](?: |(?=\t)|(?=\r?$)))+/;
+// What may stand around and inside an author-written tag without showing: white space other than a
+// line end, and Unicode format characters (zero-width characters, the soft hyphen, joiners). One
+// character class, so that a long run of them is matched once, not in every way it could split.
+const GAP = '[[\\s\\p{Cf}]--[\\r\\n]]*';
+const spaced = (word) => [...word].join(GAP);
+// A leading run of `[work]` / `[personal]` tags in any letter case, with the gaps before, between,
+// inside and after them. Homoglyphs and full-width brackets are not tags.
+const TAG_RUN_RE = new RegExp(`^${GAP}(?:\\[${GAP}(?:${spaced('work')}|${spaced('personal')})${GAP}\\]${GAP})+`, 'iv');
 const SCOPE_RE = /^(?:global|projects\/([^/]+)|agents\/([^/]+))$/;
 
 // Same unquoting as parseNote.
@@ -157,9 +164,10 @@ export function readLabelInputs({ domainsFile, personaFile }) {
   return { domains: parsed.value, persona };
 }
 
-// The tag of an index line comes only from the note it links. In a line that links a note of its folder, the run
-// of `[work]` / `[personal]` tokens right after the dash (each followed by a space, a tab or the end of the line) is removed, then the note's own tag is inserted: work
-// and personal get one, general and unlabeled notes none. Tagging a tagged line gives the same line.
+// The tag of an index line comes only from the note it links. In a line that links a note of its folder, a run
+// of tags right after the dash (TAG_RUN_RE) is removed with the white space or format characters right after it,
+// then the note's own tag is inserted: work and personal get one, general and unlabeled notes none. The rest
+// of the line keeps its text exactly. Tagging a tagged line gives the same line.
 export function tagLine(line, label) {
   const m = TAG_LINE_RE.exec(line);
   if (!m) return line;
