@@ -12,8 +12,9 @@ import { readDomain } from './domains.mjs';
 import { INDEX, PROJECT_RE, parseNote } from './notes.mjs';
 import { scanText } from './secret-scan.mjs';
 
-// The API's path rules (api/src/validate.ts), copied character for character; a test compares them.
+// The API's project-name rule lives in notes.mjs; it is re-exported here for existing importers.
 export { PROJECT_RE };
+// The API's file-name rule (api/src/validate.ts), copied character for character; a test compares them.
 export const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
 
 const MAX_FILE_BYTES = 1_000_000;
