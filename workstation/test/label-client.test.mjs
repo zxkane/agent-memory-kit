@@ -730,7 +730,6 @@ test('labelBatch says whether a failure reached the model, and whether it was an
   ]) assert.deepEqual(kinds(await batch(fetchImpl, extra)), { ok: false, transport: false, content: false }, what);
 });
 
-
 test('tokenForRun says when the age of a token file starts; a signed token has none', async (t) => {
   // A token file is written when its token is issued: its age counts from the file's modification time.
   const dir = tempDir(t);
