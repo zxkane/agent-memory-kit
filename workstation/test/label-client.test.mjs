@@ -486,6 +486,24 @@ test('a token that cannot be made sends nothing, tries no other source and says 
   assert.equal(requests, 0);
 });
 
+// What a request says when the instance metadata service gave no IMDSv2 answer.
+const NO_IMDSV2 = 'the label token could not be made: the instance metadata service gave no IMDSv2 answer, '
+  + 'for example off EC2 or in a container beyond the hop limit (InstanceMetadataV1FallbackError)';
+
+test('an instance metadata service that gives no IMDSv2 answer is named as such', async () => {
+  // The IMDS provider, kept from IMDSv1, throws this for any failed IMDSv2 token request.
+  const fallback = Object.assign(new Error('AWS EC2 Metadata v1 fallback has been blocked by AWS SDK configuration'), {
+    name: 'InstanceMetadataV1FallbackError',
+  });
+  let requests = 0;
+  const out = await requestLabels({
+    prompt: 'P', label: LABEL, provideToken: async () => { throw fallback; }, sleep: noSleep,
+    fetchImpl: async () => { requests += 1; return json(answer('ok')); },
+  });
+  assert.equal(requests, 0);
+  assert.deepEqual({ error: out.error, transport: out.transport, sent: out.sent }, { error: NO_IMDSV2, transport: true, sent: false });
+});
+
 test('a token that cannot be made for a retry ends the request at once', async () => {
   let tokens = 0;
   const provideToken = async () => {

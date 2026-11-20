@@ -136,8 +136,13 @@ const OUT_OF_REACH = (status) => status === 429 || status >= 500 || status === 4
 
 // What a token that could not be made may say: the HTTP status of an AWS answer and the error's
 // name when it has the form of an AWS error code, never its message, which can hold an ARN, an
-// account ID or text of the answer.
+// account ID or text of the answer. The IMDS provider, kept from IMDSv1, names any failed IMDSv2
+// token request after the fallback it may not take; that is said as what it means.
 function tokenFailure(err) {
+  if (err?.name === 'InstanceMetadataV1FallbackError') {
+    return `${NO_TOKEN}: the instance metadata service gave no IMDSv2 answer, for example off EC2 or in a container `
+      + 'beyond the hop limit (InstanceMetadataV1FallbackError)';
+  }
   const status = err?.$metadata?.httpStatusCode;
   return `${NO_TOKEN}: ${Number.isInteger(status) ? `${status} ` : ''}${safeCode(err?.name)}`;
 }
