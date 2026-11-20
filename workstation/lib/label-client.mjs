@@ -5,6 +5,7 @@
 import { assumeRole, bedrockToken, environmentCredentials, imdsCredentials } from './aws.mjs';
 import { LABELS } from './domains.mjs';
 import { CUT_MARKER, NOTE_TEXT_CAP, capped } from './label-notes.mjs';
+import { TOKEN_MAX_AGE_MS } from './label-run.mjs';
 import { renderPrompt } from './model-run.mjs';
 import { readRegular } from './workdir.mjs';
 
@@ -250,11 +251,15 @@ export async function labelToken(label, { now = () => new Date(), env = process.
 
 // The token of a run and the moment its age counts from (ms since the epoch), for the stop before
 // a token gets too old: a token file's modification time, as the job that issues the token writes
-// the file at once (it may be long before this run starts), or the moment the token is signed.
+// the file at once (it may be long before this run starts), or the moment the token is signed. A
+// token file already TOKEN_MAX_AGE_MS old when the run takes its token was not issued for the run:
+// it holds a token of unknown lifetime, such as a long-lived key, and its age is not known (null),
+// so it stops nothing; once such a key has expired, its requests get 401 or 403, which count toward
+// the failure stop.
 export async function tokenForRun(label, { now = () => new Date(), env = process.env, fetchImpl } = {}) {
   if (label.tokenFile) {
     const { token, mtimeMs } = readTokenFile(label.tokenFile);
-    return { token, tokenAt: mtimeMs };
+    return { token, tokenAt: now().getTime() - mtimeMs >= TOKEN_MAX_AGE_MS ? null : mtimeMs };
   }
   const signedAt = now();
   return { token: await labelToken(label, { now: () => signedAt, env, fetchImpl }), tokenAt: signedAt.getTime() };

@@ -371,3 +371,18 @@ test('tokenForRun says when the age of the run\'s token starts', async (t) => {
   assert.equal(signed.token, await labelToken({ ...LABEL, credentials: 'environment' }, { now: NOW, env: ENV }));
   await assert.rejects(tokenForRun({ ...LABEL, tokenFile: join(dir, 'missing') }, { now: NOW }), { message: 'the label token file cannot be read' });
 });
+
+test('a token file already as old as the age limit holds a token of unknown lifetime', async (t) => {
+  const dir = tempDir(t);
+  const file = join(dir, 'token');
+  writeFileSync(file, 'tok\n');
+  const ago = (seconds) => new Date(NOW().getTime() - seconds * 1000);
+  // Younger than 55 minutes when the run takes it: its age counts from the file's modification time.
+  utimesSync(file, ago(55 * 60 - 1), ago(55 * 60 - 1));
+  assert.deepEqual(await tokenForRun({ ...LABEL, tokenFile: file }, { now: NOW }), { token: 'tok', tokenAt: ago(55 * 60 - 1).getTime() });
+  // 55 minutes or older: not a token issued for this run but a long-lived key, whose age stops nothing.
+  for (const seconds of [55 * 60, 30 * 24 * 3600]) {
+    utimesSync(file, ago(seconds), ago(seconds));
+    assert.deepEqual(await tokenForRun({ ...LABEL, tokenFile: file }, { now: NOW }), { token: 'tok', tokenAt: null }, String(seconds));
+  }
+});

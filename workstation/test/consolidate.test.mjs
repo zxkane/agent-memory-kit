@@ -3445,15 +3445,34 @@ test('label --agents without a notes clone needs both input files', (t) => {
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.deepEqual(f.requests(), [{ paths: ['agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md'], auth: true }]);
   assert.doesNotMatch(r.stdout + r.stderr, /example-label-token/);
-  // The token's age counts from when the job wrote the file: 55 minutes later no batch starts.
-  const issued = new Date(Date.now() - 55 * 60 * 1000);
-  utimesSync(tokenFile, issued, issued);
+  // The token's age counts from when the job wrote the file: with a file 54 minutes old the first
+  // batch goes, and the next, two minutes later, would start with a token 56 minutes old.
+  f.writeConfig({ label: { ...block, domainsFile, personaFile, batchNotes: 1 }, clone: false });
+  f.mantle({ labels: {}, advanceMs: 2 * 60 * 1000 });
+  const ago = (minutes) => new Date(Date.now() - minutes * 60 * 1000);
+  utimesSync(tokenFile, ago(54), ago(54));
   f.agentWrites('deploys', 'How deploys go now', 'Deploys now go through a canary first.');
+  f.agentWrites('deploy-steps', 'Deploy steps now', 'Build, canary, deploy, promote.');
   r = f.labelAgents();
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /^label: stopped; the label token of this run is near the end of its hour$/m);
-  assert.equal(f.requests().length, 1);
+  assert.deepEqual(f.requests().slice(1).map((q) => q.paths), [['agents/codex-alpha/deploy-steps.md']]);
   assert.match(r.stdout, /^- agents\/codex-alpha\/deploys\.md: not sent; the label token of this run was near the end of its hour$/m);
+  // A file already 55 minutes old when the run takes its token holds a long-lived key: its age
+  // stops nothing.
+  utimesSync(tokenFile, ago(55), ago(55));
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.deepEqual(f.requests().slice(2).map((q) => q.paths), [['agents/codex-alpha/deploys.md']]);
+  // Once such a key has expired its requests get 403: the failure stop ends the run, which fails.
+  f.mantle({ labels: {}, fail: { status: 403, times: 3 } });
+  for (const name of ['deploys', 'deploy-steps', 'fresh']) f.agentWrites(name, `About ${name}`, `Text of ${name}.`);
+  r = f.labelAgents();
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
+  assert.equal(f.requests().length, 5);
+  assert.doesNotMatch(r.stdout + r.stderr, /example-label-token|FAKE-MANTLE-BODY/);
 });
 
 test('label --agents: usage errors, missing blocks and an unknown agent', (t) => {
