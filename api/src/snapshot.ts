@@ -2,7 +2,15 @@ import { ApiError } from './errors.ts';
 import type { Store } from './store.ts';
 import { parseNotePath } from './validate.ts';
 
-export type Note = { path: string; name: string; description: string; type: string; body: string };
+export const DOMAINS = ['work', 'personal', 'general'] as const;
+export type Domain = (typeof DOMAINS)[number];
+
+// domain is the owner's label of the note; it is absent when the note has none or the value is not a label.
+export type Note = { path: string; name: string; description: string; type: string; body: string; domain?: Domain };
+
+export function isDomain(value: unknown): value is Domain {
+  return typeof value === 'string' && (DOMAINS as readonly string[]).includes(value);
+}
 
 // Each snapshot holds its own kinds of scope; entries outside them are skipped like malformed ones.
 const MEM_SNAPSHOT = { key: 'index/mem.json', prefixes: ['global/', 'projects/'] };
@@ -51,6 +59,7 @@ function parseSnapshot(text: string, prefixes: string[]): Note[] {
     description: n.description,
     type: n.type,
     body: n.body,
+    ...(isDomain(n.domain) ? { domain: n.domain } : {}),
   }));
 }
 

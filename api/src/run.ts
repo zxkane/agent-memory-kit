@@ -47,7 +47,7 @@ export async function runOperation(
       onlyParams(query, []);
       return memoryScopes({ snapshots: ops.snapshots });
     case 'memory_index':
-      return memoryIndex({ store: ops.store }, query);
+      return memoryIndex({ store: ops.store, snapshots: ops.snapshots }, query);
     case 'memory_search':
       return memorySearch({ snapshots: ops.snapshots }, query);
     case 'memory_read':

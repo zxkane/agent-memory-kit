@@ -46,19 +46,19 @@ test('index reads the right key for each scope kind', async () => {
     'mem/projects/x/MEMORY.md': 'P',
     'agents/a/MEMORY.md': 'A',
   });
-  assert.deepEqual(await memoryIndex({ store }, { scope: 'global' }), { scope: 'global', index: 'G', truncated: false });
-  assert.deepEqual(await memoryIndex({ store }, { scope: 'projects/x' }), {
+  assert.deepEqual(await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' }), { scope: 'global', index: 'G', truncated: false });
+  assert.deepEqual(await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'projects/x' }), {
     scope: 'projects/x',
     index: 'P',
     truncated: false,
   });
-  assert.deepEqual(await memoryIndex({ store }, { scope: 'agents/a' }), {
+  assert.deepEqual(await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/a' }), {
     scope: 'agents/a',
     index: 'A',
     truncated: false,
   });
   assert.deepEqual(
-    store.gets.map((g) => g.key),
+    store.gets.map((g) => g.key).filter((k) => k.endsWith('/MEMORY.md')),
     ['mem/global/MEMORY.md', 'mem/projects/x/MEMORY.md', 'agents/a/MEMORY.md'],
   );
 });
@@ -66,21 +66,21 @@ test('index reads the right key for each scope kind', async () => {
 test('index over 25000 bytes is cut at a line boundary', async () => {
   const line = `${'x'.repeat(99)}\n`;
   const store = fakeStore({ 'mem/global/MEMORY.md': line.repeat(400) });
-  const result = await memoryIndex({ store }, { scope: 'global' });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
   assert.equal(result.truncated, true);
   assert.ok(Buffer.byteLength(result.index) <= 25_000);
   assert.equal(result.index, line.repeat(249) + 'x'.repeat(99));
 });
 
 test('missing index is not_found', async () => {
-  await assert.rejects(memoryIndex({ store: fakeStore() }, { scope: 'global' }), rejects(404, 'not_found'));
+  await assert.rejects(memoryIndex({ store: fakeStore(), snapshots: createSnapshots(fakeStore()) }, { scope: 'global' }), rejects(404, 'not_found'));
 });
 
 test('index rejects unknown parameters and bad scopes before any store call', async () => {
   const store = fakeStore();
-  await assert.rejects(memoryIndex({ store }, { scope: 'global', extra: '1' }), rejects(400, 'invalid_request'));
-  await assert.rejects(memoryIndex({ store }, { scope: 'agents/../x' }), rejects(400, 'invalid_request'));
-  await assert.rejects(memoryIndex({ store }, {}), rejects(400, 'invalid_request'));
+  await assert.rejects(memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global', extra: '1' }), rejects(400, 'invalid_request'));
+  await assert.rejects(memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/../x' }), rejects(400, 'invalid_request'));
+  await assert.rejects(memoryIndex({ store, snapshots: createSnapshots(store) }, {}), rejects(400, 'invalid_request'));
   assert.equal(store.gets.length, 0);
 });
 
@@ -158,4 +158,69 @@ test('foldCase preserves length and keeps characters whose lower case differs in
   assert.equal(foldCase('ABC'), 'abc');
   assert.equal(foldCase('İ'), 'İ');
   assert.equal(foldCase('İSTANBUL'), 'İstanbul');
+});
+
+test('memory_index tags work and personal lines', async () => {
+  const entry = (path: string, domain?: string) => ({ ...note(path), ...(domain ? { domain } : {}) });
+  const store = fakeStore({
+    'mem/global/MEMORY.md': [
+      '# Heading',
+      '- [A](a.md) — about a',
+      '- [B](b.md) — about b',
+      '- [G](g.md) — about g',
+      '- [U](u.md) — about u',
+      '- [N](n.md) about n',
+      '- [X](../x/a.md) — about x',
+      '- [T](t.md) — [work] already tagged',
+      '',
+    ].join('\n'),
+    'index/mem.json': JSON.stringify({
+      version: 1,
+      notes: [
+        entry('global/a.md', 'work'),
+        entry('global/b.md', 'personal'),
+        entry('global/g.md', 'general'),
+        entry('global/u.md'),
+        entry('global/n.md', 'work'),
+        entry('global/t.md', 'work'),
+        entry('projects/p/a.md', 'personal'),
+      ],
+    }),
+  });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
+  assert.equal(
+    result.index,
+    [
+      '# Heading',
+      '- [A](a.md) — [work] about a',
+      '- [B](b.md) — [personal] about b',
+      '- [G](g.md) — about g',
+      '- [U](u.md) — about u',
+      '- [N](n.md) about n',
+      '- [X](../x/a.md) — about x',
+      '- [T](t.md) — [work] already tagged',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('memory_index tags before it cuts to 25000 bytes', async () => {
+  const lines = Array.from({ length: 400 }, (_, i) => `- [N${i}](n${i}.md) — ${'x'.repeat(80)}`);
+  const store = fakeStore({
+    'mem/global/MEMORY.md': lines.join('\n'),
+    'index/mem.json': JSON.stringify({
+      version: 1,
+      notes: lines.map((_, i) => ({ ...note(`global/n${i}.md`), domain: 'work' })),
+    }),
+  });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
+  assert.equal(result.truncated, true);
+  assert.ok(Buffer.byteLength(result.index) <= 25_000);
+  assert.ok(result.index.split('\n').every((l) => l.includes(' — [work] ')));
+});
+
+test('memory_index still answers untagged when the snapshots cannot be loaded', async () => {
+  const store = fakeStore({ 'mem/global/MEMORY.md': '- [A](a.md) — about a', 'index/mem.json': 'not json' });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
+  assert.equal(result.index, '- [A](a.md) — about a');
 });

@@ -154,7 +154,7 @@ test('query parameters behave as the document says', async () => {
   });
   const snapshots = createSnapshots(store);
   const run: Record<string, (q: Record<string, string | undefined>) => Promise<unknown>> = {
-    memory_index: (q) => memoryIndex({ store }, q),
+    memory_index: (q) => memoryIndex({ store, snapshots }, q),
     memory_search: (q) => memorySearch({ snapshots }, q),
     memory_read: (q) => memoryRead({ store }, q),
   };
@@ -235,7 +235,11 @@ test('200 schemas list every returned field as required', () => {
   const scopes = item(schema('memory_scopes').properties.scopes);
   assert.deepEqual([...scopes.required].sort(), Object.keys(scopes.properties).sort());
   const results = item(schema('memory_search').properties.results);
-  assert.deepEqual([...results.required].sort(), Object.keys(results.properties).sort());
+  // domain is absent for a note that is not yet classified, so it is the one optional field.
+  assert.deepEqual(
+    [...results.required].sort(),
+    Object.keys(results.properties).filter((k) => k !== 'domain').sort(),
+  );
 });
 
 test('responses list 200 and the documented errors', () => {
@@ -255,7 +259,18 @@ test('responses list 200 and the documented errors', () => {
   assert.deepEqual(props('memory_read'), ['content', 'path', 'truncated']);
   assert.deepEqual(props('memory_write'), ['created', 'path']);
   const result = by('memory_search').responses['200'].content['application/json'].schema.properties.results.items;
-  assert.deepEqual(Object.keys(result.properties).sort(), ['description', 'name', 'path', 'scope', 'score', 'snippet']);
+  assert.deepEqual(Object.keys(result.properties).sort(), ['description', 'domain', 'name', 'path', 'scope', 'score', 'snippet']);
+});
+
+const DOMAIN_TEXT = "the owner's classification of the note: work, personal or general; absent when not yet classified";
+
+test('the search result schema has domain', () => {
+  const op = operations().find((o) => o.op.operationId === 'memory_search')!.op;
+  const result = op.responses['200'].content['application/json'].schema.properties.results.items;
+  assert.equal(result.properties.domain.type, 'string');
+  assert.deepEqual(result.properties.domain.enum, ['work', 'personal', 'general']);
+  assert.equal(result.properties.domain.description, DOMAIN_TEXT);
+  assert.equal(result.required.includes('domain'), false);
 });
 
 test('no account ids or amazonaws.com', () => {

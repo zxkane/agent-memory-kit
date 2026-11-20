@@ -682,7 +682,7 @@ Every byte comes from the Git objects of the commit that is checked out and is a
 - a file over 1,000,000 bytes (`too-large`);
 - a file that the secret scan flags (`flagged`). It is left out of the bucket and out of the search snapshot, and an earlier copy is removed from the bucket.
 
-The bridge also writes the search snapshot `index/mem.json`: each note's path, name, description, type and body, without the `MEMORY.md` index files. The snapshot object must stay under 8 MiB, which the API enforces, so the bridge keeps it under 7,000,000 bytes. It starts with up to 100,000 bytes of body per note and, when the snapshot does not fit, lowers that limit by a quarter at a time down to 2,000. `snapshotBytes` and `bodyLimit` in `status.json` show what was used. When not even 2,000 bytes per note fit, the run fails with `bridge-up failed: 0 SnapshotTooLarge` before anything is sent.
+The bridge also writes the search snapshot `index/mem.json`: each note's path, name, description, type and body, and its `domain` when the note has a valid label (`work`, `personal` or `general`), without the `MEMORY.md` index files. The snapshot object must stay under 8 MiB, which the API enforces, so the bridge keeps it under 7,000,000 bytes. It starts with up to 100,000 bytes of body per note and, when the snapshot does not fit, lowers that limit by a quarter at a time down to 2,000. `snapshotBytes` and `bodyLimit` in `status.json` show what was used. When not even 2,000 bytes per note fit, the run fails with `bridge-up failed: 0 SnapshotTooLarge` before anything is sent.
 
 **The record.** `index/bridge.json` in the bucket names the commit that was last uploaded, with the machine's host name and the time. It is written last, with a conditional write (only when nobody changed it since it was read), so it never names a commit whose notes were not all sent: puts first, then the snapshot, then deletions, then the record.
 
@@ -1100,6 +1100,10 @@ The notes in the bucket are meant to be a replica of the workstation notes. The 
   ```
 
   `path` is the note's path in the client-scope form that `memory_read` takes (`global/<file>.md` or `projects/<project>/<file>.md`, without the `mem/` prefix). `MEMORY.md` files are not listed. Entries outside `global/` and `projects/` are ignored.
+
+  An entry may also carry `"domain": "work"`, `"personal"` or `"general"`, the owner's label of the note. The API keeps the field when it is one of these three, returns it as `domain` in each `memory_search` result, and leaves it out otherwise. `index/agents.json` has the same field, and `memory_write` keeps it on the entries it does not rewrite; the entry of the note it writes carries none.
+
+  `memory_index` tags the lines of `work` and `personal` notes: in a line `- [title](file.md) — description` of the scope's `MEMORY.md`, `[work] ` or `[personal] ` is inserted after the first ` — `, so the line reads `- [title](file.md) — [work] description`. Lines of `general` and unlabeled notes, lines that already have the tag, and all other lines stay as they are. The tags are added before the text is cut at 25,000 bytes, and the index is returned untagged when the snapshots cannot be read.
 
 The API writes the matching agent-side objects itself: `agents/<agent>/<name>.md`, `agents/<agent>/MEMORY.md` and `index/agents.json`. The only other writer of these is the Organize run for agent scopes, with its label pass, which writes notes and `index/agents.json` only (see "The agent scopes of the memory API"); both keep their record in `index/organizer.json`.
 
