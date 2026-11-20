@@ -219,29 +219,35 @@ test('sendBatches counts only the failures that did not reach the model toward t
   assert.equal(unreachable.calls.length, 3);
 });
 
-test('askLabelModel makes the run\'s one token only for a batch, and says why it stopped', async () => {
+test('askLabelModel takes the pass\'s one token source only for a batch, and says why it stopped', async () => {
   const made = [];
-  const token = async () => { made.push(1); return { token: 'example-label-token', tokenAt: 0 }; };
+  const provideToken = async () => 'example-label-token';
+  const tokenSource = async () => { made.push(1); return { provideToken, tokenAt: 0 }; };
   const seen = [];
-  const labelBatch = async (notes, tok) => { seen.push(tok); return { ok: true, labels: new Map(notes.map((n) => [n.id, { label: 'work', reason: 'r' }])), costUsd: 0.6, requests: 1 }; };
-  const ask = (batches, extra = {}) => askLabelModel({ batches, token, labelBatch, ceiling: 1, now: () => 0, ...extra });
-  // No batch, no token.
+  const labelBatch = async (notes, given) => { seen.push(given); return { ok: true, labels: new Map(notes.map((n) => [n.id, { label: 'work', reason: 'r' }])), costUsd: 0.6, requests: 1 }; };
+  const ask = (batches, extra = {}) => askLabelModel({ batches, tokenSource, labelBatch, ceiling: 1, now: () => 0, ...extra });
+  // No batch, no token source.
   assert.deepEqual(await ask([]), { labels: new Map(), left: new Map(), stop: null, failed: false, spent: 0, requests: 0, sent: 0, line: null });
   assert.equal(made.length, 0);
-  // One token for every batch of the run; the second batch reaches the ceiling.
+  // One token source for every batch of the pass, whose calls take its tokens; the second batch reaches the ceiling.
   const out = await ask(batchesOf('global', 'projects/p', 'projects/q'));
   assert.equal(made.length, 1);
-  assert.deepEqual(seen, ['example-label-token', 'example-label-token']);
+  assert.deepEqual(seen, [provideToken, provideToken]);
   assert.equal(out.stop, 'ceiling');
   assert.equal(out.line, 'label: stopped; the model cost of this run reached its ceiling of USD 1.00');
-  // The token's age counts from when the token says it was issued, not from when the run took it.
+  // A token file's age counts from when the source says its token was issued, not from when the pass took it.
   const old = await ask(batchesOf('global'), { now: () => TOKEN_MAX_AGE_MS });
   assert.equal(old.stop, 'token-age');
   assert.equal(old.sent, 0);
   assert.equal(old.line, 'label: stopped; the label token of this run is near the end of its hour');
-  // A token that cannot be made leaves every note of every batch, and fails the pass.
+  // A source whose tokens have no age (a provider that makes one for each request) never stops for it.
+  const fresh = await askLabelModel({
+    batches: batchesOf('global'), tokenSource: async () => ({ provideToken, tokenAt: null }), labelBatch, ceiling: 1, now: () => 10 * TOKEN_MAX_AGE_MS,
+  });
+  assert.deepEqual([fresh.stop, fresh.sent], [null, 1]);
+  // A token source that cannot be made leaves every note of every batch, and fails the pass.
   const broken = await askLabelModel({
-    batches: batchesOf('global', 'projects/p'), token: async () => { throw new Error('the label token file is not a token\nmore'); },
+    batches: batchesOf('global', 'projects/p'), tokenSource: async () => { throw new Error('the label token file is not a token\nmore'); },
     labelBatch, ceiling: 1, now: () => 0,
   });
   assert.equal(broken.failed, true);

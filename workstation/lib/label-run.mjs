@@ -72,7 +72,8 @@ export function nextLabelRecord(record, { present, written = [], unchanged = [],
   return Object.fromEntries([...next].sort(([a], [b]) => byName(a, b)));
 }
 
-// A label token lasts an hour at most: no batch starts once the run's token is this old.
+// A token from a token file lasts an hour at most: no batch starts once it is this old. A token of
+// the token generator is made for each request, so it has no age.
 export const TOKEN_MAX_AGE_MS = 55 * 60 * 1000;
 // After this many batches in a row that did not reach the model, the endpoint is taken as out of reach.
 export const FAILURES_IN_A_ROW = 2;
@@ -87,7 +88,7 @@ const NOT_SENT = {
 const TOKEN_NOT_MADE = 'not sent; the label token could not be made';
 
 // Sends the batches to the model in order, one `labelBatch(notes)` each: the caller's call, with
-// its token, persona and endpoint, giving labelBatch's result. A batch of several notes whose
+// its token source, persona and endpoint, giving labelBatch's result. A batch of several notes whose
 // answer was about its notes and failed (`content`: a refusal, an incomplete answer, two answers
 // that fail the check) is split in two halves, its first ⌈n/2⌉ notes and the rest, both sent at
 // once as batches of their own before the next batch: batches go in the same order every run, and
@@ -99,9 +100,10 @@ const TOKEN_NOT_MADE = 'not sent; the label token could not be made';
 // not reach the model) never splits: a wrong model or parameter fails every request at once,
 // unbilled, and splitting would multiply them. Before each request, a half's too, it stops when
 // `signal` is aborted (`interrupted`), after FAILURES_IN_A_ROW batches in a row whose request did
-// not reach the model (`failures`, a failure: labelBatch marks them `transport`), when the cost so
-// far reached `ceiling` USD (`ceiling`, a limit), or when the token, made at `tokenAt` (of `now()`,
-// in ms; null when its age is not known), is TOKEN_MAX_AGE_MS old (`token-age`, a limit). Any other
+// not reach the model (`failures`, a failure: labelBatch marks them `transport`, also when no token
+// could be made for them), when the cost so far reached `ceiling` USD (`ceiling`, a limit), or when
+// the token, made at `tokenAt` (of `now()`, in ms; null when it has no known age), is
+// TOKEN_MAX_AGE_MS old (`token-age`, a limit). Any other
 // failure does not stop it: the endpoint answered, which also ends a row of failures. Returns the
 // labels given (path -> { label, reason }), the notes not labeled (path -> why: those of a failed
 // batch that was not split, and those not sent after a stop), `stop` (null when it sent every
@@ -200,26 +202,28 @@ export function stopLine(stop, ceiling) {
   return null;
 }
 
-// The model's labels for the batches of a pass (sendBatches), with the run's one token: `token()`
-// gives `{ token, tokenAt }` and is called only when there is a batch to send; `labelBatch(notes,
-// token)` is the caller's call. A token signed with a role's session lasts an hour, the token-age
-// stop's premise; one signed with instance credentials, or read from a token file, may stop
-// working earlier, and then its requests fail (401 or 403) until the failure stop ends the pass.
-// `line`: what the pass prints about it (why no note was sent, or why it stopped before its last
-// batch), or null. A token that cannot be made leaves every note and fails the pass.
-export async function askLabelModel({ batches, token, labelBatch, ceiling, now, signal }) {
+// The model's labels for the batches of a pass (sendBatches), with the pass's one token source:
+// `tokenSource()` gives `{ provideToken, tokenAt }` and is called only when there is a batch to
+// send; `labelBatch(notes, provideToken)` is the caller's call, which awaits `provideToken()` before
+// each of its requests. A token file's token may stop working before the token-age stop, and then
+// its requests fail (401 or 403) until the failure stop ends the pass; a token that cannot be made
+// for a request fails that request as one that did not reach the model. `line`: what the pass
+// prints about it (why no note was sent, or why it stopped before its last batch), or null. A
+// token source that cannot be made (a token file that is not a token, packages that are not
+// installed) leaves every note and fails the pass.
+export async function askLabelModel({ batches, tokenSource, labelBatch, ceiling, now, signal }) {
   const none = { labels: new Map(), left: new Map(), stop: null, failed: false, spent: 0, requests: 0, sent: 0, line: null };
   if (batches.length === 0) return none;
   let run;
   try {
-    run = await token();
+    run = await tokenSource();
   } catch (err) {
     const reason = errorText(err);
     const left = new Map(batches.flatMap((b) => b.notes.map((n) => [n.path, TOKEN_NOT_MADE])));
     return { ...none, left, failed: true, line: `label: the label token could not be made (${reason}); no note was sent to the model.` };
   }
   const asked = await sendBatches({
-    batches, ceiling, now, signal, tokenAt: run.tokenAt, labelBatch: (notes) => labelBatch(notes, run.token),
+    batches, ceiling, now, signal, tokenAt: run.tokenAt, labelBatch: (notes) => labelBatch(notes, run.provideToken),
   });
   return { ...asked, line: stopLine(asked.stop, ceiling) };
 }

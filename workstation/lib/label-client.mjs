@@ -1,8 +1,12 @@
 // The model call of the label step: one request per batch of notes to an OpenAI-compatible
 // Responses endpoint (Amazon Bedrock Mantle), with a short-term bearer token, and no agent loop or
-// tools. No dependencies. No error text holds a response body, a header, the token or the prompt.
+// tools. The tokens come from a token file or from AWS's official token generator, the only
+// packages the kit loads, here alone and only for a pass that signs its tokens. No error text holds
+// a response body, a header, a credential, the token or the prompt.
 
-import { assumeRole, bedrockToken, environmentCredentials, imdsCredentials } from './aws.mjs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { safeCode } from './aws.mjs';
 import { LABELS } from './domains.mjs';
 import { CUT_MARKER, NOTE_TEXT_CAP, capped } from './label-notes.mjs';
 import { TOKEN_MAX_AGE_MS } from './label-run.mjs';
@@ -20,6 +24,11 @@ const MAX_REASON_CHARS = 300;
 const MAX_TOKEN_FILE_BYTES = 16 * 1024;
 const TOKEN_RE = /^[A-Za-z0-9+/=._-]+$/;
 const TOKEN_LIFETIME_SECONDS = 3600;
+const NO_TOKEN = 'the label token could not be made';
+// The kit's checkout, whose node_modules holds the packages of the label step.
+const KIT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const INSTALL = `run npm ci --omit=dev --ignore-scripts in ${KIT_DIR}`;
+const TOKEN_PACKAGES = ['@aws/bedrock-token-generator', '@aws-sdk/credential-providers'];
 
 const defaultSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
@@ -123,14 +132,39 @@ function readResponse(data) {
 // same way.
 const OUT_OF_REACH = (status) => status === 429 || status >= 500 || status === 401 || status === 403 || status === 404;
 
+// What a token that could not be made may say: the HTTP status of an AWS answer and the error's
+// name when it has the form of an AWS error code, never its message, which can hold an ARN, an
+// account ID or text of the answer.
+function tokenFailure(err) {
+  const status = err?.$metadata?.httpStatusCode;
+  return `${NO_TOKEN}: ${Number.isInteger(status) ? `${status} ` : ''}${safeCode(err?.name)}`;
+}
+
+// The token `provideToken` gives, or the abort of `signal` as soon as it comes: a token can take a
+// while (a role's credentials take a request to STS), and an abort stops a request at once. No
+// listener stays on the signal.
+function tokenUntilAborted(provideToken, signal) {
+  if (!signal) return Promise.resolve().then(provideToken);
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    signal.addEventListener('abort', stop, { once: true });
+    Promise.resolve().then(provideToken).then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  });
+}
+
 // One Responses request, with up to ATTEMPTS attempts for 429, 5xx and network errors (a timeout
-// of one attempt is a network error). An abort of the caller's signal stops it at once. A failure
-// has `transport` true when the request did not reach the model (a network error or a timeout, or
-// HTTP 429, 5xx, 401, 403 or 404), false when the endpoint answered, and `content` true when the
-// answer was about the notes: a refusal or an incomplete answer.
-export async function requestLabels({ prompt, label, token, fetchImpl = fetch, signal, sleep = defaultSleep }) {
+// of one attempt is a network error). Right before each attempt it awaits a token of
+// `provideToken`, never one of an earlier attempt. A token that cannot be made ends the request at
+// once, with nothing sent and no other source tried, as a request that did not reach the model. An
+// abort of the caller's signal stops it at once. A failure has `transport` true when the request
+// did not reach the model (no token, a network error or a timeout, or HTTP 429, 5xx, 401, 403 or
+// 404), false when the endpoint answered, and `content` true when the answer was about the notes:
+// a refusal or an incomplete answer.
+export async function requestLabels({ prompt, label, provideToken, fetchImpl = fetch, signal, sleep = defaultSleep }) {
   const started = Date.now();
   const done = (result) => ({ ...result, ms: Date.now() - started });
+  const aborted = () => done({ ok: false, error: 'request aborted', transport: false, content: false });
   const body = JSON.stringify({
     model: label.model, input: prompt, max_output_tokens: MAX_OUTPUT_TOKENS, store: false, reasoning: { effort: label.reasoningEffort },
   });
@@ -139,7 +173,17 @@ export async function requestLabels({ prompt, label, token, fetchImpl = fetch, s
     if (attempt > 0) {
       await sleep(BACKOFF_MS[attempt - 1] * (0.8 + Math.random() * 0.4));
     }
-    if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false, content: false });
+    if (signal?.aborted) return aborted();
+    let token;
+    try {
+      token = await tokenUntilAborted(provideToken, signal);
+    } catch (err) {
+      if (signal?.aborted) return aborted();
+      return done({ ok: false, error: tokenFailure(err), transport: true, content: false });
+    }
+    if (typeof token !== 'string' || !TOKEN_RE.test(token)) {
+      return done({ ok: false, error: `${NO_TOKEN}: not a token`, transport: true, content: false });
+    }
     const limit = AbortSignal.timeout(ATTEMPT_TIMEOUT_MS);
     try {
       const res = await fetchImpl(`${label.endpoint}/responses`, {
@@ -169,7 +213,7 @@ export async function requestLabels({ prompt, label, token, fetchImpl = fetch, s
       const read = readResponse(data);
       return done(read.ok ? read : { ...read, transport: false });
     } catch (err) {
-      if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false, content: false });
+      if (signal?.aborted) return aborted();
       error = 'Mantle Responses request failed';
     }
   }
@@ -181,13 +225,14 @@ export function costOf(usage, label) {
   return (usage.input * label.inputUsdPerMillion + usage.output * label.outputUsdPerMillion) / 1e6;
 }
 
-// Labels a batch of notes. An answer that fails parseLabelAnswer is asked once more; an HTTP or
-// network failure (after its own retries) ends the batch. A failed batch has `transport` true when
-// its request did not reach the model (see requestLabels), and `content` true when its last answer
-// was about the notes: a refusal, an incomplete answer, or (twice) an answer that fails the check.
-// Any other failure (another 4xx, an answer that is not JSON or is too large, a response that did
-// not complete otherwise, an abort) has both false.
-export async function labelBatch({ notes, persona, label, token, fetchImpl, signal, sleep }) {
+// Labels a batch of notes, each request with a token of its own from `provideToken`. An answer that
+// fails parseLabelAnswer is asked once more; an HTTP or network failure (after its own retries), or
+// a token that cannot be made, ends the batch. A failed batch has `transport` true when its request
+// did not reach the model (see requestLabels), and `content` true when its last answer was about
+// the notes: a refusal, an incomplete answer, or (twice) an answer that fails the check. Any other
+// failure (another 4xx, an answer that is not JSON or is too large, a response that did not
+// complete otherwise, an abort) has both false.
+export async function labelBatch({ notes, persona, label, provideToken, fetchImpl, signal, sleep }) {
   const prompt = labelPrompt({ notes, persona });
   const ids = notes.map((n) => n.id);
   const usage = { input: 0, output: 0 };
@@ -197,7 +242,7 @@ export async function labelBatch({ notes, persona, label, token, fetchImpl, sign
   let content = false;
   for (let round = 0; round < 2; round += 1) {
     requests += 1;
-    const res = await requestLabels({ prompt, label, token, fetchImpl, signal, sleep });
+    const res = await requestLabels({ prompt, label, provideToken, fetchImpl, signal, sleep });
     if (res.usage) {
       usage.input += res.usage.input;
       usage.output += res.usage.output;
@@ -238,37 +283,69 @@ function readTokenFile(path) {
   return { token, mtimeMs: info.mtimeMs };
 }
 
-// A bearer token for the label endpoint: the token file when the label block names one, otherwise
-// a short-term token signed with the instance or environment credentials (of the role, when the
-// block names one). The role session lasts as long as the token, which stops working with the
-// credentials that signed it.
-export async function labelToken(label, { now = () => new Date(), env = process.env, fetchImpl } = {}) {
-  if (label.tokenFile) return readTokenFile(label.tokenFile).token;
-  let credentials;
-  if (label.credentials === 'environment') credentials = environmentCredentials(env);
-  else if (label.credentials === 'instance') credentials = await imdsCredentials({ fetchImpl });
-  else throw new Error('the label block names no token source');
-  if (label.roleArn) {
-    credentials = await assumeRole({
-      roleArn: label.roleArn, sessionName: 'agent-memory-label', region: label.region, credentials,
-      durationSeconds: TOKEN_LIFETIME_SECONDS, fetchImpl, now,
-    });
+// The generator and the credential providers of the official AWS packages, loaded by `load` (a
+// dynamic import), which the kit does only when a pass that signs its tokens takes its token
+// source. When they cannot be loaded, the error names the command that installs them.
+export async function loadTokenPackages(load = (name) => import(name)) {
+  let generator;
+  let providers;
+  try {
+    [generator, providers] = await Promise.all(TOKEN_PACKAGES.map((name) => load(name)));
+  } catch (err) {
+    const missing = err?.code === 'ERR_MODULE_NOT_FOUND' || err?.code === 'MODULE_NOT_FOUND';
+    throw new Error(`the AWS token generator ${missing ? 'is not installed' : 'could not be loaded'}; ${INSTALL}`);
   }
-  return bedrockToken({ region: label.region, credentials, now: now(), expiresInSeconds: TOKEN_LIFETIME_SECONDS });
+  const { getTokenProvider } = generator;
+  const { fromEnv, fromInstanceMetadata, fromTemporaryCredentials } = providers;
+  return { getTokenProvider, fromEnv, fromInstanceMetadata, fromTemporaryCredentials };
 }
 
-// The token of a run and the moment its age counts from (ms since the epoch), for the stop before
-// a token gets too old: a token file's modification time, as the job that issues the token writes
-// the file at once (it may be long before this run starts), or the moment the token is signed. A
-// token file already TOKEN_MAX_AGE_MS old when the run takes its token was not issued for the run:
-// it holds a token of unknown lifetime, such as a long-lived key, and its age is not known (null),
-// so it stops nothing; once such a key has expired, its requests get 401 or 403, which count toward
-// the failure stop.
-export async function tokenForRun(label, { now = () => new Date(), env = process.env, fetchImpl } = {}) {
+// The credentials of `provider`, which must be temporary: long-lived keys never reach the token
+// generator, as `environment` means the temporary credentials of a job.
+const temporaryOnly = (provider) => async (...args) => {
+  const credentials = await provider(...args);
+  if (typeof credentials?.sessionToken !== 'string' || credentials.sessionToken === '') {
+    throw Object.assign(new Error('the environment credentials have no session token'), { name: 'NoSessionToken' });
+  }
+  return credentials;
+};
+
+// The credentials that sign the label tokens, as the official providers give them: the instance
+// metadata service, or the environment's temporary credentials, exchanged for the role's (a
+// session as long as a token lasts, in the block's region) when the block names one. One source,
+// never another one after it.
+function labelCredentials(label, aws) {
+  const base = label.credentials === 'environment' ? temporaryOnly(aws.fromEnv()) : aws.fromInstanceMetadata();
+  if (!label.roleArn) return base;
+  return aws.fromTemporaryCredentials({
+    params: { RoleArn: label.roleArn, RoleSessionName: 'agent-memory-label', DurationSeconds: TOKEN_LIFETIME_SECONDS },
+    masterCredentials: base,
+    clientConfig: { region: label.region },
+  });
+}
+
+// The token source of a pass, taken when it has a batch to send: `provideToken()`, awaited right
+// before each request, and the moment the age of its token counts from (ms since the epoch, null
+// when it has none), for the stop before a token gets too old.
+// - A token file is read once: every request gets its token. Its age counts from the file's
+//   modification time, as the job that issues the token writes the file at once (it may be long
+//   before this pass starts). A file already TOKEN_MAX_AGE_MS old when the pass takes it was not
+//   issued for the pass: it holds a token of unknown lifetime, such as a long-lived key, whose age
+//   is not known (null), so it stops nothing; once such a key has expired, its requests get 401 or
+//   403, which count toward the failure stop.
+// - Otherwise one provider of the official token generator (`deps` replaces the packages in tests)
+//   for the block's region, which makes a new token of an hour from the block's credentials for
+//   every request, so that no token gets old (null). No token is kept: a provider that fails fails
+//   that request, and no other source is tried.
+export async function tokenForRun(label, { now = () => new Date(), deps } = {}) {
   if (label.tokenFile) {
     const { token, mtimeMs } = readTokenFile(label.tokenFile);
-    return { token, tokenAt: now().getTime() - mtimeMs >= TOKEN_MAX_AGE_MS ? null : mtimeMs };
+    return { provideToken: async () => token, tokenAt: now().getTime() - mtimeMs >= TOKEN_MAX_AGE_MS ? null : mtimeMs };
   }
-  const signedAt = now();
-  return { token: await labelToken(label, { now: () => signedAt, env, fetchImpl }), tokenAt: signedAt.getTime() };
+  if (label.credentials !== 'environment' && label.credentials !== 'instance') throw new Error('the label block names no token source');
+  const aws = deps ?? (await loadTokenPackages());
+  const provideToken = aws.getTokenProvider({
+    region: label.region, credentials: labelCredentials(label, aws), expiresInSeconds: TOKEN_LIFETIME_SECONDS,
+  });
+  return { provideToken, tokenAt: null };
 }

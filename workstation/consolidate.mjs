@@ -1360,7 +1360,7 @@ async function agentLabelPass({ config, opts, s3For, started }) {
   }
   const pass = await labelAgentScopes({
     config, opts, s3For, started, domains: inputs.domains, persona: inputs.persona,
-    token: () => tokenForRun(label), labelBatch, signal: abort.signal,
+    tokenSource: () => tokenForRun(label), labelBatch, signal: abort.signal,
   });
   if (pass.lines.length > 0) process.stdout.write(`${pass.lines.join('\n')}\n`);
   return pass;
@@ -1550,11 +1550,11 @@ function labelInputs(config) {
 // The label pass over the clone's scopes: `scopes` names some (`global` or project folders), none
 // means every scope. It reads the notes (label-read), sends the touched ones to the label model in
 // batches until it has sent them all or must stop (askLabelModel: the cost ceiling maxBudgetUsd,
-// the age of the token, batches in a row that did not reach the model), writes the labels given
-// and the exceptions' (label-apply), records what it saw in `state.labels`, and moves Organize's
-// record of each scope it wrote into, where that was the content it found. Prints what it did.
-// `failed`: the inputs are missing or invalid, no token could be made, a batch failed, or a step
-// failed. A signal stops it before label-apply, with nothing written.
+// the age of a token file's token, batches in a row that did not reach the model), writes the
+// labels given and the exceptions' (label-apply), records what it saw in `state.labels`, and moves
+// Organize's record of each scope it wrote into, where that was the content it found. Prints what
+// it did. `failed`: the inputs are missing or invalid, the token source could not be made, a batch
+// failed, or a step failed. A signal stops it before label-apply, with nothing written.
 async function labelPass({ config, opts, state, scopes, runFolder }) {
   const c = config.consolidate;
   // In an Organize run --model names the Organize model; in a label run, the label model.
@@ -1611,8 +1611,8 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   const { exceptions, batches } = planLabelBatches({ notes: runNotes, touched, domains, batchNotes: label.batchNotes });
 
   const asked = await askLabelModel({
-    batches, ceiling: config.consolidate.maxBudgetUsd, now: () => Date.now(), signal: abort.signal, token: () => tokenForRun(label),
-    labelBatch: (notes, token) => labelBatch({ notes, persona, label, token, signal: abort.signal }),
+    batches, ceiling: config.consolidate.maxBudgetUsd, now: () => Date.now(), signal: abort.signal, tokenSource: () => tokenForRun(label),
+    labelBatch: (notes, provideToken) => labelBatch({ notes, persona, label, provideToken, signal: abort.signal }),
   });
   if (asked.line) say(asked.line);
   // Interrupted: nothing is written, and every note stays as it is.

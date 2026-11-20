@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../lib/config.mjs';
@@ -276,6 +278,58 @@ test('the config, the session-start text and the note labels load no AWS code', 
   assert.match(loads, /lib\/config\.mjs/);
   assert.match(loads, /lib\/domains\.mjs/);
   assert.doesNotMatch(loads, /lib\/(aws|s3)\.mjs/);
+});
+
+test('only a label pass that signs loads the AWS packages, when it takes its token source', (t) => {
+  const dir = tempDir(t);
+  const hook = join(dir, 'record-loads.mjs');
+  writeFileSync(hook, [
+    "import { appendFileSync } from 'node:fs';",
+    "import { registerHooks } from 'node:module';",
+    'registerHooks({ load(url, context, next) { appendFileSync(process.env.AM_LOAD_LOG, `${url}\\n`); return next(url, context); } });',
+    '',
+  ].join('\n'));
+  const log = join(dir, 'loads.log');
+  const tokenFile = join(dir, 'token');
+  writeFileSync(tokenFile, 'example-label-token\n');
+  const label = { model: 'example-model', region: 'us-east-1', credentials: 'environment', roleArn: null, tokenFile: null };
+  // Every module of the kit's library, then a pass's token source from a token file, then one that signs.
+  const code = `
+    import { appendFileSync, readdirSync } from 'node:fs';
+    const lib = ${JSON.stringify(join(PKG, 'lib'))};
+    const mark = (what) => appendFileSync(process.env.AM_LOAD_LOG, '-- ' + what + '\\n');
+    for (const name of readdirSync(lib).filter((n) => n.endsWith('.mjs')).sort()) await import(lib + '/' + name);
+    const { tokenForRun } = await import(lib + '/label-client.mjs');
+    const label = ${JSON.stringify(label)};
+    mark('token file');
+    const fromFile = await tokenForRun({ ...label, credentials: null, tokenFile: ${JSON.stringify(tokenFile)} });
+    await fromFile.provideToken();
+    mark('signed');
+    const signed = await tokenForRun(label);
+    process.stdout.write((await signed.provideToken()).slice(0, 16));
+  `;
+  const env = {
+    PATH: process.env.PATH, AM_LOAD_LOG: log,
+    AWS_ACCESS_KEY_ID: 'AKIDEXAMPLE', AWS_SECRET_ACCESS_KEY: 'example-signing-value', AWS_SESSION_TOKEN: 'example-session-value',
+  };
+  const r = spawnSync(process.execPath, ['--import', hook, '--input-type=module', '-e', code], { env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, 'bedrock-api-key-', 'a token of the official generator, made offline from the environment');
+  const [library, fromFile, signed] = readFileSync(log, 'utf8').split(/^-- .*\n/m);
+  assert.match(library, /lib\/label-client\.mjs/);
+  assert.match(library, /lib\/agent-labels\.mjs/);
+  assert.doesNotMatch(library + fromFile, /\/node_modules\//, 'no module of the library, and no pass with a token file, loads a package');
+  assert.match(signed, /\/node_modules\/@aws\/bedrock-token-generator\//);
+  assert.match(signed, /\/node_modules\/@aws-sdk\/credential-providers\//);
+  // The commands load the library's modules and Node's own only; the label client alone names the packages.
+  const sources = [
+    ...readdirSync(PKG).filter((n) => n.endsWith('.mjs')).map((n) => join(PKG, n)),
+    ...readdirSync(join(PKG, 'lib')).filter((n) => n.endsWith('.mjs')).map((n) => join(PKG, 'lib', n)),
+  ];
+  for (const file of sources) {
+    if (file === join(PKG, 'lib', 'label-client.mjs')) continue;
+    assert.doesNotMatch(readFileSync(file, 'utf8'), /@aws\/bedrock-token-generator|@aws-sdk\//, file);
+  }
 });
 
 test('sync.mjs loads the bridge modules when a bridge block is configured', (t) => {
