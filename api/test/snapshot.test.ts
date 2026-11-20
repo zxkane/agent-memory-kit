@@ -117,6 +117,19 @@ test("upsertNote keeps other entries' domain", () => {
   assert.equal('domain' in out.notes[1]!, false);
 });
 
+test('upsertNote: the rewritten note loses its domain and the other entries keep theirs', () => {
+  const before = doc([
+    note('agents/bot/a.md', { domain: 'work' }),
+    note('agents/bot/b.md', { domain: 'personal' }),
+  ]);
+  const out = JSON.parse(upsertNote(before, note('agents/bot/a.md', { body: 'new' }))) as { notes: Note[] };
+  assert.equal(out.notes.length, 2);
+  assert.equal(out.notes[0]?.path, 'agents/bot/a.md');
+  assert.equal(out.notes[0]?.body, 'new');
+  assert.equal('domain' in out.notes[0]!, false);
+  assert.equal(out.notes[1]?.domain, 'personal');
+});
+
 test('upsertNote: starts a new snapshot from null', () => {
   const out = JSON.parse(upsertNote(null, note('global/a.md')));
   assert.deepEqual(out, { version: 1, notes: [note('global/a.md')] });

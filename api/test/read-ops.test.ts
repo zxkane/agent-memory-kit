@@ -221,6 +221,32 @@ test('memory_index tags before it cuts to 25000 bytes', async () => {
 
 test('memory_index still answers untagged when the snapshots cannot be loaded', async () => {
   const store = fakeStore({ 'mem/global/MEMORY.md': '- [A](a.md) — about a', 'index/mem.json': 'not json' });
-  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
+  const lines: object[] = [];
+  const result = await memoryIndex(
+    { store, snapshots: createSnapshots(store), log: (line) => lines.push(line) },
+    { scope: 'global' },
+  );
   assert.equal(result.index, '- [A](a.md) — about a');
+  assert.deepEqual(lines, [{ op: 'memory_index', untagged: true, error: 'internal' }]);
+});
+
+test('memory_index logs the name of a raw error and never its message', async () => {
+  const store = fakeStore({ 'mem/global/MEMORY.md': '- [A](a.md) — about a' });
+  const boom = new Error('AccessDenied on arn:aws:s3:::secret-bucket/key');
+  boom.name = 'AccessDenied';
+  const lines: object[] = [];
+  const result = await memoryIndex(
+    { store, snapshots: { load: async () => { throw boom; } }, log: (line) => lines.push(line) },
+    { scope: 'global' },
+  );
+  assert.equal(result.index, '- [A](a.md) — about a');
+  assert.deepEqual(lines, [{ op: 'memory_index', untagged: true, error: 'AccessDenied' }]);
+  assert.equal(JSON.stringify(lines).includes('arn:'), false);
+});
+
+test('memory_index logs nothing when the snapshots load', async () => {
+  const store = fakeStore({ 'mem/global/MEMORY.md': '- [A](a.md) — about a' });
+  const lines: object[] = [];
+  await memoryIndex({ store, snapshots: createSnapshots(store), log: (line) => lines.push(line) }, { scope: 'global' });
+  assert.deepEqual(lines, []);
 });
