@@ -3,7 +3,7 @@ import test from 'node:test';
 import { parseDomains } from '../lib/domains.mjs';
 import {
   FAILURES_IN_A_ROW, TOKEN_MAX_AGE_MS, askLabelModel, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched,
-  sendBatches, stopLine,
+  sendBatches, stopLine, unreadScopeResults,
 } from '../lib/label-run.mjs';
 
 const hex = (c) => c.repeat(64);
@@ -435,6 +435,28 @@ test('labelReport shows the labels set or changed, the counts, the notes left an
   ].join('\n'));
   // A scope with nothing to report has no section; a run with none gives no text.
   assert.equal(labelReport([sampleResults()[1]]), '');
+});
+
+test('a run over every scope also names the exceptions of the scopes it did not read', () => {
+  // A name in the domains file that is not a folder or an agent scope (a typo) is never applied.
+  const exceptions = new Map([
+    ['global/a.md', 'work'], ['projects/typo/y.md', 'personal'], ['projects/typo/x.md', 'work'], ['projects/p/gone.md', 'work'],
+    ['agents/nobody/z.md', 'general'], ['projects/other/w.md', 'work'],
+  ]);
+  const clone = (scope) => scope === 'global' || scope.startsWith('projects/');
+  const results = unreadScopeResults({ scopes: ['global', 'projects/p'], exceptions, own: clone });
+  assert.deepEqual(results, [
+    { scope: 'projects/other', labels: [], counts: null, left: [], repair: [], unmatched: ['projects/other/w.md'] },
+    { scope: 'projects/typo', labels: [], counts: null, left: [], repair: [], unmatched: ['projects/typo/x.md', 'projects/typo/y.md'] },
+  ]);
+  // Each pass names its own scopes only.
+  const agents = unreadScopeResults({ scopes: ['agents/example-agent'], exceptions, own: (scope) => scope.startsWith('agents/') });
+  assert.deepEqual(agents.map((r) => [r.scope, r.unmatched]), [['agents/nobody', ['agents/nobody/z.md']]]);
+  // The report lists them under their scope, without counts for a scope that was not read.
+  assert.equal(labelReport(results), [
+    '## projects/other', '', 'Exceptions that name no note:', '- projects/other/w.md', '',
+    '## projects/typo', '', 'Exceptions that name no note:', '- projects/typo/x.md', '- projects/typo/y.md', '',
+  ].join('\n'));
 });
 
 test('labelReport leaves the model\'s reasons out when asked', () => {

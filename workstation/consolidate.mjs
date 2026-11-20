@@ -27,7 +27,9 @@ import { labelBatch, tokenForRun } from './lib/label-client.mjs';
 import {
   applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, labelEntryProblem,
 } from './lib/label-notes.mjs';
-import { askLabelModel, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched } from './lib/label-run.mjs';
+import {
+  askLabelModel, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, unreadScopeResults,
+} from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
@@ -518,6 +520,8 @@ function stepApply(config, rest) {
 // `projects/<name>/`).
 const scopeFolder = (name) => (name === GLOBAL ? GLOBAL : `projects/${name}`);
 const scopeOfPath = (path) => (path.startsWith('projects/') ? path.split('/')[1] : GLOBAL);
+// A scope folder of the clone (`global` or `projects/<name>`), not one of the agent scopes.
+const isCloneScope = (folder) => folder === GLOBAL || folder.startsWith('projects/');
 
 // Writes `<work>/label-notes.json`: the notes of the named scopes (of every scope without
 // `--scope`) as collectScopeNotes lists them, and each scope's digest. A named scope whose folder
@@ -1631,7 +1635,11 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
     ...exceptions.map((e) => [e.path, { label: e.label, reason: null, exception: true }]),
     ...[...asked.labels].map(([path, given]) => [path, { ...given, exception: false }]),
   ]);
-  const results = labelResults({ scopes: runScopes, notes: listed.filter(inRun), planned, left: asked.left, exceptions: domains.exceptions });
+  const results = [
+    ...labelResults({ scopes: runScopes, notes: listed.filter(inRun), planned, left: asked.left, exceptions: domains.exceptions }),
+    // A run over every scope also names the exceptions of folders it did not read: a typo there is never applied.
+    ...(scopes.length === 0 ? unreadScopeResults({ scopes: runScopes, exceptions: domains.exceptions, own: isCloneScope }) : []),
+  ];
   const sections = labelReport(results, { reasons: true });
   const report = [
     `# Labels — ${new Date().toISOString().slice(0, 10)} on ${config.host}`, '',
@@ -1640,7 +1648,17 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
     ...(sections === '' ? [] : ['', sections.trimEnd()]),
   ].join('\n').concat('\n');
   const figures = `${usd(asked.spent)}, ${asked.requests} request(s)`;
-  const nothing = batches.length === 0 && exceptions.length === 0;
+  // The plan: every label planned, in the order the notes were read, each with the digest it was
+  // read with. An exception whose note holds its label already stays out of it, so that a run with
+  // nothing else to write starts no label-apply; it is recorded as it was read.
+  const domainOf = new Map(runNotes.map((n) => [n.path, n.domain]));
+  const held = exceptions.filter((e) => domainOf.get(e.path) === e.label);
+  const heldPaths = new Set(held.map((e) => e.path));
+  const order = new Map(runNotes.map((n, i) => [n.path, i]));
+  const digestOf = new Map(runNotes.map((n) => [n.path, n.digest]));
+  const entries = [...planned].filter(([path]) => !heldPaths.has(path)).sort(([a], [b]) => order.get(a) - order.get(b))
+    .map(([path, p]) => ({ path, label: p.label, sha256: digestOf.get(path) }));
+  const nothing = batches.length === 0 && entries.length === 0;
   if (opts.dryRun) {
     const changes = results.reduce((n, r) => n + r.labels.length, 0);
     say(nothing ? 'label: nothing to do' : `label: dry-run, ${changes} label(s) to set or change, ${figures}`);
@@ -1648,33 +1666,29 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
     return { failed };
   }
 
-  // The plan: every label planned, in the order the notes were read, each with the digest it was read with.
-  const order = new Map(runNotes.map((n, i) => [n.path, i]));
-  const digestOf = new Map(runNotes.map((n) => [n.path, n.digest]));
-  const entries = [...planned].sort(([a], [b]) => order.get(a) - order.get(b))
-    .map(([path, p]) => ({ path, label: p.label, sha256: digestOf.get(path) }));
   let outcome = { applied: null, headline: nothing ? 'label: nothing to do' : `label: nothing written, ${figures}`, details: [], failed: false };
   if (entries.length > 0) {
     if (await signalsHandled()) return { failed };
-    outcome = await applyLabelPlan({ config, work, entries, report, figures });
+    outcome = await applyLabelPlan({ config, work, entries, report, figures, held: held.length });
     if (outcome.interrupted) return { failed };
   }
   failed ||= outcome.failed;
   const { applied } = outcome;
 
-  // The record: what label-apply wrote or found labeled, and on a first run what was labeled
-  // already. A note the run took but did not record (a failed batch, a stop, a failed step) loses
-  // its entry, which still matches it after --all, so that the next run sends it. A run that read
-  // only some scopes keeps the entries of the others.
+  // The record: what label-apply wrote or found labeled, the exceptions that held, and on a first
+  // run what was labeled already. A note the run took but did not record (a failed batch, a stop, a
+  // failed step) loses its entry, which still matches it after --all, so that the next run sends
+  // it. A run that read only some scopes keeps the entries of the others.
   const done = ['applied', 'no-change', 'apply-interrupted'].includes(applied?.outcome) ? applied : { written: [], unchanged: [] };
   const recorded = (list) => (list ?? []).map((x) => ({ path: x.path, digest: x.sha256 }));
-  const kept = new Set([...(done.written ?? []), ...(done.unchanged ?? [])].map((x) => x.path));
+  const unchanged = [...held.map((e) => ({ path: e.path, digest: e.digest })), ...recorded(done.unchanged)];
+  const kept = new Set([...(done.written ?? []), ...unchanged].map((x) => x.path));
   const readFolders = readNames.map(scopeFolder);
   const elsewhere = readAll ? [] : Object.keys(record ?? {}).filter((path) => !readFolders.includes(notesFolderOf(path)));
   state.labels = {
     version: 1,
     notes: nextLabelRecord(record, {
-      present: [...listed.map((n) => n.path), ...elsewhere], written: recorded(done.written), unchanged: recorded(done.unchanged), confirmed,
+      present: [...listed.map((n) => n.path), ...elsewhere], written: recorded(done.written), unchanged, confirmed,
       left: touched.map((n) => n.path).filter((path) => !kept.has(path)),
     }),
   };
@@ -1689,16 +1703,21 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   }
   writeState(config, state);
   say(outcome.headline);
-  if (sections !== '') process.stdout.write(labelReport(results, { reasons: false }));
+  // After a label-apply that failed, the plan's labels were not written (or which were is not
+  // known): the lists would say otherwise. The headline and its reason say what happened.
+  const planApplied = entries.length === 0 || applied?.outcome === 'applied' || applied?.outcome === 'no-change';
+  if (sections !== '' && planApplied) process.stdout.write(labelReport(results, { reasons: false }));
   for (const line of outcome.details) say(line);
   return { failed };
 }
 
 // Writes the plan and runs label-apply on it: the step's result (`applied`, null when it ended
-// without one), the headline and the lines to print, and whether the step failed the pass.
+// without one), the headline and the lines to print, and whether the step failed the pass. `held`:
+// the exceptions left out of the plan because their notes hold their labels; the headline counts
+// them as unchanged.
 // `interrupted` when a signal killed the step, which is possible only before its handlers existed,
 // so before it did anything (see stepMain). A step that finished stands, signal or not.
-async function applyLabelPlan({ config, work, entries, report, figures }) {
+async function applyLabelPlan({ config, work, entries, report, figures, held }) {
   const planText = `${JSON.stringify({ entries, report }, null, 2)}\n`;
   writeFileSync(join(work, 'label-plan.json'), planText, { mode: 0o600, flag: 'wx' });
   const step = runStep(['label-apply', '--work', work, '--plan-sha256', sha256(planText)]);
@@ -1717,7 +1736,7 @@ async function applyLabelPlan({ config, work, entries, report, figures }) {
     if (o === 'applied' && applied.sync && !applied.sync.ok) {
       details.push(`  - push pending: the sync after writing failed (${applied.sync.error ?? 'unknown error'}); the next sync retries`);
     }
-    const headline = `label: ${o}, ${applied.written.length} label(s) written, ${applied.unchanged.length} unchanged${notWritten}, ${figures}`;
+    const headline = `label: ${o}, ${applied.written.length} label(s) written, ${applied.unchanged.length + held} unchanged${notWritten}, ${figures}`;
     return { applied, headline, details, failed: false };
   }
   if (o === 'sync-failed') {

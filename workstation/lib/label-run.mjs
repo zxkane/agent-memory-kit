@@ -209,12 +209,30 @@ export function labelResults({ scopes, notes, planned, left, exceptions }) {
   });
 }
 
+// For a run over every scope: one result per scope that the domains file's `exceptions` name, that
+// is one of the pass's own (`own(scope)`), and that the run did not read (not among `scopes`): a
+// project folder, or an agent scope, that does not exist, often a typo. Its exceptions are listed as
+// naming no note; it has no counts.
+export function unreadScopeResults({ scopes, exceptions, own }) {
+  const read = new Set(scopes);
+  const unread = new Map();
+  for (const path of [...exceptions.keys()].sort(byName)) {
+    const scope = scopeOf(path);
+    if (read.has(scope) || !own(scope)) continue;
+    if (!unread.has(scope)) unread.set(scope, []);
+    unread.get(scope).push(path);
+  }
+  return [...unread].sort(([a], [b]) => byName(a, b))
+    .map(([scope, unmatched]) => ({ scope, labels: [], counts: null, left: [], repair: [], unmatched }));
+}
+
 // A path or a reason that looks like a credential is not shown.
 const shown = (text, what) => (scanText(String(text)).length > 0 ? `(${what} withheld)` : String(text));
 
 // The report of a run: for each scope with something to say, the labels set or changed (old to
-// new; with `reasons`, the model's reason), the counts of its labels after the run, the notes left
-// for the next run and why, and the exceptions that name no note. '' when no scope has anything.
+// new; with `reasons`, the model's reason), the counts of its labels after the run (none for a
+// scope the run did not read), the notes left for the next run and why, and the exceptions that
+// name no note. '' when no scope has anything.
 export function labelReport(results, { reasons = true } = {}) {
   const sections = [];
   for (const r of results) {
@@ -230,7 +248,7 @@ export function labelReport(results, { reasons = true } = {}) {
       return line;
     }));
     const c = r.counts;
-    parts.push(`Labels after this run: ${c.work} work, ${c.personal} personal, ${c.general} general${c.unlabeled > 0 ? `, ${c.unlabeled} unlabeled` : ''}`);
+    if (c !== null) parts.push(`Labels after this run: ${c.work} work, ${c.personal} personal, ${c.general} general${c.unlabeled > 0 ? `, ${c.unlabeled} unlabeled` : ''}`);
     list('Left for the next run:', r.left.map((l) => `- ${shown(l.path, 'file name')}: ${l.why}`));
     list("Left for Organize's repair:", r.repair.map((l) => `- ${shown(l.path, 'file name')}: ${l.why}`));
     list('Exceptions that name no note:', r.unmatched.map((path) => `- ${shown(path, 'file name')}`));
