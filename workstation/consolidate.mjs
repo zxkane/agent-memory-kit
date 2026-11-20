@@ -1,9 +1,11 @@
 // Consolidation: lets a model tidy the notes (organize) or add what recent conversations show
-// (extract), one scope at a time, on a private copy. Started through `run.sh consolidate`, which
-// holds consolidate.lock. Everything that reads or writes the clone runs as a locked step
+// (extract), one scope at a time, on a private copy, and gives every note its label (label, also at
+// the end of every organize run). Started through `run.sh consolidate`, which holds
+// consolidate.lock. Everything that reads or writes the clone runs as a locked step
 // (`run.sh consolidate-step scan|snapshot|apply`, and `label-read|label-apply` for the labels, under
 // the sync lock); the model only ever sees the work folder, and its result is applied only when the
-// rules in lib/workdir.mjs accept it.
+// rules in lib/workdir.mjs accept it. The label model sees only the notes it labels, and code writes
+// the labels.
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -19,9 +21,12 @@ import {
 } from './lib/agent-scopes.mjs';
 import { AwsError } from './lib/aws.mjs';
 import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
+import { readLabelInputs } from './lib/domains.mjs';
+import { labelBatch, labelToken } from './lib/label-client.mjs';
 import {
   applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, labelEntryProblem,
 } from './lib/label-notes.mjs';
+import { labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched } from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
@@ -48,7 +53,7 @@ const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
-const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>]';
+const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>]';
 const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
 const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -522,6 +527,9 @@ function stepLabelRead(config, rest) {
   if (!named.every((name) => name === GLOBAL || isPlainName(name))) throw new Error('invalid scope');
   const work = checkWork(config, a['--work']);
   if (readdirSync(work).length > 0) throw new Error('the work folder is not empty');
+  // A label run has no scan step before it, which would say this.
+  const problem = cloneProblem(config);
+  if (problem) throw new Error(problem);
   const sync = syncInfo(writeStatus(config, runSync(config)));
   if (!sync.ok) {
     out({ outcome: 'sync-failed', sync });
@@ -665,14 +673,22 @@ function stepMain(args) {
 
 // ---- Driver ----
 
+// The kinds of run the driver starts: the model runs on the notes (KINDS, which the locked steps
+// take too) and `label`, the label pass on its own.
+const DRIVER_KINDS = [...KINDS, 'label'];
+
 function parseDriverArgs(argv) {
   const [kind, ...rest] = argv;
-  if (!KINDS.includes(kind)) return null;
-  const opts = { kind, projects: [], agents: false, agentNames: [], dryRun: false, keep: false, model: undefined, minRetention: undefined };
+  if (!DRIVER_KINDS.includes(kind)) return null;
+  const opts = {
+    kind, projects: [], agents: false, agentNames: [], all: false, dryRun: false, keep: false, model: undefined, minRetention: undefined,
+  };
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === '--dry-run') {
       opts.dryRun = true;
+    } else if (arg === '--all') {
+      opts.all = true;
     } else if (arg === '--keep') {
       opts.keep = true;
     } else if (arg === '--project') {
@@ -699,6 +715,9 @@ function parseDriverArgs(argv) {
     }
   }
   if (kind === 'extract' && opts.projects.includes(GLOBAL)) return null;
+  // --all (a full relabel) belongs to label, --min-retention to Extract and Organize.
+  if (opts.all && kind !== 'label') return null;
+  if (kind === 'label' && opts.minRetention !== undefined) return null;
   // The agent scopes are organized only, and never together with the clone's scopes.
   if (opts.agents && (kind !== 'organize' || opts.projects.length > 0)) return null;
   return opts;
@@ -1442,6 +1461,265 @@ function printScope(kind, scope, res, opts, repoDir) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
+// ---- The label pass: a label for the notes of the clone (`label`, and the end of `organize`) ----
+
+// The pass's work folder in the run folder. A project folder's name never starts with a dot
+// (isPlainName), so it is never the work folder of an Organize scope of the same run.
+const LABEL_WORK = '.label';
+
+// The record of what the label pass last saw (`labels` in consolidate.json): path -> SHA-256 of the
+// note as the pass wrote, found or confirmed it. Null without one, or with one of another version:
+// the run is then a first run.
+function labelRecordOf(state) {
+  const labels = state.labels;
+  if (!isObject(labels) || labels.version !== 1 || !isObject(labels.notes)) return null;
+  return Object.fromEntries(Object.entries(labels.notes).filter(([, digest]) => typeof digest === 'string' && HASH_RE.test(digest)));
+}
+
+const notesFolderOf = (path) => path.slice(0, path.lastIndexOf('/'));
+
+// The label pass over the clone's scopes: `scopes` names some (`global` or project folders), none
+// means every scope. It reads the notes (label-read), sends the touched ones to the label model in
+// batches until the pass's cost ceiling (maxBudgetUsd), writes their labels and the exceptions'
+// (label-apply), records what it saw in `state.labels`, and moves Organize's record of each scope
+// it wrote into, where that was the content it found. Prints what it did. `failed`: the inputs are
+// missing or invalid, no token could be made, a batch failed, or a step failed. A signal stops it
+// before label-apply, with nothing written.
+async function labelPass({ config, opts, state, scopes, runFolder }) {
+  const c = config.consolidate;
+  // In an Organize run --model names the Organize model; in a label run, the label model.
+  const label = { ...c.label, model: opts.kind === 'label' ? opts.model ?? c.label.model : c.label.model };
+  const say = (line) => process.stdout.write(`${line}\n`);
+  const inputs = readLabelInputs({
+    domainsFile: c.label.domainsFile ?? join(config.repoDir, '.agent-memory', 'domains.json'),
+    personaFile: c.label.personaFile ?? join(config.repoDir, '.agent-memory', 'persona.md'),
+  });
+  if (inputs.problem) {
+    say(`label: the label inputs are missing or invalid (${inputs.problem}); no label was written.`);
+    return { failed: true };
+  }
+  const work = join(runFolder(), LABEL_WORK);
+  mkdirSync(work, { mode: 0o700 });
+  chmodSync(work, 0o700);
+  try {
+    return await labelScopes({ config, opts, state, scopes, label, ...inputs, work, say });
+  } finally {
+    if (opts.keep) say(`  work folder kept: ${work}\n  it holds the text of the notes; delete it when you are done`);
+  }
+}
+
+async function labelScopes({ config, opts, state, scopes, label, domains, persona, work, say }) {
+  const record = labelRecordOf(state);
+  // A first run reads every scope, whatever the run names, so that it records every label it finds.
+  const readAll = scopes.length === 0 || record === null;
+  const readStep = runStep(['label-read', '--work', work, ...(readAll ? [] : scopes.flatMap((name) => ['--scope', name]))]);
+  if (await signalsHandled()) return { failed: false };
+  const read = readStep.result;
+  if (read?.outcome === 'sync-failed') {
+    say(`label: sync-failed, no label was written\n  - the sync before reading the notes failed: ${read.sync?.error ?? 'unknown error'}`);
+    return { failed: false };
+  }
+  if (read?.outcome !== 'label-read') {
+    if (read?.outcome === 'error') say(`label: error, no label was written\n  - the label-read step failed: ${read.error ?? 'unknown error'}`);
+    else say(`label: step-failed, no label was written\n  - the label-read step could not run${lockTimedOut(readStep) ? ': the wait for the sync lock timed out' : ''}`);
+    return { failed: true };
+  }
+  const data = JSON.parse(readFileSync(join(work, 'label-notes.json'), 'utf8'));
+  if (!Array.isArray(data?.notes) || !isObject(data.digests)) throw new Error('label-notes.json does not hold what label-read writes');
+  const listed = data.notes.map((n) => ({
+    path: n.path, scope: n.scope, digest: n.sha256, domain: n.domain, name: n.name, description: n.description, body: n.body, skip: n.skip,
+  }));
+  const readNames = Object.keys(data.digests);
+  for (const name of scopes) if (!readNames.includes(name)) say(`label: no folder for project ${name}; nothing labeled there.`);
+  const runScopes = (scopes.length === 0 ? readNames : readNames.filter((name) => scopes.includes(name))).map(scopeFolder);
+  const inRun = (n) => runScopes.includes(n.scope);
+  // Only notes whose frontmatter the pass can edit go to the model or take an exception.
+  const editable = listed.filter((n) => n.skip === null);
+  const runNotes = editable.filter(inRun);
+  const { touched } = selectTouched({ notes: runNotes, record, all: opts.all });
+  const sent = new Set(touched.map((n) => n.path));
+  // On a first run the labeled notes of every scope read are recorded as they are, except those
+  // that --all sends to the model.
+  const confirmed = selectTouched({ notes: editable, record, all: false }).confirmed.filter((x) => !sent.has(x.path));
+  const { exceptions, batches } = planLabelBatches({ notes: runNotes, touched, domains, batchNotes: label.batchNotes });
+
+  const asked = await askLabelModel({ batches, label, persona, ceiling: config.consolidate.maxBudgetUsd, say });
+  // Interrupted: nothing is written, and every note stays as it is.
+  if (asked.interrupted) return { failed: asked.failed };
+  let failed = asked.failed;
+  const planned = new Map([...exceptions.map((e) => [e.path, { label: e.label, reason: null, exception: true }]), ...asked.planned]);
+  const results = labelResults({ scopes: runScopes, notes: listed.filter(inRun), planned, left: asked.left, exceptions: domains.exceptions });
+  const sections = labelReport(results, { reasons: true });
+  const report = [
+    `# Labels — ${new Date().toISOString().slice(0, 10)} on ${config.host}`, '',
+    `- Model: ${label.model}; requests: ${asked.requests}; cost: ${usd(asked.spent)}`,
+    `- Notes: ${touched.length} touched, ${asked.sent} sent to the model, ${exceptions.length} with an exception, ${confirmed.length} recorded as they were`,
+    ...(sections === '' ? [] : ['', sections.trimEnd()]),
+  ].join('\n').concat('\n');
+  const figures = `${usd(asked.spent)}, ${asked.requests} request(s)`;
+  const nothing = batches.length === 0 && exceptions.length === 0;
+  if (opts.dryRun) {
+    const changes = results.reduce((n, r) => n + r.labels.length, 0);
+    say(nothing ? 'label: nothing to do' : `label: dry-run, ${changes} label(s) to set or change, ${figures}`);
+    process.stdout.write(report);
+    return { failed };
+  }
+
+  // The plan: every label planned, in the order the notes were read, each with the digest it was read with.
+  const order = new Map(runNotes.map((n, i) => [n.path, i]));
+  const digestOf = new Map(runNotes.map((n) => [n.path, n.digest]));
+  const entries = [...planned].sort(([a], [b]) => order.get(a) - order.get(b))
+    .map(([path, p]) => ({ path, label: p.label, sha256: digestOf.get(path) }));
+  let outcome = { applied: null, headline: nothing ? 'label: nothing to do' : `label: nothing written, ${figures}`, details: [], failed: false };
+  if (entries.length > 0) {
+    if (await signalsHandled()) return { failed };
+    outcome = await applyLabelPlan({ config, work, entries, report, figures });
+    if (outcome.interrupted) return { failed };
+  }
+  failed ||= outcome.failed;
+  const { applied } = outcome;
+
+  // The record: what label-apply wrote or found labeled, and on a first run what was labeled
+  // already. A run that read only some scopes keeps the entries of the others.
+  const done = ['applied', 'no-change', 'apply-interrupted'].includes(applied?.outcome) ? applied : { written: [], unchanged: [] };
+  const recorded = (list) => (list ?? []).map((x) => ({ path: x.path, digest: x.sha256 }));
+  const readFolders = readNames.map(scopeFolder);
+  const elsewhere = readAll ? [] : Object.keys(record ?? {}).filter((path) => !readFolders.includes(notesFolderOf(path)));
+  state.labels = {
+    version: 1,
+    notes: nextLabelRecord(record, {
+      present: [...listed.map((n) => n.path), ...elsewhere], written: recorded(done.written), unchanged: recorded(done.unchanged), confirmed,
+    }),
+  };
+  // Labels never make a scope due for Organize: its record moves with them where it was the
+  // content label-apply found before writing. `after` is null when anything else changed the
+  // folder meanwhile; the scope then stays due, as does a scope that was due already.
+  if (applied?.outcome === 'applied' || applied?.outcome === 'no-change') {
+    for (const [name, d] of Object.entries(applied.digests ?? {})) {
+      const entry = state.projects[name];
+      if (entry && isObject(d) && HASH_RE.test(d.after ?? '') && entry.organizedDigest === d.before) entry.organizedDigest = d.after;
+    }
+  }
+  writeState(config, state);
+  say(outcome.headline);
+  if (sections !== '') process.stdout.write(labelReport(results, { reasons: false }));
+  for (const line of outcome.details) say(line);
+  return { failed };
+}
+
+// The model's labels for the batches, one request each, until the pass's cost `ceiling`: `planned`
+// (path -> { label, reason, exception: false }), `left` (path -> why it was not labeled), what was
+// spent and sent. `failed` when no token could be made or a batch failed; `interrupted` when a
+// signal stopped it. One token for the run, and only when there is a batch to send.
+async function askLabelModel({ batches, label, persona, ceiling, say }) {
+  const asked = { planned: new Map(), left: new Map(), failed: false, interrupted: false, spent: 0, requests: 0, sent: 0 };
+  const leave = (list, why) => list.forEach((b) => b.notes.forEach((n) => asked.left.set(n.path, why)));
+  if (batches.length === 0) return asked;
+  let token;
+  try {
+    token = await labelToken(label);
+  } catch (err) {
+    say(`label: the label token could not be made (${awsText(err)}); no note was sent to the model.`);
+    leave(batches, 'not sent; the label token could not be made');
+    asked.failed = true;
+    asked.interrupted = (await signalsHandled()) !== null;
+    return asked;
+  }
+  for (const [i, batch] of batches.entries()) {
+    if (await signalsHandled()) {
+      asked.interrupted = true;
+      return asked;
+    }
+    if (asked.spent >= ceiling) {
+      say(`label: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}`);
+      leave(batches.slice(i), 'not sent; the model cost of this run reached its ceiling');
+      break;
+    }
+    const res = await labelBatch({ notes: batch.notes, persona, label, token, signal: abort.signal });
+    asked.spent += res.costUsd;
+    asked.requests += res.requests;
+    asked.sent += batch.notes.length;
+    if (await signalsHandled()) {
+      asked.interrupted = true;
+      return asked;
+    }
+    if (!res.ok) {
+      asked.failed = true;
+      leave([batch], `the model call failed (${res.error})`);
+      continue;
+    }
+    for (const n of batch.notes) {
+      const answer = res.labels.get(n.id);
+      asked.planned.set(n.path, { label: answer.label, reason: answer.reason || null, exception: false });
+    }
+  }
+  return asked;
+}
+
+// Writes the plan and runs label-apply on it: the step's result (`applied`, null when it ended
+// without one), the headline and the lines to print, and whether the step failed the pass.
+// `interrupted` when a signal killed the step, which is possible only before its handlers existed,
+// so before it did anything (see stepMain). A step that finished stands, signal or not.
+async function applyLabelPlan({ config, work, entries, report, figures }) {
+  const planText = `${JSON.stringify({ entries, report }, null, 2)}\n`;
+  writeFileSync(join(work, 'label-plan.json'), planText, { mode: 0o600, flag: 'wx' });
+  const step = runStep(['label-apply', '--work', work, '--plan-sha256', sha256(planText)]);
+  await signalsHandled();
+  const applied = step.result;
+  if (!applied && !lockTimedOut(step) && INTERRUPT_SIGNALS.includes(step.signal)) {
+    onSignal(step.signal);
+    return { interrupted: true };
+  }
+  const o = applied?.outcome;
+  const nothing = `no label was written, ${figures}`;
+  if (o === 'applied' || o === 'no-change') {
+    const notWritten = applied.skipped.length > 0 ? `, ${applied.skipped.length} not written` : '';
+    const details = applied.skipped.map((s) => `  - not written: ${shown(s.path)} (${s.reason})`);
+    if (applied.reportError) details.push(`  - the report could not be written: ${applied.reportError}`);
+    if (o === 'applied' && applied.sync && !applied.sync.ok) {
+      details.push(`  - push pending: the sync after writing failed (${applied.sync.error ?? 'unknown error'}); the next sync retries`);
+    }
+    const headline = `label: ${o}, ${applied.written.length} label(s) written, ${applied.unchanged.length} unchanged${notWritten}, ${figures}`;
+    return { applied, headline, details, failed: false };
+  }
+  if (o === 'sync-failed') {
+    return { applied, headline: `label: sync-failed, ${nothing}`, details: [`  - the sync before writing failed: ${applied.sync?.error ?? 'unknown error'}`], failed: false };
+  }
+  const fail = (headline, line) => ({ applied, headline, details: [line], failed: true });
+  if (!applied && lockTimedOut(step)) return fail(`label: step-failed, ${nothing}`, '  - the label-apply step could not run: the wait for the sync lock timed out');
+  if (!applied) {
+    return fail(`label: apply interrupted, labels may have been written, ${figures}`, '  - the label-apply step ended without reporting its result;'
+      + ` look at the log of the notes repository (git -C ${config.repoDir} log) for a consolidate(...) commit, and at its working tree`);
+  }
+  if (o === 'apply-interrupted') {
+    return fail(`label: apply interrupted, labels may have been written, ${figures}`,
+      `  - ${applied.reason ?? 'a write failed'}; the labels written before it are committed by the next sync`);
+  }
+  if (o === 'rejected') return fail(`label: rejected, ${nothing}`, `  - ${applied.reason ?? 'the plan was refused'}`);
+  return fail(`label: error, ${nothing}`, `  - the label-apply step failed: ${applied.error ?? 'unknown error'}`);
+}
+
+// `run.sh consolidate label`: the label pass on its own.
+async function labelMain({ config, opts, started }) {
+  if (!config.consolidate.label) {
+    process.stdout.write(`agent-memory: labeling needs "label" in the consolidate block of ${configPath()}; nothing was run.\n`);
+    return 1;
+  }
+  const state = readState(config, started);
+  let runDir = null;
+  let pass;
+  try {
+    pass = await labelPass({ config, opts, state, scopes: opts.projects, runFolder: () => (runDir ??= makeRunDir(config, started, opts.keep)) });
+  } finally {
+    if (runDir && !opts.keep) removeTree(runDir);
+  }
+  if (await signalsHandled()) {
+    process.stdout.write(`label: interrupted by ${interrupted}; nothing more was applied\n`);
+    return SIGNAL_CODES[interrupted];
+  }
+  return pass.failed ? 1 : 0;
+}
+
 async function driverMain(argv) {
   const opts = parseDriverArgs(argv);
   if (!opts) {
@@ -1466,6 +1744,7 @@ async function driverMain(argv) {
   const now = started.getTime();
   removeStaleRuns(config, now);
   if (opts.agents) return agentsMain({ config, opts, model, started });
+  if (opts.kind === 'label') return labelMain({ config, opts, started });
   if (opts.kind === 'extract' && config.codexDir === null) {
     process.stdout.write(`agent-memory consolidate: codexDir in ${configPath()} is not an absolute path; Codex sessions are not read.\n`);
   }
@@ -1502,6 +1781,7 @@ async function driverMain(argv) {
   let calls = 0;
   let spent = 0;
   let runDir = null;
+  const runFolder = () => (runDir ??= makeRunDir(config, started, opts.keep));
   let failed = false;
   try {
     for (const item of list) {
@@ -1522,9 +1802,8 @@ async function driverMain(argv) {
           continue;
         }
       }
-      runDir ??= makeRunDir(config, started, opts.keep);
       calls += 1;
-      const res = await runScope({ config, opts, model, runDir, scope: item.scope, digest });
+      const res = await runScope({ config, opts, model, runDir: runFolder(), scope: item.scope, digest });
       if (digest) res.conversation = conversationOf(digest);
       digest = null;
       spent += spentBy(res, c);
@@ -1549,6 +1828,15 @@ async function driverMain(argv) {
         }
       }
     }
+    if (!(await signalsHandled())) {
+      if (list.length === 0) process.stdout.write(`${opts.kind}: nothing to do\n`);
+      // Every Organize run that was not interrupted ends with the label pass over its scopes,
+      // whatever Organize did. A failed pass fails the run.
+      if (opts.kind === 'organize' && c.label) {
+        const pass = await labelPass({ config, opts, state, scopes: opts.projects, runFolder });
+        if (pass.failed) failed = true;
+      }
+    }
   } finally {
     if (runDir && !opts.keep) removeTree(runDir);
   }
@@ -1556,7 +1844,6 @@ async function driverMain(argv) {
     process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
-  if (list.length === 0) process.stdout.write(`${opts.kind}: nothing to do\n`);
   return failed ? 1 : 0;
 }
 

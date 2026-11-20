@@ -72,6 +72,17 @@ test('collectScopeNotes names the notes whose frontmatter setDomain cannot edit'
   ]);
 });
 
+test('collectScopeNotes names a note that is not UTF-8 text', (t) => {
+  const dir = tempDir(t);
+  const bytes = Buffer.concat([Buffer.from(`${LABELED('work')}Caf`), Buffer.from([0xe9]), Buffer.from('.\n')]);
+  writeFileSync(join(dir, 'a.md'), bytes);
+  writeFileSync(join(dir, 'b.md'), `${HEAD}Café.\n`);
+  const [latin, utf8] = collectScopeNotes(dir, 'global');
+  // setDomain would write the text back with U+FFFD in place of the byte: such a note is never labeled.
+  assert.deepEqual([latin.path, latin.skip, latin.sha256], ['global/a.md', 'not UTF-8 text', sha(bytes)]);
+  assert.deepEqual([utf8.path, utf8.skip], ['global/b.md', null]);
+});
+
 test('applyLabelEntries keeps the mode of a note and leaves no temporary file', (t) => {
   const repo = repoWith(t, { 'projects/p/a.md': `${HEAD}Alpha.\n`, 'projects/p/b.md': `${HEAD}Beta.\n` });
   chmodSync(join(repo, 'projects/p/a.md'), 0o640);

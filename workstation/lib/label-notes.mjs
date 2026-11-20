@@ -37,16 +37,19 @@ export function capped(text) {
 
 // The notes of a scope folder that the label step takes, sorted by file name: its regular note
 // files except the index, a retired note (a `MOVED TO` stub) and a conflict copy. `scope` is
-// `global` or `projects/<name>`. `skip` is why setDomain cannot label the note (null when it can).
+// `global` or `projects/<name>`. `skip` is why the note cannot be labeled (null when it can): its
+// bytes are not UTF-8 text, which setDomain would not write back as they are (labelNote), or
+// setDomain cannot edit its frontmatter.
 export function collectScopeNotes(dir, scope) {
   const notes = [];
   for (const [file, buf] of noteFiles(dir)) {
     const text = buf.toString('utf8');
     if (file === INDEX || CONFLICT_RE.test(file) || stubTarget(text) !== null) continue;
     const { name, description } = parseNote(text);
+    const skip = Buffer.from(text, 'utf8').equals(buf) ? setDomain(text, 'general').skip ?? null : 'not UTF-8 text';
     notes.push({
       path: `${scope}/${file}`, scope, file, sha256: sha256(buf), domain: readDomain(text), name, description,
-      body: capped(bodyOf(text)), skip: setDomain(text, 'general').skip ?? null,
+      body: capped(bodyOf(text)), skip,
     });
   }
   return notes;
