@@ -177,13 +177,14 @@ export function tagLine(line, label) {
   return `${m.groups.link} — ${tag}${hook.slice(start.length)}`;
 }
 
-// Tags every index line by the label of the note it links in `dir`. A note that cannot be read (also a link, a
-// FIFO or a file over MAX_NOTE_BYTES) leaves its line as it was.
+// Tags every index line by the label of the note it links in `dir`. A note that cannot be read (missing, a link,
+// not a regular file such as a FIFO, or over MAX_NOTE_BYTES) counts as unlabeled, as a note without a label does
+// in the memory API: its line gets no tag, and a run of tags written there is removed.
 export function tagIndexLines(lines, dir) {
   return lines.map(line => {
     const m = TAG_LINE_RE.exec(line);
     if (!m) return line;
     const note = readText(join(dir, m.groups.file), MAX_NOTE_BYTES);
-    return note === null ? line : tagLine(line, readDomain(note));
+    return tagLine(line, note === null ? null : readDomain(note));
   });
 }

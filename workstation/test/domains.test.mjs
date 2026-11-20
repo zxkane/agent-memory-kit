@@ -333,17 +333,23 @@ test('tagIndexLines reads each linked note of the folder', t => {
   ]);
 });
 
-test('tagIndexLines leaves the line of a note it may not read as it was', t => {
+test('tagIndexLines takes a note it may not read as unlabeled', t => {
   const dir = tmp(t);
   const labeled = NOTE.replace('  originSessionId: x', '  domain: work');
   writeFileSync(join(dir, 'real.md'), labeled);
   symlinkSync(join(dir, 'real.md'), join(dir, 'link.md'));
   // Over the size limit, even with its label in the first lines.
   writeFileSync(join(dir, 'big.md'), labeled + 'x'.repeat(1024 * 1024));
-  writeFileSync(join(dir, 'MEMORY.md'), '- [L](link.md) — [personal] about l\n- [B](big.md) — about b\n- [R](real.md) — about r\n');
+  mkdirSync(join(dir, 'dir.md'));
+  // A link, a file over the limit, a folder and a missing note get no tag, and the author's run goes.
+  writeFileSync(join(dir, 'MEMORY.md'), [
+    '- [L](link.md) — [personal] about l', '- [B](big.md) — [work] about b', '- [D](dir.md) — [personal] about d',
+    '- [M](gone.md) — [work] about m', '- [R](real.md) — about r', '',
+  ].join('\n'));
   const index = readFileSync(join(dir, 'MEMORY.md'), 'utf8');
   assert.deepEqual(tagIndexLines(index.split('\n'), dir), [
-    '- [L](link.md) — [personal] about l', '- [B](big.md) — about b', '- [R](real.md) — [work] about r', '',
+    '- [L](link.md) — about l', '- [B](big.md) — about b', '- [D](dir.md) — about d', '- [M](gone.md) — about m',
+    '- [R](real.md) — [work] about r', '',
   ]);
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), index, 'MEMORY.md itself is never written');
 });
@@ -354,9 +360,10 @@ test('tagIndexLines refuses a FIFO in place of a note without waiting for a writ
   // In a child process with a time limit: a read that waited on the FIFO would hang the test run.
   const url = new URL('../lib/domains.mjs', import.meta.url).href;
   const code = `import { tagIndexLines } from ${JSON.stringify(url)};\n`
-    + `process.stdout.write(JSON.stringify(tagIndexLines(['- [F](f.md) — about f'], ${JSON.stringify(dir)})));`;
+    + `process.stdout.write(JSON.stringify(tagIndexLines(['- [F](f.md) — [work] about f'], ${JSON.stringify(dir)})));`;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 10_000 });
   assert.equal(r.signal, null, 'the read did not wait');
   assert.equal(r.status, 0, r.stderr);
+  // The FIFO counts as an unlabeled note: no tag, and the author's run goes.
   assert.deepEqual(JSON.parse(r.stdout), ['- [F](f.md) — about f']);
 });
