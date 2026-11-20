@@ -24,29 +24,29 @@ import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
 import { readLabelInputs } from './lib/domains.mjs';
 import { labelBatch, tokenForRun } from './lib/label-client.mjs';
 import {
-  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, digestsOf, fileDigests, folderDigest, labelEntryProblem,
+  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, folderDigest, labelEntryProblem,
 } from './lib/label-notes.mjs';
 import {
   askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, plannedLabels, selectTouched, unreadScopeResults,
 } from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
-import { scanText } from './lib/secret-scan.mjs';
+import { buildReport, labelReportHead, shown, usd } from './lib/reports.mjs';
+import {
+  GLOBAL, INDEX_MAX_BYTES, INDEX_MAX_LINES, cloneProblem, isPlainName, listProjects, liveFolder, lstatOrNull, organizeScopes, projectsDir,
+  scopeFolder, scopeInfo, timeOf,
+} from './lib/scopes.mjs';
 import { runSync, writeStatus } from './lib/sync-engine.mjs';
 import { buildDigest, codexProjectSessions, filesChangedSince, projectSessionDirs, sessionFilesSince } from './lib/transcripts.mjs';
-import { apply, evaluate, noteFiles, readRegular, snapshot } from './lib/workdir.mjs';
+import { apply, evaluate, readRegular, snapshot } from './lib/workdir.mjs';
 
 const RUN_SH = join(dirname(fileURLToPath(import.meta.url)), 'run.sh');
 const KINDS = ['extract', 'organize'];
-const GLOBAL = 'global';
-const INDEX_MAX_LINES = 200;
-const INDEX_MAX_BYTES = 25000;
 const DAY_MS = 24 * 3600 * 1000;
 const EXTRACT_LOOKBACK_MS = 7 * DAY_MS;
 // The session window of a project that was extracted before never reaches back further than this.
 const EXTRACT_MAX_WINDOW_MS = 28 * DAY_MS;
 const REPORT_KEEP_DAYS = 90;
-const REVISIT_MS = 28 * DAY_MS;
 const KEEP_MARKER = '.keep';
 // The read-only reference copy of the scope's notes that a repair run gets, in the work folder.
 const ORIGINAL = 'original';
@@ -56,25 +56,15 @@ const REPAIR_MIN_USD = 0.1;
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
 const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run]';
-const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
 const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const RETENTION_RE = /^(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)$/;
-const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 const isMissing = (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
-const usd = (value) => `USD ${value === null || value === undefined ? 'unknown' : value.toFixed(2)}`;
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const out = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
-
-// A folder name the driver may use as a project scope: no separator, not hidden, printable.
-// A project folder named `global` would be confused with the global scope and is never used.
-function isPlainName(name) {
-  return typeof name === 'string' && name.length > 0 && name.length <= 200 && !name.includes('/')
-    && !name.startsWith('.') && !CONTROL_RE.test(name) && name !== GLOBAL;
-}
 
 function parseRetention(value) {
   if (typeof value !== 'string' || !RETENTION_RE.test(value)) return null;
@@ -82,55 +72,7 @@ function parseRetention(value) {
   return Number.isFinite(n) && n >= 0 && n <= 1 ? n : null;
 }
 
-function lstatOrNull(path) {
-  try {
-    return lstatSync(path);
-  } catch (err) {
-    if (isMissing(err)) return null;
-    throw err;
-  }
-}
-
-function scopeInfo(dir) {
-  const files = noteFiles(dir);
-  const index = files.get(INDEX);
-  const stats = indexStats(index ? index.toString('utf8') : '');
-  const names = [...files.keys()];
-  return {
-    notes: names.filter((n) => n !== INDEX).length,
-    overLimit: stats.lines > INDEX_MAX_LINES || stats.bytes > INDEX_MAX_BYTES,
-    conflict: names.some((n) => CONFLICT_RE.test(n)),
-    digest: digestOfFiles(digestsOf(files)),
-  };
-}
-
 // ---- Folders of the clone that a run may touch ----
-
-function projectsDir(config) {
-  const dir = join(config.repoDir, 'projects');
-  return lstatOrNull(dir)?.isDirectory() ? dir : null;
-}
-
-// Plain, real folders directly under <repoDir>/projects.
-function listProjects(config) {
-  const dir = projectsDir(config);
-  if (!dir) return [];
-  return readdirSync(dir).filter((n) => isPlainName(n) && lstatOrNull(join(dir, n))?.isDirectory()).sort(byName);
-}
-
-// The live folder of a scope, or null when it may not be touched. global/ may be missing (an
-// apply creates it); a project folder must exist.
-function liveFolder(config, scope) {
-  if (scope === GLOBAL) {
-    const dir = join(config.repoDir, GLOBAL);
-    const st = lstatOrNull(dir);
-    return !st || st.isDirectory() ? dir : null;
-  }
-  const base = isPlainName(scope) ? projectsDir(config) : null;
-  if (!base) return null;
-  const dir = join(base, scope);
-  return lstatOrNull(dir)?.isDirectory() ? dir : null;
-}
 
 // Extract: the project folder. Organize: the scope folder, plus global/ for a project.
 function pairsFor(config, kind, scope, work) {
@@ -159,11 +101,6 @@ function checkWork(config, work) {
 }
 
 const syncInfo = (s) => ({ ok: s.ok, error: s.error ?? null, committed: s.committed ?? 0, pushed: !!s.pushed });
-
-// A name shown in output or in a report; one that looks like a credential is not shown.
-function shown(text) {
-  return scanText(String(text)).length > 0 ? '(file name withheld)' : String(text);
-}
 
 // What reached the model of an Extract run: whether the digest was cut, how large it is, and how
 // many qualifying sessions it left out entirely. Passed to the apply step as one argument.
@@ -205,19 +142,6 @@ function parseStepArgs(rest, valued, flags = [], repeated = []) {
   }
   for (const a of valued) if (!(a in opts)) throw new Error(`missing step argument ${a}`);
   return opts;
-}
-
-// Why the configured clone cannot be used, or null.
-function cloneProblem(config) {
-  let st = null;
-  try {
-    st = statSync(config.repoDir);
-  } catch (err) {
-    if (!isMissing(err)) throw err;
-  }
-  if (!st?.isDirectory()) return `the notes clone ${config.repoDir} does not exist`;
-  if (lstatOrNull(join(config.repoDir, '.git')) === null) return `${config.repoDir} is not a Git clone of the notes`;
-  return null;
 }
 
 // `--codex-since <ms>`: also the Codex sessions of each project changed after that time, the start
@@ -279,11 +203,6 @@ function validSnap(snap, pairs) {
   });
 }
 
-// `<label>/<file>` (as evaluate names it) shown relative to the scope: global/ keeps its prefix.
-function display(label, file) {
-  return label === GLOBAL ? `global/${file}` : file;
-}
-
 // Error lines of evaluate that name an entry which is not a note file quote its name, which the
 // model chose and which may hold any text. They are replaced by a count per folder.
 function safeErrors(errors, labels) {
@@ -301,71 +220,10 @@ function safeErrors(errors, labels) {
   return kept;
 }
 
-function splitLoc(entry) {
-  const slash = entry.indexOf('/');
-  return slash < 0 ? { label: 'notes', file: entry } : { label: entry.slice(0, slash), file: entry.slice(slash + 1) };
-}
-
 function cleanDescription(text) {
   const d = String(text ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
   if (d === '') return '(no description)';
   return d.length > 200 ? `${d.slice(0, 200)}…` : d;
-}
-
-function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired = 0 }) {
-  const title = `${kind[0].toUpperCase()}${kind.slice(1)}`;
-  const suffix = (label) => (label === GLOBAL ? ' (global/)' : '');
-  const changed = (label) => ev.changes.some((c) => c.label === label);
-  const labels = pairs.map((p) => p.label);
-  const shownLabels = labels.filter((l) => l === 'notes' || changed(l));
-  const lines = [`# ${title} ${scope} — ${date} on ${config.host}`, ''];
-  lines.push(`- Model: ${model}; turns: ${turns ?? 'unknown'}; cost: ${usd(costUsd)}; stopped: ${stopReason}; denials: ${denials ?? 'unknown'}`);
-  if (repaired > 0) lines.push(`- Repair: one repair run; the first check found ${repaired} problem(s)`);
-  if (conversation) {
-    lines.push(conversation.truncated
-      ? `- Conversation text: cut to ${conversation.bytes} bytes; ${conversation.sessionsLeftOut} session(s) left out`
-      : '- Conversation text: complete');
-  }
-  for (const l of shownLabels) {
-    const { indexBefore: b, indexAfter: a } = ev.stats[l];
-    lines.push(`- Index${suffix(l)}: ${b.lines} lines, ${b.bytes} bytes → ${a.lines} lines, ${a.bytes} bytes`);
-  }
-  for (const l of shownLabels) {
-    lines.push(`- Notes not listed in the index${suffix(l)}: ${ev.stats[l].unlistedBefore} → ${ev.stats[l].unlistedAfter}`);
-  }
-  for (const l of labels.filter(changed)) {
-    const s = ev.stats[l];
-    lines.push(`- Notes${suffix(l)}: ${s.notesBytesBefore} bytes → ${s.notesBytesAfter} bytes; retired: ${s.retiredBytes} bytes`);
-  }
-  const r = ev.stats.retention;
-  lines.push(`- Distinct terms kept: ${Math.floor(r.share * 100)}% (${r.termsKept} of ${r.termsBefore})`);
-  const order = (c) => `${labels.indexOf(c.label)}\u0000${c.file}`;
-  const sorted = [...ev.changes].sort((x, y) => byName(order(x), order(y)));
-  let first = true;
-  const section = (heading, items) => {
-    if (items.length === 0) return;
-    if (first) lines.push('');
-    first = false;
-    lines.push(`## ${heading}`, ...items);
-  };
-  section('Added', sorted.filter((c) => c.kind === 'add')
-    .map((c) => `- ${shown(display(c.label, c.file))} — ${descriptions.get(`${c.label}/${c.file}`) ?? '(no description)'}`));
-  section('Changed', sorted.filter((c) => c.kind === 'change').map((c) => `- ${shown(display(c.label, c.file))}`));
-  section('Retired', sorted.filter((c) => c.kind === 'retire')
-    .map((c) => `- ${shown(display(c.label, c.file))} → ${shown(display(c.target.label, c.target.file))}`));
-  // Entries that are not notes at all are counted per folder, never named.
-  const notNotes = labels.filter((l) => ev.ignoredEntries?.[l] > 0).map((l) => {
-    const n = ev.ignoredEntries[l];
-    const what = n === 1 ? '1 entry that is not a note file' : `${n} entries that are not note files`;
-    return `- ${l === GLOBAL ? 'global/' : ''}(${what}): ignored`;
-  });
-  section('Not applied', [...ev.ignored.map((entry) => {
-    const { label, file } = splitLoc(entry);
-    const known = snap[label] && Object.hasOwn(snap[label], file);
-    const why = known ? 'retiring a note is not part of an extract run' : 'a new file cannot be a retirement';
-    return `- ${display(label, file)}: ${why}`;
-  }), ...notNotes]);
-  return `${lines.join('\n')}\n`;
 }
 
 function writeReport(config, name, text) {
@@ -511,7 +369,6 @@ function stepApply(config, rest) {
 // The two locked steps of the label step. A scope is named as consolidate.json names it (`global`
 // or the project's folder name); the paths of its notes start with its folder (`global/`,
 // `projects/<name>/`).
-const scopeFolder = (name) => (name === GLOBAL ? GLOBAL : `projects/${name}`);
 const scopeOfPath = (path) => (path.startsWith('projects/') ? path.split('/')[1] : GLOBAL);
 // A scope folder of the clone (`global` or `projects/<name>`), not one of the agent scopes.
 const isCloneScope = (folder) => folder === GLOBAL || folder.startsWith('projects/');
@@ -783,11 +640,6 @@ function writeState(config, state) {
   }
 }
 
-const timeOf = (iso) => {
-  const t = typeof iso === 'string' ? Date.parse(iso) : NaN;
-  return Number.isFinite(t) ? t : null;
-};
-
 // Where a project's session window starts: at its last extract, but never more than
 // EXTRACT_MAX_WINDOW_MS back (a run that stopped early keeps lastExtract, and the window must not
 // grow without end); EXTRACT_LOOKBACK_MS back when it was never extracted.
@@ -829,56 +681,6 @@ function extractScopes(scan, state, opts, now) {
     list.sort((x, y) => older(x.tried, y.tried) || older(x.last, y.last) || y.newest - x.newest || byName(x.scope, y.scope));
   }
   return list;
-}
-
-// Organize: a scope with notes is due when its content changed since it was last organized (or
-// it never was). One that did not change but is still over the index limits or still holds a
-// conflict copy is due again only after REVISIT_MS: the model could not fix it last time, and
-// taking it every week would crowd out the scopes that changed.
-// Order, in two groups:
-// - A, every due scope except those of group B: by class (over the limits, then a conflict copy,
-//   then the others), then by lastOrganizeTried (falling back to lastOrganize), oldest first,
-//   never tried first;
-// - B, scopes whose last model run left them unorganized (lastOrganizeTried is set and lastOrganize
-//   is absent or older) within the last REVISIT_MS: after all of A, by lastOrganizeTried only,
-//   whatever their class, so that scopes failing every run rotate among themselves and cannot keep
-//   the others waiting. A failed try older than REVISIT_MS puts the scope back into group A, at the
-//   front of its class, so that it waits behind the others for at most REVISIT_MS.
-function organizeScopes(scan, state, opts, now) {
-  const infos = [...(scan.global.usable ? [{ name: GLOBAL, ...scan.global }] : []), ...scan.projects];
-  if (opts.projects.length > 0) return opts.projects.map((name) => ({ scope: name }));
-  const entry = (i) => state.projects[i.name];
-  const last = (i) => timeOf(entry(i)?.lastOrganize) ?? -Infinity;
-  const isDue = (i) => {
-    if (i.notes === 0) return false;
-    if (i.digest !== entry(i)?.organizedDigest) return true;
-    return (i.overLimit || i.conflict) && now - last(i) > REVISIT_MS;
-  };
-  const rank = (i) => (i.overLimit ? 0 : i.conflict ? 1 : 2);
-  const failedTry = (i) => {
-    const t = timeOf(entry(i)?.lastOrganizeTried);
-    const l = timeOf(entry(i)?.lastOrganize);
-    return t !== null && (l === null || t > l) ? t : null;
-  };
-  const leftUnorganized = (i) => {
-    const t = failedTry(i);
-    return t !== null && now - t <= REVISIT_MS;
-  };
-  // A scope whose failed try is older than REVISIT_MS counts as the oldest of its class.
-  const tried = (i) => {
-    const t = failedTry(i);
-    if (t !== null && now - t > REVISIT_MS) return -Infinity;
-    return timeOf(entry(i)?.lastOrganizeTried) ?? last(i);
-  };
-  const older = (a, b) => (a === b ? 0 : a - b);
-  const due = infos.filter(isDue);
-  due.sort((x, y) => {
-    const gx = leftUnorganized(x);
-    const gy = leftUnorganized(y);
-    if (gx !== gy) return gx ? 1 : -1;
-    return (gx ? 0 : rank(x) - rank(y)) || older(tried(x), tried(y)) || byName(x.name, y.name);
-  });
-  return due.map((i) => ({ scope: i.name }));
 }
 
 // Removes a folder tree, also one whose folders lost their permissions. Never throws.
@@ -1626,9 +1428,10 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   ];
   const sections = labelReport(results, { reasons: true });
   const report = [
-    `# Labels — ${new Date().toISOString().slice(0, 10)} on ${config.host}`, '',
-    `- Model: ${label.model}; requests: ${asked.requests}; cost: ${usd(asked.spent)}`,
-    `- Notes: ${touched.length} touched, ${asked.sent} sent to the model, ${exceptions.length} with an exception, ${confirmed.length} recorded as they were`,
+    ...labelReportHead({
+      date: new Date().toISOString().slice(0, 10), host: config.host, model: label.model, requests: asked.requests, costUsd: asked.spent,
+      touched: touched.length, sent: asked.sent, exceptions: exceptions.length, confirmed: confirmed.length,
+    }),
     ...(sections === '' ? [] : ['', sections.trimEnd()]),
   ].join('\n').concat('\n');
   const figures = `${usd(asked.spent)}, ${asked.requests} request(s)`;
