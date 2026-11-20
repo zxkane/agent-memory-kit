@@ -102,3 +102,31 @@ test('tagIndexText takes any gap after the dash, and a line it changes gets " �
   const index = '# T\r\n- [A](a.md) —\t[personal] x\r\n- [B](b.md) —y\r\n';
   assert.equal(tagIndexText(index, new Map([['a.md', 'work']])), '# T\r\n- [A](a.md) — [work] x\r\n- [B](b.md) —y\r\n');
 });
+
+test('tagIndexText takes any gap between the link and the dash, and a line it changes gets ") — "', () => {
+  const unlabeled = (text: string) => tagIndexText(text, new Map());
+  // No gap, a no-break space, two spaces, tabs, a format character.
+  for (const sep of ['—', '\u00a0— ', '  — ', '\t—\t', '\u200b— ']) {
+    const line = `- [A](a.md)${sep}[work] x`;
+    assert.equal(tag(line, 'general'), '- [A](a.md) — x', line);
+    assert.equal(unlabeled(line), '- [A](a.md) — x', line);
+    assert.equal(tag(line, 'work'), '- [A](a.md) — [work] x', line);
+    assert.equal(tag(line, 'personal'), '- [A](a.md) — [personal] x', line);
+    // Without a run, a general or unlabeled line stays byte for byte as it is.
+    const bare = `- [A](a.md)${sep}x`;
+    assert.equal(tag(bare, 'general'), bare, bare);
+    assert.equal(unlabeled(bare), bare, bare);
+    for (const input of [line, bare]) {
+      for (const domain of DOMAINS) {
+        const once = tag(input, domain);
+        assert.equal(tag(once, domain), once, input);
+      }
+      assert.equal(unlabeled(unlabeled(input)), unlabeled(input), input);
+    }
+  }
+  // The bullet stays exact: another bullet, an indent or a gap without the em dash is not an index line.
+  for (const line of ['* [A](a.md) — [work] x', '+ [A](a.md) — [work] x', '  - [A](a.md) — [work] x', '- [A](a.md)\t[work] x']) {
+    assert.equal(tag(line, 'general'), line, line);
+    assert.equal(tag(line, 'personal'), line, line);
+  }
+});

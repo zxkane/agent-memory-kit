@@ -283,16 +283,42 @@ test('tagLine takes any gap after the dash, and a line it changes gets " — "',
   }
 });
 
-test('tagIndexLines reads the note of a line with any gap after the dash', t => {
+test('tagLine takes any gap between the link and the dash, and a line it changes gets ") — "', () => {
+  // No gap, a no-break space, two spaces, tabs, a format character.
+  for (const sep of ['—', '\u00a0— ', '  — ', '\t—\t', '\u200b— ']) {
+    const line = `- [A](a.md)${sep}[work] x`;
+    assert.equal(tagLine(line, 'general'), '- [A](a.md) — x', line);
+    assert.equal(tagLine(line, null), '- [A](a.md) — x', line);
+    assert.equal(tagLine(line, 'work'), '- [A](a.md) — [work] x', line);
+    assert.equal(tagLine(line, 'personal'), '- [A](a.md) — [personal] x', line);
+    // Without a run, a general or unlabeled line stays byte for byte as it is.
+    const bare = `- [A](a.md)${sep}x`;
+    assert.equal(tagLine(bare, 'general'), bare, bare);
+    assert.equal(tagLine(bare, null), bare, bare);
+    for (const input of [line, bare]) {
+      for (const label of ['work', 'personal', 'general', null]) {
+        const once = tagLine(input, label);
+        assert.equal(tagLine(once, label), once, input);
+      }
+    }
+  }
+  // The bullet stays exact: another bullet, an indent or a gap without the em dash is not an index line.
+  for (const line of ['* [A](a.md) — [work] x', '+ [A](a.md) — [work] x', '  - [A](a.md) — [work] x', '- [A](a.md)\t[work] x']) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, 'personal'), line, line);
+  }
+});
+
+test('tagIndexLines reads the note of a line with any gap around the dash', t => {
   const dir = tmp(t);
   writeFileSync(join(dir, 'g.md'), NOTE.replace('  originSessionId: x', '  domain: general'));
   writeFileSync(join(dir, 'w.md'), NOTE.replace('  originSessionId: x', '  domain: work'));
   writeFileSync(join(dir, 'p.md'), NOTE.replace('  originSessionId: x', '  domain: personal'));
-  for (const gap of ['', '\u00a0', '\t']) {
-    const lines = [`- [G](g.md) —${gap}[work] g`, `- [W](w.md) —${gap}[personal] w`, `- [P](p.md) —${gap}[work] p`, `- [G](g.md) —${gap}g`];
+  for (const sep of [' —', ' —\u00a0', ' —\t', '—', '\u00a0— ', '  — ', '\t—\t', '\u200b— ']) {
+    const lines = [`- [G](g.md)${sep}[work] g`, `- [W](w.md)${sep}[personal] w`, `- [P](p.md)${sep}[work] p`, `- [G](g.md)${sep}g`];
     assert.deepEqual(tagIndexLines(lines, dir), [
-      '- [G](g.md) — g', '- [W](w.md) — [work] w', '- [P](p.md) — [personal] p', `- [G](g.md) —${gap}g`,
-    ], JSON.stringify(gap));
+      '- [G](g.md) — g', '- [W](w.md) — [work] w', '- [P](p.md) — [personal] p', `- [G](g.md)${sep}g`,
+    ], JSON.stringify(sep));
   }
 });
 

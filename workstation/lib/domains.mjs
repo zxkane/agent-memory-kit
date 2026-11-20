@@ -10,13 +10,15 @@ export const LABELS = Object.freeze(['work', 'personal', 'general']);
 const MAX_DOMAINS_BYTES = 1024 * 1024;
 const MAX_PERSONA_CHARS = 20000;
 const MAX_NOTE_BYTES = 1024 * 1024;
-// An index line that links a note of its folder, up to the em dash after the link. Everything after the
-// dash is the hook, with whatever gap stands at its start (also none).
-const TAG_LINE_RE = /^- \[[^\]]*\]\(([A-Za-z0-9][A-Za-z0-9._-]*\.md)\) —/;
-// What may stand around and inside an author-written tag without showing: white space other than a
-// line end, and Unicode format characters (zero-width characters, the soft hyphen, joiners). One
-// character class, so that a long run of them is matched once, not in every way it could split.
+// What may stand around the dash of an index line, and around and inside an author-written tag, without
+// showing: white space other than a line end, and Unicode format characters (zero-width characters, the
+// soft hyphen, joiners). One character class, so that a long run of them is matched once, not in every
+// way it could split.
 const GAP = '[[\\s\\p{Cf}]--[\\r\\n]]*';
+// An index line that links a note of its folder, up to the em dash after the link: `- ` and the link
+// (`link`, with the file name as `file`), then a gap (also none) and the dash. Everything after the dash
+// is the hook, with whatever gap stands at its start (also none).
+const TAG_LINE_RE = new RegExp(`^(?<link>- \\[[^\\]]*\\]\\((?<file>[A-Za-z0-9][A-Za-z0-9._\\-]*\\.md)\\))${GAP}—`, 'v');
 const spaced = (word) => [...word].join(GAP);
 // The start of a hook: the gap after the dash, then a run of `[work]` / `[personal]` tags (the group,
 // empty when there is none) in any letter case, with the gaps between, inside and after them. Homoglyphs
@@ -172,7 +174,7 @@ export function tagLine(line, label) {
   const [start, run] = HOOK_START_RE.exec(hook);
   const tag = label === 'work' || label === 'personal' ? `[${label}] ` : '';
   if (!tag && !run) return line;
-  return `${m[0]} ${tag}${hook.slice(start.length)}`;
+  return `${m.groups.link} — ${tag}${hook.slice(start.length)}`;
 }
 
 // Tags every index line by the label of the note it links in `dir`. A note that cannot be read (also a link, a
@@ -181,7 +183,7 @@ export function tagIndexLines(lines, dir) {
   return lines.map(line => {
     const m = TAG_LINE_RE.exec(line);
     if (!m) return line;
-    const note = readText(join(dir, m[1]), MAX_NOTE_BYTES);
+    const note = readText(join(dir, m.groups.file), MAX_NOTE_BYTES);
     return note === null ? line : tagLine(line, readDomain(note));
   });
 }
