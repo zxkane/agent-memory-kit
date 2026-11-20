@@ -1291,6 +1291,8 @@ test('a failed sync before the snapshot skips the scope and stops the run', (t) 
   assert.match(r.stdout, /^organize: stopped; the sync failed/m);
   assert.deepEqual(f.calls(), []);
   assert.equal(f.readState().projects.p.lastOutcome.outcome, 'sync-failed');
+  const [line] = f.runLog();
+  assert.deepEqual([line.exitCode, line.stop, line.scopes.map((x) => [x.scope, x.outcome])], [0, 'sync-failed', [['p', 'sync-failed']]]);
 });
 
 const REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
@@ -1672,6 +1674,8 @@ test('an apply step that times out waiting for the lock is step-failed and appli
   assert.equal(p.lastOutcome.outcome, 'step-failed');
   assert.equal(p.organizedDigest, undefined);
   assert.equal(p.lastOrganize, undefined);
+  const [line] = f.runLog();
+  assert.deepEqual([line.exitCode, line.stop, line.scopes.map((x) => x.outcome)], [1, 'step-failed', ['step-failed']]);
 });
 
 test('a scan that times out waiting for the lock says so', async (t) => {
@@ -1687,6 +1691,8 @@ test('a scan that times out waiting for the lock says so', async (t) => {
   assert.equal(r.status, 1);
   assert.match(r.stderr, /the scan of the notes could not run: the wait for the sync lock timed out/);
   assert.deepEqual(f.calls(), []);
+  // The run log names the failure for an alert.
+  assert.deepEqual(f.runLog().map((l) => [l.exitCode, l.error, l.scopes]), [[1, 'lock-timeout', []]]);
 });
 
 test('a signal while the apply step waits for the lock: aborted, nothing applied', async (t) => {
@@ -3123,6 +3129,8 @@ test('missing inputs stop the pass', (t) => {
   assert.deepEqual(f.requests(), []);
   assert.equal(liveText(f, 'projects/p/c.md'), note('c', 'C', 'Gamma.'));
   assert.equal(f.readState().labels, undefined);
+  // Both runs name the pass's outcome; the pass failed them.
+  assert.deepEqual(f.runLog().map((l) => [l.kind, l.exitCode, l.label.outcome, l.label.failed]), [['label', 1, 'inputs-invalid', true], ['organize', 1, 'inputs-invalid', true]]);
   // A domains file that is not valid is named with its problem.
   f.seed({ '.agent-memory/persona.md': PERSONA, '.agent-memory/domains.json': '{"version": 2}\n' });
   r = f.label();
@@ -3226,6 +3234,8 @@ test('a pass whose tokens cannot be made sends nothing, and its figures say so',
   assert.match(r.stdout, /^- projects\/q\/b\.md: not sent; 2 batches in a row failed$/m);
   assert.doesNotMatch(r.stdout + r.stderr, /ASIAEXAMPLE|example-signing/);
   assert.equal(f.readState().labels.notes['global/g.md'], undefined);
+  const [line] = f.runLog();
+  assert.deepEqual([line.exitCode, line.label.outcome, line.label.failed, line.label.stop, line.label.requests], [1, 'nothing-written', true, 'failures', 0]);
 });
 
 test('the age of a token file stops the pass', (t) => {
