@@ -21,8 +21,10 @@ const GAP = '[[\\s\\p{Cf}]--[\\r\\n]]*';
 const TAG_LINE_RE = new RegExp(`^(?<link>- \\[[^\\]]*\\]\\((?<file>[A-Za-z0-9][A-Za-z0-9._\\-]*\\.md)\\))${GAP}—`, 'v');
 const spaced = (word) => [...word].join(GAP);
 // The start of a hook: the gap after the dash, then a run of `[work]` / `[personal]` tags (the group,
-// empty when there is none) in any letter case, with the gaps between, inside and after them. Homoglyphs
-// and full-width brackets are not tags.
+// empty when there is none) in any letter case, with the gaps between, inside and after them. The case
+// folding also takes the Kelvin sign (U+212A) for `k` and the long s (U+017F) for `s`, which look like
+// them; no other character folds to these letters, and other lookalikes (letters of other scripts,
+// full-width brackets) are not tags.
 const HOOK_START_RE = new RegExp(`^${GAP}((?:\\[${GAP}(?:${spaced('work')}|${spaced('personal')})${GAP}\\]${GAP})*)`, 'iv');
 const SCOPE_RE = /^(?:global|projects\/([^/]+)|agents\/([^/]+))$/;
 

@@ -230,6 +230,18 @@ test('tagLine strips a leading tag run whatever its spacing, letter case or hidd
   }
 });
 
+test('tagLine takes the Kelvin sign and the long s for k and s, and no other lookalike', () => {
+  // The case folding matches these two; they look like the letters they fold to.
+  for (const hook of ['[wor\u212a] about', '[per\u017fonal] about']) {
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'general'), '- [A](a.md) — about', hook);
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'work'), '- [A](a.md) — [work] about', hook);
+  }
+  // Other lookalikes, such as a Cyrillic o or full-width brackets, are not tags.
+  for (const hook of ['[w\u043erk] about', '\uff3bwork\uff3d about']) {
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'general'), `- [A](a.md) — ${hook}`, hook);
+  }
+});
+
 test('tagLine keeps the rest of the hook exactly', () => {
   // Text that only looks like a tag, and format characters later in the hook, stay as they are.
   const family = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
