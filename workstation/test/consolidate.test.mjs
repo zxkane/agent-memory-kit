@@ -3,8 +3,8 @@ import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync,
-  writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync,
+  utimesSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -2308,4 +2308,363 @@ test('organize --agents: usage errors, a missing agents block and missing creden
   assert.equal(r.status, 1);
   assert.match(r.stdout, /organizing the agent scopes needs "agents" in the consolidate block/);
   assert.deepEqual(plain.calls(), []);
+});
+
+// ---- The label steps: run.sh consolidate-step label-read | label-apply ----
+
+// A note whose metadata block carries `domain: <label>`, as label-apply writes it.
+const labeledNote = (name, description, body, label) =>
+  note(name, description, body).replace('  type: project\n', `  type: project\n  domain: ${label}\n`);
+
+const liveText = (f, rel) => readFileSync(join(f.repo, rel), 'utf8');
+
+// Runs a step through run.sh, under the sync lock, as the driver does: its exit status and its JSON line.
+function runLabelStep(f, ...args) {
+  const r = spawnSync(RUN_SH, ['consolidate-step', ...args], { env: f.env, encoding: 'utf8' });
+  const line = r.stdout.trim().split('\n').at(-1);
+  return { status: r.status, stderr: r.stderr, result: line ? JSON.parse(line) : null };
+}
+
+// A new, empty work folder where the driver makes one: <stateDir>/consolidate/<run>/<folder>.
+function labelWork(f) {
+  const run = join(f.workRoot(), 'run');
+  mkdirSync(run, { recursive: true, mode: 0o700 });
+  return mkdtempSync(join(run, 'label-'));
+}
+
+// label-read in a new work folder: the folder, the step's line and what it wrote to label-notes.json.
+function labelRead(f, ...args) {
+  const work = labelWork(f);
+  const r = runLabelStep(f, 'label-read', '--work', work, ...args);
+  assert.equal(r.status, 0, r.stderr);
+  return { work, result: r.result, ...JSON.parse(readFileSync(join(work, 'label-notes.json'), 'utf8')) };
+}
+
+// Writes label-plan.json (an object as JSON, a string as it is) and returns its SHA-256.
+function writeLabelPlan(work, plan) {
+  const text = typeof plan === 'string' ? plan : `${JSON.stringify(plan, null, 2)}\n`;
+  writeFileSync(join(work, 'label-plan.json'), text, { mode: 0o600 });
+  return sha(text);
+}
+
+// The plan entry that gives `label` to the note at `path` as label-read listed it.
+const entryFor = (notes, path, label) => ({ path, label, sha256: notes.find((n) => n.path === path).sha256 });
+
+const labelApply = (f, work, planSha) => runLabelStep(f, 'label-apply', '--work', work, '--plan-sha256', planSha);
+
+test('label-read lists the notes of every scope', (t) => {
+  const f = fixture(t);
+  f.seed({
+    'global/MEMORY.md': index('a.md'),
+    'global/a.md': labeledNote('a', 'About a', 'Alpha.', 'work'),
+    'projects/p/MEMORY.md': index('b.md'),
+    'projects/p/b.md': note('b', 'About b', 'Beta.'),
+    'projects/p/old.md': 'MOVED TO [[b]]\n',
+    'projects/p/x.conflict-host.md': note('b', 'About b', 'Beta, as another machine wrote it.'),
+  });
+  const { work, result, notes, digests } = labelRead(f);
+  assert.equal(result.outcome, 'label-read');
+  assert.equal(result.notes, 2);
+  assert.equal(result.sync.ok, true);
+  const digestOf = (rel) => sha(readFileSync(join(f.repo, rel)));
+  assert.deepEqual(notes, [
+    {
+      path: 'global/a.md', scope: 'global', file: 'a.md', sha256: digestOf('global/a.md'), domain: 'work',
+      name: 'a', description: 'About a', body: '\nAlpha.\n', skip: null,
+    },
+    {
+      path: 'projects/p/b.md', scope: 'projects/p', file: 'b.md', sha256: digestOf('projects/p/b.md'), domain: null,
+      name: 'b', description: 'About b', body: '\nBeta.\n', skip: null,
+    },
+  ]);
+  assert.deepEqual(digests, { global: folderDigest(join(f.repo, 'global')), p: folderDigest(join(f.repo, 'projects/p')) });
+  assert.equal(statSync(join(work, 'label-notes.json')).mode & 0o777, 0o600);
+});
+
+test('label-read takes only the named scopes', (t) => {
+  const f = fixture(t);
+  f.seed({
+    'global/g.md': note('g', 'G', 'General.'),
+    'projects/p/b.md': note('b', 'B', 'Beta.'),
+    'projects/q/c.md': note('c', 'C', 'Gamma.'),
+  });
+  // A session's note that is not committed yet: the step's sync commits it before the notes are read.
+  write(f.repo, 'projects/p/d.md', note('d', 'D', 'Delta.'));
+  const { work, result, notes, digests } = labelRead(f, '--scope', 'p', '--scope', 'gone', '--scope', 'p');
+  assert.equal(result.notes, 2);
+  assert.equal(result.sync.committed, 1);
+  assert.deepEqual(notes.map((n) => n.path), ['projects/p/b.md', 'projects/p/d.md']);
+  // A named scope without a folder is left out.
+  assert.deepEqual(Object.keys(digests), ['p']);
+  // A work folder that is not empty, or a scope name no scope folder may have, is an error before anything is read.
+  assert.equal(runLabelStep(f, 'label-read', '--work', work).result.outcome, 'error');
+  for (const bad of [['--scope', '../p'], ['--scope', '.p'], ['--scope', 'a/b'], ['--scope'], ['--other', 'x']]) {
+    const w = labelWork(f);
+    const r = runLabelStep(f, 'label-read', '--work', w, ...bad);
+    assert.equal(r.status, 1, bad.join(' '));
+    assert.equal(r.result.outcome, 'error', bad.join(' '));
+    assert.deepEqual(readdirSync(w), [], bad.join(' '));
+  }
+});
+
+test('label-apply writes the labels and commits them', (t) => {
+  const f = fixture(t);
+  f.seed({
+    'global/MEMORY.md': index('a.md'),
+    'global/a.md': note('a', 'A', 'Alpha.'),
+    'projects/p/MEMORY.md': index('b.md', 'c.md'),
+    'projects/p/b.md': note('b', 'B', 'Beta.'),
+    'projects/p/c.md': labeledNote('c', 'C', 'Gamma.', 'general'),
+  });
+  const { work, notes } = labelRead(f);
+  const before = { global: folderDigest(join(f.repo, 'global')), p: folderDigest(join(f.repo, 'projects/p')) };
+  const report = '# Labels — test\n\n- global/a.md: personal\n- projects/p/b.md: work\n';
+  const planSha = writeLabelPlan(work, {
+    entries: [
+      entryFor(notes, 'global/a.md', 'personal'), entryFor(notes, 'projects/p/b.md', 'work'),
+      entryFor(notes, 'projects/p/c.md', 'general'),
+    ],
+    report,
+  });
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  const res = r.result;
+  assert.equal(res.outcome, 'applied');
+  assert.equal(liveText(f, 'global/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+  const digestOf = (rel) => sha(readFileSync(join(f.repo, rel)));
+  assert.deepEqual(res.written, [
+    { path: 'global/a.md', sha256: digestOf('global/a.md') },
+    { path: 'projects/p/b.md', sha256: digestOf('projects/p/b.md') },
+  ]);
+  assert.deepEqual(res.unchanged, [{ path: 'projects/p/c.md', sha256: digestOf('projects/p/c.md') }]);
+  assert.deepEqual(res.skipped, []);
+  assert.deepEqual(res.digests, {
+    global: { before: before.global, after: folderDigest(join(f.repo, 'global')) },
+    p: { before: before.p, after: folderDigest(join(f.repo, 'projects/p')) },
+  });
+  assert.notEqual(res.digests.p.before, res.digests.p.after);
+  assert.equal(res.reportError, null);
+  assert.deepEqual(res.sync, { ok: true, error: null, committed: 3, pushed: true });
+  // The subject given to the sync, which adds the file count as it does for every consolidate commit.
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 2 note(s) (3 file(s))');
+  const reportFile = `_reports/${today()}-alpha-label.md`;
+  assert.deepEqual(sh(f.repo, 'git', ['show', '--name-only', '--format=', 'HEAD']).trim().split('\n').sort(),
+    [reportFile, 'global/a.md', 'projects/p/b.md']);
+  assert.equal(liveText(f, reportFile), report);
+  assert.equal(f.head(), sh(f.remote, 'git', ['rev-parse', 'main']).trim());
+});
+
+test('label-apply skips a note changed after the read', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/d.md': note('d', 'D', 'Delta.') });
+  const { work, notes } = labelRead(f);
+  // A session edits b.md and removes d.md after the read.
+  const edited = note('b', 'B', 'Beta, edited by a session.');
+  write(f.repo, 'projects/p/b.md', edited);
+  rmSync(join(f.repo, 'projects/p/d.md'));
+  const planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'projects/p/b.md', 'work'), entryFor(notes, 'projects/p/d.md', 'work')],
+    report: '# Labels\n',
+  });
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'no-change');
+  assert.deepEqual(r.result.written, []);
+  assert.deepEqual(r.result.skipped, [
+    { path: 'projects/p/b.md', reason: 'changed since it was read' },
+    { path: 'projects/p/d.md', reason: 'gone' },
+  ]);
+  assert.equal(liveText(f, 'projects/p/b.md'), edited);
+  assert.equal(r.result.digests.p.before, r.result.digests.p.after);
+  // Nothing was written: no report and no label commit. The step's first sync committed the session's changes.
+  assert.deepEqual(f.reports(), []);
+  assert.equal(f.subjects()[0], 'sync(alpha): 2 file(s)');
+});
+
+test('label-apply names a note it cannot edit', (t) => {
+  const f = fixture(t);
+  const inline = '---\nname: c\ndescription: C\nmetadata: {}\n---\n\nGamma.\n';
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/c.md': inline });
+  const { work, notes } = labelRead(f);
+  // label-read names it already, so that the pass can keep it away from the model.
+  assert.equal(notes.find((n) => n.path === 'projects/p/c.md').skip, 'metadata is not a block');
+  const planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'projects/p/b.md', 'work'), entryFor(notes, 'projects/p/c.md', 'personal')],
+    report: '# Labels\n',
+  });
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'applied');
+  assert.deepEqual(r.result.skipped, [{ path: 'projects/p/c.md', reason: 'metadata is not a block' }]);
+  assert.equal(liveText(f, 'projects/p/c.md'), inline);
+  assert.equal(liveText(f, `_reports/${today()}-alpha-label.md`),
+    '# Labels\n\n## Not written\n- projects/p/c.md: metadata is not a block\n');
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (2 file(s))');
+});
+
+test('label-apply commits the labels when the report cannot be written', (t) => {
+  const f = fixture(t);
+  f.seed({ '_reports': 'a file where the report folder would be\n', 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const r = labelApply(f, work, writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'applied');
+  assert.equal(r.result.reportError, '_reports is not a folder');
+  assert.equal(r.result.sync.ok, true);
+  assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (1 file(s))');
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+});
+
+test('label-apply refuses a plan changed after it was written', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const planSha = writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' });
+  writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'personal')], report: '# Labels\n' });
+  // A session's note that is not committed yet: a step that synced would commit it.
+  write(f.repo, 'projects/p/s.md', note('s', 'S', 'From a session.'));
+  const head = f.head();
+  const r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.result, {
+    outcome: 'rejected', reason: 'label-plan.json was changed after it was written',
+    written: [], unchanged: [], skipped: [], digests: {}, reportError: null, sync: null,
+  });
+  // A plan that is gone is refused the same way.
+  rmSync(join(work, 'label-plan.json'));
+  assert.equal(labelApply(f, work, planSha).result.outcome, 'rejected');
+  assert.equal(liveText(f, 'projects/p/b.md'), note('b', 'B', 'Beta.'));
+  assert.equal(f.head(), head);
+  assert.match(sh(f.repo, 'git', ['status', '--porcelain']), /^\?\? projects\/p\/s\.md$/m);
+  assert.deepEqual(f.reports(), []);
+});
+
+test('label-apply rejects a plan that is not well formed and writes nothing', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/MEMORY.md': index('b.md'), 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const good = entryFor(notes, 'projects/p/b.md', 'work');
+  const shape = /^label-plan\.json does not hold an entries list and a report text$/;
+  const second = (what) => new RegExp(`^label-plan\\.json entry 2: ${what}$`);
+  const notInScope = second('the path is not a note of global/ or of a project folder');
+  const cases = [
+    ['not JSON', '{"entries": [', /^label-plan\.json is not valid JSON$/],
+    ['a list', '[]', shape],
+    ['no report', { entries: [good] }, shape],
+    ['entries that are not a list', { entries: good, report: '' }, shape],
+    ['an entry that is not an object', { entries: [good, 'projects/p/b.md'], report: '' }, second('not an object')],
+    ['the index', { entries: [good, { ...good, path: 'projects/p/MEMORY.md' }], report: '' }, second('MEMORY\\.md is the index, not a note')],
+    ...['p/b.md', 'agents/a/b.md', 'projects/b.md', 'projects/p/sub/b.md', 'projects/../b.md', 'global/../b.md',
+      '/projects/p/b.md', 'projects/p/b.txt']
+      .map((path) => [path, { entries: [good, { ...good, path }], report: '' }, notInScope]),
+    ...['projects/.p/b.md', 'projects/global/b.md']
+      .map((path) => [path, { entries: [good, { ...good, path }], report: '' }, second('a project folder of that name is never labeled')]),
+    ['an unknown label', { entries: [good, { ...good, label: 'Work' }], report: '' }, second('the label is not work, personal or general')],
+    ['a digest that is not SHA-256', { entries: [good, { ...good, sha256: good.sha256.toUpperCase() }], report: '' },
+      second('sha256 is not 64 hexadecimal characters')],
+    ['a note listed twice', { entries: [good, { ...good, label: 'personal' }], report: '' }, second('the note is listed twice')],
+  ];
+  const head = f.head();
+  for (const [what, plan, reason] of cases) {
+    const r = labelApply(f, work, writeLabelPlan(work, plan));
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`);
+    assert.equal(r.result.outcome, 'rejected', what);
+    assert.match(r.result.reason, reason, what);
+    assert.deepEqual([r.result.written, r.result.unchanged, r.result.skipped, r.result.sync], [[], [], [], null], what);
+  }
+  assert.equal(liveText(f, 'projects/p/b.md'), note('b', 'B', 'Beta.'));
+  assert.equal(f.head(), head);
+  assert.deepEqual(f.reports(), []);
+});
+
+test('label-apply that fails after its first write is apply-interrupted; before it, an error', { skip: asRoot && 'runs as root' }, (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.'), 'global/a.md': note('a', 'A', 'Alpha.') });
+  const globalDir = join(f.repo, 'global');
+  const withGlobalReadOnly = (fn) => {
+    chmodSync(globalDir, 0o555);
+    try {
+      return fn();
+    } finally {
+      chmodSync(globalDir, 0o755);
+    }
+  };
+  let { work, notes } = labelRead(f);
+  let planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'projects/p/b.md', 'work'), entryFor(notes, 'global/a.md', 'work')],
+    report: '# Labels\n',
+  });
+  const head = f.head();
+  let r = withGlobalReadOnly(() => labelApply(f, work, planSha));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'apply-interrupted');
+  assert.match(r.result.reason, /EACCES/);
+  // b.md was written and stays uncommitted (the next sync commits it); a.md was not.
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+  assert.deepEqual(r.result.written, [{ path: 'projects/p/b.md', sha256: sha(readFileSync(join(f.repo, 'projects/p/b.md'))) }]);
+  assert.equal(liveText(f, 'global/a.md'), note('a', 'A', 'Alpha.'));
+  assert.equal(f.head(), head);
+  assert.deepEqual(f.reports(), []);
+  assert.deepEqual(readdirSync(globalDir), ['a.md']);
+
+  ({ work, notes } = labelRead(f));
+  planSha = writeLabelPlan(work, {
+    entries: [entryFor(notes, 'global/a.md', 'work'), entryFor(notes, 'projects/p/b.md', 'personal')],
+    report: '# Labels\n',
+  });
+  r = withGlobalReadOnly(() => labelApply(f, work, planSha));
+  assert.equal(r.status, 1);
+  assert.equal(r.result.outcome, 'error');
+  assert.match(r.result.error, /EACCES/);
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+});
+
+test('label-apply finishes after SIGTERM, SIGINT or SIGHUP and reports its result', async (t) => {
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    const f = fixture(t);
+    f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.') });
+    const { work, notes } = labelRead(f);
+    const planSha = writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' });
+    // The second fetch from here on is the sync after writing.
+    const step = slowFetch(f, 2);
+    const child = spawn(RUN_SH, ['consolidate-step', 'label-apply', '--work', work, '--plan-sha256', planSha],
+      { env: f.env, stdio: ['ignore', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    const exited = new Promise((resolve) => child.once('close', (code, sig) => resolve({ code, signal: sig })));
+    t.after(() => {
+      step.release();
+      child.kill('SIGKILL');
+    });
+    assert.ok(await waitFor(step.ready), `${signal}: the sync after writing is running`);
+    process.kill(child.pid, signal);
+    step.release();
+    assert.deepEqual(await exited, { code: 0, signal: null }, signal);
+    const res = JSON.parse(stdout.trim().split('\n').at(-1));
+    assert.equal(res.outcome, 'applied', signal);
+    assert.equal(res.sync.ok, true, signal);
+    assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (2 file(s))', signal);
+  }
+});
+
+test('label-read and label-apply stop when their first sync fails', (t) => {
+  const f = fixture(t);
+  f.seed({ 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const planSha = writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' });
+  sh(f.repo, 'git', ['remote', 'set-url', 'origin', join(f.tmp, 'no-such-remote.git')]);
+  const read = labelWork(f);
+  let r = runLabelStep(f, 'label-read', '--work', read);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'sync-failed');
+  assert.equal(r.result.sync.ok, false);
+  assert.deepEqual(readdirSync(read), []);
+  r = labelApply(f, work, planSha);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'sync-failed');
+  assert.equal(r.result.sync.ok, false);
+  assert.deepEqual([r.result.written, r.result.unchanged, r.result.skipped], [[], [], []]);
+  assert.equal(liveText(f, 'projects/p/b.md'), note('b', 'B', 'Beta.'));
+  assert.deepEqual(f.reports(), []);
 });

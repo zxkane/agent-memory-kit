@@ -219,7 +219,7 @@ const stripInvisible = (str) => str.replace(/^\p{Cf}+/u, '');
 const MALFORMED_RE = /^moved\s+to\s*\[\s*\[[^\]\n]*\]\s*\]\s*[.!]?$/i;
 
 // The part of a note after a leading frontmatter block (the whole note when it has none).
-function bodyOf(content) {
+export function bodyOf(content) {
   const lines = content.split(/\r?\n/);
   if (lines[0] !== '---') return content;
   const end = lines.indexOf('---', 1);
@@ -456,7 +456,9 @@ export function evaluate({ pairs, snap, allowRetire, minRetention = 0.25 }) {
   return { ok: errors.length === 0 && liveChanged.length === 0, errors, changes, ignored, ignoredEntries, stats, liveChanged };
 }
 
-function writeAtomic(dir, name, buf, mode) {
+// Replaces `<dir>/<name>` with `buf` through a temporary file beside it, which is removed on failure;
+// the file gets `mode`.
+export function writeAtomic(dir, name, buf, mode) {
   const dest = join(dir, name);
   const tmp = join(dir, `${name}.tmp.${process.pid}-${randomBytes(6).toString('hex')}`);
   try {

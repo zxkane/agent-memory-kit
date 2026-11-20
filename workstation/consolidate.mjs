@@ -1,8 +1,9 @@
 // Consolidation: lets a model tidy the notes (organize) or add what recent conversations show
 // (extract), one scope at a time, on a private copy. Started through `run.sh consolidate`, which
 // holds consolidate.lock. Everything that reads or writes the clone runs as a locked step
-// (`run.sh consolidate-step scan|snapshot|apply`, under the sync lock); the model only ever sees
-// the work folder, and its result is applied only when the rules in lib/workdir.mjs accept it.
+// (`run.sh consolidate-step scan|snapshot|apply`, and `label-read|label-apply` for the labels, under
+// the sync lock); the model only ever sees the work folder, and its result is applied only when the
+// rules in lib/workdir.mjs accept it.
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -18,6 +19,7 @@ import {
 } from './lib/agent-scopes.mjs';
 import { AwsError } from './lib/aws.mjs';
 import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
+import { applyLabelEntries, collectScopeNotes, labelEntryProblem } from './lib/label-notes.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
@@ -181,12 +183,17 @@ function parseConversationArg(value) {
 
 // ---- Locked steps ----
 
-function parseStepArgs(rest, valued, flags = []) {
+// `valued` arguments are required, each once; `flags` may be given once; `repeated` arguments take
+// a value each time they are given and become a list.
+function parseStepArgs(rest, valued, flags = [], repeated = []) {
   const opts = Object.create(null);
+  for (const a of repeated) opts[a] = [];
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (flags.includes(a) && !(a in opts)) {
       opts[a] = true;
+    } else if (repeated.includes(a) && i + 1 < rest.length) {
+      opts[a].push(rest[++i]);
     } else if (valued.includes(a) && !(a in opts) && i + 1 < rest.length) {
       opts[a] = rest[++i];
     } else {
@@ -498,17 +505,134 @@ function stepApply(config, rest) {
   out({ ...result, outcome: 'applied', digest, reportError, sync });
 }
 
+// The two locked steps of the label step. A scope is named as consolidate.json names it (`global`
+// or the project's folder name); the paths of its notes start with its folder (`global/`,
+// `projects/<name>/`).
+const scopeFolder = (name) => (name === GLOBAL ? GLOBAL : `projects/${name}`);
+const scopeOfPath = (path) => (path.startsWith('projects/') ? path.split('/')[1] : GLOBAL);
+
+// Writes `<work>/label-notes.json`: the notes of the named scopes (of every scope without
+// `--scope`) as collectScopeNotes lists them, and each scope's digest. A named scope whose folder
+// is missing or may not be touched is left out.
+function stepLabelRead(config, rest) {
+  const a = parseStepArgs(rest, ['--work'], [], ['--scope']);
+  const named = [...new Set(a['--scope'])];
+  if (!named.every((name) => name === GLOBAL || isPlainName(name))) throw new Error('invalid scope');
+  const work = checkWork(config, a['--work']);
+  if (readdirSync(work).length > 0) throw new Error('the work folder is not empty');
+  const sync = syncInfo(writeStatus(config, runSync(config)));
+  if (!sync.ok) {
+    out({ outcome: 'sync-failed', sync });
+    return;
+  }
+  const scopes = (named.length > 0 ? named : [GLOBAL, ...listProjects(config)])
+    .map((name) => ({ name, dir: liveFolder(config, name) })).filter((s) => s.dir);
+  const notes = scopes.flatMap((s) => collectScopeNotes(s.dir, scopeFolder(s.name)));
+  const digests = Object.fromEntries(scopes.map((s) => [s.name, folderDigest(s.dir)]));
+  writeFileSync(join(work, 'label-notes.json'), `${JSON.stringify({ notes, digests }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  out({ outcome: 'label-read', notes: notes.length, sync });
+}
+
+// Why a label plan may not be applied, or null.
+function labelPlanProblem(plan) {
+  if (!isObject(plan) || !Array.isArray(plan.entries) || typeof plan.report !== 'string') {
+    return 'label-plan.json does not hold an entries list and a report text';
+  }
+  const seen = new Set();
+  for (const [i, entry] of plan.entries.entries()) {
+    let problem = labelEntryProblem(entry);
+    // A project folder that no run takes: hidden, or named like the global scope.
+    if (!problem && entry.path.startsWith('projects/') && !isPlainName(entry.path.split('/')[1])) {
+      problem = 'a project folder of that name is never labeled';
+    }
+    if (!problem && seen.has(entry.path)) problem = 'the note is listed twice';
+    if (problem) return `label-plan.json entry ${i + 1}: ${problem}`;
+    seen.add(entry.path);
+  }
+  return null;
+}
+
+// The report: the pass's text, then the notes that this step left as they were, and why.
+function labelReportText(report, skipped) {
+  const parts = [report.trimEnd()];
+  if (skipped.length > 0) parts.push(['## Not written', ...skipped.map((s) => `- ${shown(s.path)}: ${s.reason}`)].join('\n'));
+  return `${parts.filter((part) => part !== '').join('\n\n')}\n`;
+}
+
+// Writes the labels that `<work>/label-plan.json` names (`{ entries: [{ path, label, sha256 }],
+// report }`, whose SHA-256 the driver gives) and commits them with the report. The plan is checked
+// whole before anything else: one that is not well formed is rejected and nothing is written.
+// `digests` holds, for each scope the entries name, its digest after the first sync (`before`, right
+// before writing) and right after writing (`after`). `sync` is the last sync the step ran.
+function stepLabelApply(config, rest) {
+  const a = parseStepArgs(rest, ['--work', '--plan-sha256']);
+  const work = checkWork(config, a['--work']);
+  const none = { written: [], unchanged: [], skipped: [], digests: {}, reportError: null, sync: null };
+  const reject = (reason) => out({ outcome: 'rejected', reason, ...none });
+  const planBuf = readRegular(join(work, 'label-plan.json'));
+  if (!planBuf || sha256(planBuf) !== a['--plan-sha256']) {
+    reject('label-plan.json was changed after it was written');
+    return;
+  }
+  let plan;
+  try {
+    plan = JSON.parse(planBuf.toString('utf8'));
+  } catch {
+    reject('label-plan.json is not valid JSON');
+    return;
+  }
+  const problem = labelPlanProblem(plan);
+  if (problem) {
+    reject(problem);
+    return;
+  }
+  // Commits what sessions wrote meanwhile under the usual subject, so that the label commit holds
+  // only this step's changes. When it fails, nothing is written.
+  const preSync = syncInfo(writeStatus(config, runSync(config)));
+  if (!preSync.ok) {
+    out({ outcome: 'sync-failed', ...none, sync: preSync });
+    return;
+  }
+  const scopes = [...new Set(plan.entries.map((e) => scopeOfPath(e.path)))]
+    .map((name) => ({ name, dir: liveFolder(config, name) })).filter((s) => s.dir);
+  const before = scopes.map((s) => folderDigest(s.dir));
+  let applied;
+  try {
+    applied = applyLabelEntries(config.repoDir, plan.entries);
+  } catch (err) {
+    // Before the first write nothing was written: a plain error. After it, some labels are live and
+    // uncommitted (the next sync commits them); say so, never "nothing".
+    if (!err.partial) throw err;
+    out({ outcome: 'apply-interrupted', reason: firstLine(err), ...none, ...err.result, sync: preSync });
+    return;
+  }
+  const digests = Object.fromEntries(scopes.map((s, i) => [s.name, { before: before[i], after: folderDigest(s.dir) }]));
+  const { written, unchanged, skipped } = applied;
+  if (written.length === 0) {
+    out({ outcome: 'no-change', ...none, unchanged, skipped, digests, sync: preSync });
+    return;
+  }
+  let reportError = null;
+  try {
+    writeReport(config, `${new Date().toISOString().slice(0, 10)}-${config.host}-label.md`, labelReportText(plan.report, skipped));
+  } catch (err) {
+    reportError = firstLine(err);
+  }
+  const sync = syncInfo(writeStatus(config, runSync(config, { message: `consolidate(${config.host}): label ${written.length} note(s)` })));
+  out({ outcome: 'applied', written, unchanged, skipped, digests, reportError, sync });
+}
+
 function stepMain(args) {
   const [name, ...rest] = args;
-  // Once Node runs the apply step, it finishes and reports, even after Ctrl-C (which reaches the
-  // whole process group), SIGTERM or SIGHUP: killed part-way, it could have written or committed
-  // changes that the driver would then not know of. The handlers come first, before anything
-  // else runs (the imported modules only define functions and constants, and nothing before this
-  // line reads or writes the clone), so an apply step that dies from one of these signals has
-  // done nothing. It is bounded by the Git network time limits; the lock wait in run.sh comes
-  // before Node starts. A Git command killed by the same signal is a failed sync, reported as
-  // such. scan and snapshot change nothing and may die.
-  if (name === 'apply') for (const signal of INTERRUPT_SIGNALS) process.on(signal, () => {});
+  // Once Node runs an apply step (apply, label-apply), it finishes and reports, even after Ctrl-C
+  // (which reaches the whole process group), SIGTERM or SIGHUP: killed part-way, it could have
+  // written or committed changes that the driver would then not know of. The handlers come first,
+  // before anything else runs (the imported modules only define functions and constants, and
+  // nothing before this line reads or writes the clone), so an apply step that dies from one of
+  // these signals has done nothing. It is bounded by the Git network time limits; the lock wait in
+  // run.sh comes before Node starts. A Git command killed by the same signal is a failed sync,
+  // reported as such. scan, snapshot and label-read change nothing and may die.
+  if (name === 'apply' || name === 'label-apply') for (const signal of INTERRUPT_SIGNALS) process.on(signal, () => {});
   const config = loadConfig();
   if (!config || !config.consolidate) {
     out({ outcome: 'error', error: 'consolidation is not configured' });
@@ -518,7 +642,9 @@ function stepMain(args) {
     if (name === 'scan') stepScan(config, rest);
     else if (name === 'snapshot') stepSnapshot(config, rest);
     else if (name === 'apply') stepApply(config, rest);
-    else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ...');
+    else if (name === 'label-read') stepLabelRead(config, rest);
+    else if (name === 'label-apply') stepLabelApply(config, rest);
+    else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ... | label-read ... | label-apply ...');
     return 0;
   } catch (err) {
     process.stderr.write(`agent-memory consolidate-step ${String(name).slice(0, 20)}: ${firstLine(err)}\n`);
