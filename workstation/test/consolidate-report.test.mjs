@@ -54,7 +54,10 @@ const extractJson = (host, daysAgo, scope, extra = {}) => ({
 
 // A clone, a state folder and a configuration as a consolidation machine has them, with reports
 // of two machines, a run log and the record of Organize and of the label step.
-function reportFixture(t, { organize = 'Sun *-*-* 04:30' } = {}) {
+const LABEL_PART = { model: 'example-label-model', region: 'us-east-1', inputUsdPerMillion: 1.1, outputUsdPerMillion: 5.5 };
+const AGENTS_PART = { bucket: 'example-bucket', region: 'us-east-1' };
+
+function reportFixture(t, { organize = 'Sun *-*-* 04:30', extract = 'Sat *-*-* 03:00', label = LABEL_PART, agents = AGENTS_PART } = {}) {
   const tmp = tempDir(t);
   const home = join(tmp, 'home');
   const repo = join(tmp, 'notes');
@@ -119,7 +122,10 @@ function reportFixture(t, { organize = 'Sun *-*-* 04:30' } = {}) {
   const configFile = join(tmp, 'config.json');
   writeFileSync(configFile, JSON.stringify({
     enabled: true, host: 'alpha', repoDir: repo, stateDir: state, claudeDir: join(tmp, 'claude'),
-    consolidate: { command: '/bin/true', model: 'example-model', maxProjects: 2, ...(organize ? { organize } : {}) },
+    consolidate: {
+      command: '/bin/true', model: 'example-model', maxProjects: 2,
+      ...(organize ? { organize } : {}), ...(extract ? { extract } : {}), ...(label ? { label } : {}), ...(agents ? { agents } : {}),
+    },
   }));
   const env = isolatedEnv(home, { AGENT_MEMORY_CONFIG: configFile });
   return {
@@ -168,7 +174,10 @@ test('consolidate report gathers the reports of every machine, this machine\'s r
   assert.equal(report.backlog.scopes[0].lastOrganize, JSON.parse(readFileSync(join(f.state, 'consolidate.json'), 'utf8')).projects.global.lastOrganize);
   assert.equal(report.backlog.scopes[4].lastOrganize, null);
   assert.deepEqual(report.backlog.totals, { scopes: 6, withNotes: 5, notes: 6, due: 3, neverOrganized: 1, overLimits: 1 });
-  assert.deepEqual([report.backlog.maxProjects, report.backlog.etaWeeks], [2, 2]);
+  // How many Organize runs the due scopes take; the schedule says how often those run.
+  assert.deepEqual([report.backlog.maxProjects, report.backlog.etaRuns, 'etaWeeks' in report.backlog], [2, 2, false]);
+  assert.deepEqual(report.schedule, { extract: 'Sat *-*-* 03:00', organize: 'Sun *-*-* 04:30' });
+  assert.deepEqual(report.configured, { label: true, agents: true });
   // The labels of the notes, and what the next label run takes: notes without an entry or whose
   // entry is not their digest, never one Organize must repair first.
   assert.deepEqual(report.labels, {
@@ -216,15 +225,19 @@ test('--format md gives a short summary of the same report', (t) => {
   assert.match(text, /^Reports: 3 \(alpha 2, beta 1\)$/m);
   assert.match(text, new RegExp(`^- ${day(3)} alpha organize big: 0 added, 0 changed, 1 retired, USD 0\\.50 \\(from the Markdown\\)$`, 'm'));
   assert.match(text, new RegExp(`^- ${day(2)} beta extract kept: 1 added, 1 changed, 0 retired, USD unknown$`, 'm'));
-  assert.match(text, /^Organize backlog: 3 of 5 scope\(s\) with notes due \(1 never organized, 1 over the index limits\); about 2 week\(s\) at 2 a run$/m);
+  assert.match(text, /^Schedule: Extract Sat \*-\*-\* 03:00, Organize Sun \*-\*-\* 04:30; the label step and the agent scopes are configured$/m);
+  assert.match(text, /^Organize backlog: 3 of 5 scope\(s\) with notes due \(1 never organized, 1 over the index limits\); about 2 Organize run\(s\) of 2 scope\(s\)$/m);
   assert.match(text, /^Labels: 2 work, 1 personal, 1 general, 2 unlabeled; 4 note\(s\) for the next label run$/m);
   assert.match(text, /^Problems: 4$/m);
   assert.match(text, /^- runs\.jsonl line 3: not valid JSON$/m);
   assert.match(text, new RegExp(`^- _reports/${day(4)}-alpha-label\\.json: not valid JSON$`, 'm'));
   // Without an Organize schedule there is no estimate.
-  const g = reportFixture(t, { organize: null });
-  assert.doesNotMatch(g.report().stdout, /week/);
-  assert.equal(g.json().backlog.etaWeeks, null);
+  const g = reportFixture(t, { organize: null, extract: null, label: null, agents: null });
+  const plain = g.report().stdout;
+  assert.doesNotMatch(plain, /Organize run/);
+  assert.match(plain, /^Schedule: Extract none, Organize none; neither the label step nor the agent scopes are configured$/m);
+  const json = g.json();
+  assert.deepEqual([json.backlog.etaRuns, json.schedule, json.configured], [null, { extract: null, organize: null }, { label: false, agents: false }]);
 });
 
 test('consolidate report writes nothing, takes no lock and runs while a consolidation holds its lock', async (t) => {
@@ -260,7 +273,7 @@ test('a missing clone, state or configuration', (t) => {
     { file: null, problem: 'the consolidate block is invalid (maxTurns)' },
     { file: 'consolidate.json', problem: 'not valid JSON' },
   ]);
-  assert.equal(odd.backlog.etaWeeks, null);
+  assert.deepEqual([odd.backlog.etaRuns, odd.schedule, odd.configured], [null, { extract: null, organize: null }, { label: false, agents: false }]);
   assert.equal(readFileSync(join(f.state, 'consolidate.json'), 'utf8'), 'not json', 'never moved aside');
   assert.equal(odd.labels.recorded, false);
   writeFileSync(f.configFile, 'not json');

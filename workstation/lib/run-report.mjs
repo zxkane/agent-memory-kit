@@ -176,8 +176,8 @@ function scopeDirs(config, problems) {
 
 // Organize's backlog: for each scope its notes, whether it is due (organizeDue) and why, whether it
 // was ever organized, whether its index is over the limits, and when it was last organized; the
-// totals (of the scopes that hold notes), and with an Organize schedule how many weekly runs of
-// maxProjects scopes the due scopes take.
+// totals (of the scopes that hold notes), and with an Organize schedule how many runs of maxProjects
+// scopes the due scopes take (`etaRuns`; how often those run follows from the schedule).
 function readBacklog(config, scopes, state, now, problems) {
   const list = [];
   for (const s of scopes) {
@@ -205,7 +205,7 @@ function readBacklog(config, scopes, state, now, problems) {
       neverOrganized: withNotes.filter((x) => x.neverOrganized).length, overLimits: withNotes.filter((x) => x.overLimits).length,
     },
     maxProjects: c?.maxProjects ?? null,
-    etaWeeks: c?.organize ? Math.ceil(due / c.maxProjects) : null,
+    etaRuns: c?.organize ? Math.ceil(due / c.maxProjects) : null,
   };
 }
 
@@ -261,8 +261,11 @@ export function consolidationReport({ config, now, since }) {
     problems.push({ file: null, problem: clone });
   }
   const state = readState(config.stateDir, problems);
+  const c = config.consolidate;
   return {
     schemaVersion: REPORT_SCHEMA_VERSION, generatedAt: now.toISOString(), host: config.host, window,
+    // The timers' calendar expressions and the parts of the consolidate block, as this machine has them.
+    schedule: { extract: c?.extract ?? null, organize: c?.organize ?? null }, configured: { label: !!c?.label, agents: !!c?.agents },
     reports, runs, backlog: readBacklog(config, scopes, state, now, problems), labels: readLabels(scopes, state, problems), problems,
   };
 }
@@ -303,7 +306,12 @@ function reportLine(r) {
 
 // The report as a short text for a terminal.
 export function reportSummary(report) {
-  const lines = [`Consolidation on ${report.host}, ${minute(report.window.since)} to ${minute(report.window.until)} UTC`, ''];
+  const lines = [`Consolidation on ${report.host}, ${minute(report.window.since)} to ${minute(report.window.until)} UTC`];
+  const { label, agents } = report.configured;
+  const parts = label && agents ? 'the label step and the agent scopes are configured'
+    : label ? 'the label step is configured, the agent scopes are not'
+      : agents ? 'the agent scopes are configured, the label step is not' : 'neither the label step nor the agent scopes are configured';
+  lines.push(`Schedule: Extract ${report.schedule.extract ?? 'none'}, Organize ${report.schedule.organize ?? 'none'}; ${parts}`, '');
   const failed = report.runs.filter((r) => r.exitCode !== 0).length;
   lines.push(report.runs.length === 0 ? 'Runs on this machine: none' : `Runs on this machine: ${report.runs.length}, ${failed} failed`);
   lines.push(...report.runs.map(runLine), '');
@@ -314,7 +322,7 @@ export function reportSummary(report) {
   const b = report.backlog;
   let backlog = `Organize backlog: ${b.totals.due} of ${b.totals.withNotes} scope(s) with notes due`
     + ` (${b.totals.neverOrganized} never organized, ${b.totals.overLimits} over the index limits)`;
-  if (b.etaWeeks !== null) backlog += `; about ${b.etaWeeks} week(s) at ${b.maxProjects} a run`;
+  if (b.etaRuns !== null) backlog += `; about ${b.etaRuns} Organize run(s) of ${b.maxProjects} scope(s)`;
   lines.push(backlog);
   const c = report.labels.counts;
   lines.push(`Labels: ${c.work} work, ${c.personal} personal, ${c.general} general, ${c.unlabeled} unlabeled;`
