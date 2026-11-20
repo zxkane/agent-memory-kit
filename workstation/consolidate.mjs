@@ -31,7 +31,9 @@ import {
 } from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
-import { buildReport, labelReportHead, shown, usd } from './lib/reports.mjs';
+import {
+  REPORT_NAME_RE, buildReport, labelPlanData, labelReportData, labelReportHead, reportData, shown, usd,
+} from './lib/reports.mjs';
 import {
   GLOBAL, INDEX_MAX_BYTES, INDEX_MAX_LINES, cloneProblem, isPlainName, listProjects, liveFolder, lstatOrNull, organizeScopes, projectsDir,
   scopeFolder, scopeInfo, timeOf,
@@ -56,7 +58,6 @@ const REPAIR_MIN_USD = 0.1;
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
 const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run]';
-const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const RETENTION_RE = /^(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)$/;
@@ -65,6 +66,8 @@ const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 const isMissing = (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const out = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+// A report's JSON twin as its file holds it.
+const jsonText = (obj) => `${JSON.stringify(obj, null, 2)}\n`;
 
 function parseRetention(value) {
   if (typeof value !== 'string' || !RETENTION_RE.test(value)) return null;
@@ -110,12 +113,15 @@ function conversationOf(digest) {
 
 function conversationArg(conversation) {
   if (!conversation) return 'none';
-  return conversation.truncated ? `cut,${conversation.bytes},${conversation.sessionsLeftOut}` : 'complete';
+  return conversation.truncated ? `cut,${conversation.bytes},${conversation.sessionsLeftOut}` : `complete,${conversation.bytes}`;
 }
 
+// `complete` without a size is what a driver of an older kit gives.
 function parseConversationArg(value) {
   if (value === 'none') return null;
   if (value === 'complete') return { truncated: false, bytes: null, sessionsLeftOut: 0 };
+  const whole = /^complete,(\d{1,12})$/.exec(value ?? '');
+  if (whole) return { truncated: false, bytes: Number(whole[1]), sessionsLeftOut: 0 };
   const m = /^cut,(\d{1,12}),(\d{1,9})$/.exec(value ?? '');
   if (!m) throw new Error('invalid --conversation');
   return { truncated: true, bytes: Number(m[1]), sessionsLeftOut: Number(m[2]) };
@@ -244,13 +250,13 @@ function writeReport(config, name, text) {
   }
 }
 
-// Deletes reports whose date is more than REPORT_KEEP_DAYS days before `now`.
+// Deletes reports, and their JSON twins, whose date is more than REPORT_KEEP_DAYS days before `now`.
 function pruneReports(config, now) {
   const dir = join(config.repoDir, '_reports');
   if (!lstatOrNull(dir)?.isDirectory()) return;
   const cutoff = new Date(now.getTime() - REPORT_KEEP_DAYS * DAY_MS).toISOString().slice(0, 10);
   for (const name of readdirSync(dir)) {
-    const m = REPORT_RE.exec(name);
+    const m = REPORT_NAME_RE.exec(name);
     if (!m || m[1] >= cutoff) continue;
     if (lstatOrNull(join(dir, name))?.isFile()) unlinkSync(join(dir, name));
   }
@@ -320,9 +326,8 @@ function stepApply(config, rest) {
     const buf = readRegular(join(pair.workDir, c.file));
     if (buf && sha256(buf) === c.hash) descriptions.set(`${c.label}/${c.file}`, cleanDescription(parseNote(buf.toString('utf8')).description));
   }
-  const report = () => buildReport({
-    config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired,
-  });
+  const reportArgs = { config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired };
+  const report = () => buildReport(reportArgs);
 
   let outcome;
   if (ev.liveChanged.length > 0) outcome = 'changed-meanwhile';
@@ -356,7 +361,9 @@ function stepApply(config, rest) {
   const digest = folderDigest(pairs[0].liveDir);
   let reportError = null;
   try {
-    writeReport(config, `${date}-${config.host}-${kind}-${scope}.md`, report());
+    const name = `${date}-${config.host}-${kind}-${scope}`;
+    writeReport(config, `${name}.md`, report());
+    writeReport(config, `${name}.json`, jsonText(reportData(reportArgs)));
     if (kind === 'organize') pruneReports(config, now);
   } catch (err) {
     reportError = errorText(err);
@@ -424,7 +431,9 @@ function labelReportText(report, skipped) {
 }
 
 // Writes the labels that `<work>/label-plan.json` names (`{ entries: [{ path, label, sha256 }],
-// report }`, whose SHA-256 the driver gives) and commits them with the report. The plan is checked
+// report, data }`, whose SHA-256 the driver gives) and commits them with the report and its JSON
+// twin, made from `data` (labelPlanData's; a plan without it gives a twin with what this step did
+// only) and what this step did. The plan is checked
 // whole before anything else: one that is not well formed is rejected and nothing is written.
 // `digests` holds, for each scope the entries name, its digest after the first sync (`before`, right
 // before writing) and right after writing (`after`); `after` is null when anything but this step's
@@ -486,7 +495,10 @@ function stepLabelApply(config, rest) {
   }
   let reportError = null;
   try {
-    writeReport(config, `${new Date().toISOString().slice(0, 10)}-${config.host}-label.md`, labelReportText(plan.report, skipped));
+    const date = new Date().toISOString().slice(0, 10);
+    writeReport(config, `${date}-${config.host}-label.md`, labelReportText(plan.report, skipped));
+    const twin = labelReportData({ host: config.host, date, data: plan.data, written, unchanged, skipped });
+    writeReport(config, `${date}-${config.host}-label.json`, jsonText(twin));
   } catch (err) {
     reportError = errorText(err);
   }
@@ -1456,7 +1468,11 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   let outcome = { applied: null, headline: nothing ? 'label: nothing to do' : `label: nothing written, ${figures}`, details: [], failed: false };
   if (entries.length > 0) {
     if (await signalsHandled()) return { failed };
-    outcome = await applyLabelPlan({ config, work, entries, report, figures, held: held.length });
+    const reportFigures = labelPlanData({
+      model: label.model, asked, touched: touched.length, exceptions: exceptions.length, confirmed: confirmed.length, results,
+      held: held.map((e) => e.path),
+    });
+    outcome = await applyLabelPlan({ config, work, entries, report, data: reportFigures, figures, held: held.length });
     if (outcome.interrupted) return { failed };
   }
   failed ||= outcome.failed;
@@ -1499,13 +1515,14 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
 }
 
 // Writes the plan and runs label-apply on it: the step's result (`applied`, null when it ended
-// without one), the headline and the lines to print, and whether the step failed the pass. `held`:
+// without one), the headline and the lines to print, and whether the step failed the pass. `data`:
+// the figures of the report's JSON twin (labelPlanData). `held`:
 // the exceptions left out of the plan because their notes hold their labels; the headline counts
 // them as unchanged.
 // `interrupted` when a signal killed the step, which is possible only before its handlers existed,
 // so before it did anything (see stepMain). A step that finished stands, signal or not.
-async function applyLabelPlan({ config, work, entries, report, figures, held }) {
-  const planText = `${JSON.stringify({ entries, report }, null, 2)}\n`;
+async function applyLabelPlan({ config, work, entries, report, data, figures, held }) {
+  const planText = `${JSON.stringify({ entries, report, data }, null, 2)}\n`;
   writeFileSync(join(work, 'label-plan.json'), planText, { mode: 0o600, flag: 'wx' });
   const step = runStep(['label-apply', '--work', work, '--plan-sha256', sha256(planText)]);
   await signalsHandled();

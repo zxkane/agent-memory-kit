@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildReport, labelReportHead } from '../lib/reports.mjs';
+import { labelReport, labelResults } from '../lib/label-run.mjs';
+import { buildReport, labelPlanData, labelReportData, labelReportHead, parseReport, reportData } from '../lib/reports.mjs';
 
 // A name that the secret scan flags, built at run time so that this file holds no such literal.
 const KEY = ['AKIA', 'Q3JZ7XK2M4N8P6R1'].join('');
@@ -204,4 +205,167 @@ test('labelReportHead gives the head of the label report as before', () => {
     '- Model: example-label-model; requests: 3; cost: USD 0.01',
     '- Notes: 7 touched, 5 sent to the model, 1 with an exception, 2 recorded as they were',
   ]);
+});
+
+test('reportData gives the figures of the report as JSON, without a description or a text', () => {
+  const data = reportData(CASES.projectOrganize);
+  assert.deepEqual(data, {
+    schemaVersion: 1, host: 'alpha', kind: 'organize', scope: 'example-project', date: '2026-11-20', model: 'example-model',
+    stopReason: 'completed', costUsd: 0.25, turns: 4, denials: 1, repaired: 2, conversation: null,
+    folders: [
+      {
+        folder: 'projects/example-project', changed: true, indexBefore: { lines: 2, bytes: 64 }, indexAfter: { lines: 1, bytes: 32 },
+        unlistedBefore: 0, unlistedAfter: 0, notesBytesBefore: 300, notesBytesAfter: 180, retiredBytes: 120,
+      },
+      {
+        folder: 'global', changed: true, indexBefore: { lines: 1, bytes: 30 }, indexAfter: { lines: 2, bytes: 61 },
+        unlistedBefore: 0, unlistedAfter: 0, notesBytesBefore: 100, notesBytesAfter: 160, retiredBytes: 0,
+      },
+    ],
+    retention: { termsKept: 37, termsBefore: 40, share: 0.925 },
+    counts: { added: 1, changed: 3, retired: 1, notApplied: 2 },
+    changes: [
+      { kind: 'add', path: 'global/new.md' },
+      { kind: 'change', path: 'MEMORY.md' },
+      { kind: 'change', path: 'a.md' },
+      { kind: 'change', path: 'global/MEMORY.md' },
+      { kind: 'retire', path: 'b.md', target: 'a.md' },
+    ],
+  });
+  assert.doesNotMatch(JSON.stringify(data), /A new global note/);
+  // Every folder of the scope is listed, also one the run did not change; Extract says what reached the model.
+  const extract = reportData(CASES.extractCut);
+  assert.deepEqual(extract.conversation, { truncated: true, bytes: 10000, sessionsLeftOut: 3 });
+  assert.deepEqual([extract.costUsd, extract.turns, extract.denials, extract.scope], [null, null, null, 'p q']);
+  assert.deepEqual(extract.counts, { added: 1, changed: 1, retired: 0, notApplied: 3 });
+  assert.deepEqual(reportData(CASES.nothing).folders.map((f) => [f.folder, f.changed]), [['projects/p', false], ['global', false]]);
+  assert.deepEqual(reportData(CASES.globalWithheld).folders.map((f) => f.folder), ['global']);
+  // A name that looks like a credential is withheld as in the report.
+  const withheld = reportData(CASES.globalWithheld);
+  assert.deepEqual(withheld.changes.filter((c) => c.kind === 'retire'), [{ kind: 'retire', path: '(file name withheld)', target: 'keys.md' }]);
+  assert.ok(!JSON.stringify(withheld).includes(`"${KEY}.md"`));
+});
+
+// What the Markdown of a report holds of its JSON: the cost in cents, no size of a complete
+// conversation, and the folders it shows (its own, and global/ when the run changed it), with
+// note sizes only for a folder the run changed.
+function markdownView(data) {
+  const own = data.folders[0].folder;
+  return {
+    ...data,
+    costUsd: data.costUsd === null ? null : Number(data.costUsd.toFixed(2)),
+    conversation: data.conversation && { ...data.conversation, bytes: data.conversation.truncated ? data.conversation.bytes : null },
+    folders: data.folders.filter((f) => f.folder === own || f.changed)
+      .map((f) => (f.changed ? f : { ...f, notesBytesBefore: null, notesBytesAfter: null, retiredBytes: null })),
+  };
+}
+
+test('parseReport reads back from the Markdown what buildReport wrote', () => {
+  for (const [name, c] of Object.entries(CASES)) assert.deepEqual(parseReport(buildReport(c)), markdownView(reportData(c)), name);
+  // A long cost and every share of terms survive as the report shows them.
+  const c = { ...CASES.onlyGlobal, costUsd: 0.123456, ev: { ...CASES.onlyGlobal.ev, stats: { ...CASES.onlyGlobal.ev.stats, retention: { termsBefore: 7, termsKept: 2, share: 2 / 7 } } } };
+  const back = parseReport(buildReport(c));
+  assert.equal(back.costUsd, 0.12);
+  assert.deepEqual(back.retention, { termsKept: 2, termsBefore: 7, share: 2 / 7 });
+});
+
+test('parseReport returns null for a text that is not a report the kit wrote', () => {
+  const good = buildReport(CASES.projectOrganize);
+  const bad = [
+    '', '# old\n', 'kept\n', '# Organize p — 2026-11-20 on alpha\n',
+    good.replace('- Notes not listed in the index: 0 → 0\n', '- Something else: 1\n'),
+    good.replace('## Retired\n', '## Moved\n'),
+    good.replace('- Distinct terms kept: 92% (37 of 40)\n', ''),
+    good.replace('- Model: example-model; turns: 4;', '- Model: example-model; turns: four;'),
+    good.replace('- b.md → a.md\n', 'b.md → a.md\n'),
+    good.replace(' on alpha\n', ' on Alpha\n'),
+    '# Labels — 2026-11-20 on alpha\n\n- Model: m; requests: x; cost: USD 0.00\n',
+  ];
+  for (const text of bad) assert.equal(parseReport(text), null, JSON.stringify(text.slice(0, 80)));
+});
+
+// A label run over global/ and projects/p, as the driver sees it before label-apply.
+function labelRun() {
+  const note = (path, domain = null, skip = null) => ({ path, scope: path.slice(0, path.lastIndexOf('/')), digest: '0'.repeat(64), domain, skip });
+  const notes = [
+    note('global/a.md'), note('global/b.md', 'general'), note('global/c.md', 'work'), note('global/d.md', null, 'no frontmatter'),
+    note('global/e.md', 'personal'), note('global/h.md', 'work'), note('projects/p/f.md', 'work'), note('projects/p/g.md'),
+  ];
+  const planned = new Map([
+    ['global/a.md', { label: 'work', reason: 'MODEL-REASON about the job', exception: false }],
+    ['global/b.md', { label: 'personal', reason: null, exception: true }],
+    ['global/e.md', { label: 'personal', reason: 'MODEL-REASON the same', exception: false }],
+    ['global/h.md', { label: 'work', reason: null, exception: true }],
+    ['projects/p/f.md', { label: 'general', reason: 'MODEL-REASON a public tool', exception: false }],
+  ]);
+  const left = new Map([
+    ['global/c.md', 'the model call failed (Mantle Responses HTTP 500)'],
+    ['projects/p/g.md', 'not sent; the model cost of this run reached its ceiling'],
+  ]);
+  const exceptions = new Map([['global/b.md', 'personal'], ['global/h.md', 'work'], ['global/gone.md', 'work']]);
+  const results = labelResults({ scopes: ['global', 'projects/p'], notes, planned, left, exceptions });
+  const asked = { spent: 0.0028, requests: 2, sent: 3, stop: 'ceiling' };
+  // As label-plan.json carries it.
+  const data = JSON.parse(JSON.stringify(labelPlanData({
+    model: 'example-label-model', asked, touched: 4, exceptions: 1, confirmed: 2, results, held: ['global/h.md'],
+  })));
+  const applied = {
+    written: [{ path: 'global/a.md', sha256: '1'.repeat(64) }, { path: 'global/b.md', sha256: '2'.repeat(64) }],
+    unchanged: [{ path: 'global/e.md', sha256: '3'.repeat(64) }],
+    skipped: [{ path: 'projects/p/f.md', reason: 'changed since it was read' }],
+  };
+  return { results, asked, data, applied };
+}
+
+test('the JSON of the label report counts what label-apply did in each scope, with the figures of the plan', () => {
+  const { data, applied } = labelRun();
+  assert.doesNotMatch(JSON.stringify(data), /MODEL-REASON|Mantle Responses/);
+  const json = labelReportData({ host: 'alpha', date: '2026-11-20', data, ...applied });
+  assert.deepEqual(json, {
+    schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', model: 'example-label-model', stopReason: 'ceiling',
+    costUsd: 0.0028, turns: null, denials: null, repaired: null, requests: 2, sent: 3,
+    notes: { touched: 4, exceptions: 1, recordedAsTheyWere: 2 },
+    written: 2, unchanged: 2, notWritten: 1,
+    scopes: [
+      {
+        scope: 'global', set: 1, changed: 1, unchanged: 2, left: 1, leftReasons: { 'model-call-failed': 1 }, needsRepair: 1,
+        unmatchedExceptions: 1, labelsAfter: { work: 3, personal: 2, general: 0, unlabeled: 1 },
+      },
+      {
+        scope: 'projects/p', set: 0, changed: 0, unchanged: 0, left: 2, leftReasons: { ceiling: 1, 'changed-since-read': 1 }, needsRepair: 0,
+        unmatchedExceptions: 0, labelsAfter: { work: 0, personal: 0, general: 1, unlabeled: 1 },
+      },
+    ],
+  });
+  assert.equal(labelReportData({ host: 'alpha', date: '2026-11-20', data: { ...data, stop: null }, ...applied }).stopReason, 'completed');
+  // Without the plan's figures (a plan that has none), only what label-apply knows.
+  assert.deepEqual(labelReportData({ host: 'alpha', date: '2026-11-20', data: undefined, ...applied }), {
+    schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', model: null, stopReason: null,
+    costUsd: null, turns: null, denials: null, repaired: null, requests: null, sent: null,
+    notes: { touched: null, exceptions: null, recordedAsTheyWere: null },
+    written: 2, unchanged: 1, notWritten: 1,
+    scopes: [
+      { scope: 'global', set: null, changed: null, unchanged: 1, left: 0, leftReasons: {}, needsRepair: null, unmatchedExceptions: null, labelsAfter: null },
+      {
+        scope: 'projects/p', set: null, changed: null, unchanged: 0, left: 1, leftReasons: { 'changed-since-read': 1 }, needsRepair: null,
+        unmatchedExceptions: null, labelsAfter: null,
+      },
+    ],
+  });
+  // Figures of the wrong type are not passed on.
+  const odd = labelReportData({ host: 'alpha', date: '2026-11-20', data: { model: 7, costUsd: '1', scopes: [{ scope: 'global', labelsAfter: { work: 'x' } }] }, ...applied });
+  assert.deepEqual([odd.model, odd.costUsd, odd.scopes[0].labelsAfter], [null, null, null]);
+});
+
+test('parseReport reads back the head of a label report', () => {
+  const { results, asked, data, applied } = labelRun();
+  const text = [
+    ...labelReportHead({ date: '2026-11-20', host: 'alpha', model: 'example-label-model', requests: asked.requests, costUsd: asked.spent, touched: 4, sent: asked.sent, exceptions: 1, confirmed: 2 }),
+    '', labelReport(results).trimEnd(),
+  ].join('\n').concat('\n');
+  const json = labelReportData({ host: 'alpha', date: '2026-11-20', data, ...applied });
+  // The Markdown holds the head only: the cost in cents, and nothing of what label-apply did.
+  assert.deepEqual(parseReport(text), {
+    ...json, stopReason: null, costUsd: Number(json.costUsd.toFixed(2)), written: null, unchanged: null, notWritten: null, scopes: null,
+  });
 });

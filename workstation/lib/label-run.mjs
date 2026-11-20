@@ -86,6 +86,25 @@ const NOT_SENT = {
   'token-age': 'not sent; the label token of this run was near the end of its hour',
 };
 const TOKEN_NOT_MADE = 'not sent; the label token could not be made';
+// Why label-apply did not write a note (labelNote in label-notes.mjs), and why setDomain cannot
+// edit its frontmatter (domains.mjs).
+const NOT_WRITTEN = {
+  gone: 'gone', 'changed since it was read': 'changed-since-read', 'not UTF-8 text': 'not-utf8',
+  'no frontmatter': 'frontmatter', 'frontmatter not closed': 'frontmatter', 'metadata is not a block': 'frontmatter',
+};
+
+// Why a note was left for the next run or not written, as one fixed word for the JSON report: a
+// stop of sendBatches (`interrupted`, `failures`, `ceiling`, `token-age`), `token-not-made`,
+// `model-call-failed`, a reason of label-apply or of the frontmatter, or `other`. Never the text of
+// an error, which may hold whatever an endpoint answered.
+export function leftCategory(why) {
+  const text = String(why);
+  const stop = Object.keys(NOT_SENT).find((key) => NOT_SENT[key] === text);
+  if (stop !== undefined) return stop;
+  if (text === TOKEN_NOT_MADE) return 'token-not-made';
+  if (text.startsWith('the model call failed (')) return 'model-call-failed';
+  return Object.hasOwn(NOT_WRITTEN, text) ? NOT_WRITTEN[text] : 'other';
+}
 
 // Sends the batches to the model in order, one `labelBatch(notes)` each: the caller's call, with
 // its token source, persona and endpoint, giving labelBatch's result. A batch of several notes whose
