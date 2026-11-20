@@ -244,6 +244,21 @@ test('tagLine keeps the rest of the hook exactly', () => {
   assert.equal(tagLine(spaces, 'general'), spaces);
 });
 
+test('tagLine drops the gap at the start of a hook it tags, so tagging again gives the same line', () => {
+  // Spaces, a tab or a format character before the hook, without a tag.
+  for (const gap of ['  ', '\t', '\u200b']) {
+    const line = `- [A](a.md) — ${gap}about`;
+    for (const label of ['work', 'personal']) {
+      const once = tagLine(line, label);
+      assert.equal(once, `- [A](a.md) — [${label}] about`, JSON.stringify(gap));
+      assert.equal(tagLine(once, label), once, JSON.stringify(gap));
+    }
+    // A general or unlabeled line without a tag run stays exactly as it is.
+    assert.equal(tagLine(line, 'general'), line, JSON.stringify(gap));
+    assert.equal(tagLine(line, null), line, JSON.stringify(gap));
+  }
+});
+
 test('tagIndexLines reads each linked note of the folder', t => {
   const dir = tmp(t);
   writeFileSync(join(dir, 'a.md'), NOTE.replace('  originSessionId: x', '  domain: work'));

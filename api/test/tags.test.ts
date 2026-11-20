@@ -61,3 +61,18 @@ test('tagIndexText also strips a tag token at the end of the line or before a ta
     assert.equal(tag(once, 'work'), once);
   }
 });
+
+test('tagIndexText drops the gap at the start of a hook it tags, so tagging again gives the same line', () => {
+  // Spaces, a tab or a format character before the hook, without a tag.
+  for (const gap of ['  ', '\t', '\u200b']) {
+    const line = `- [A](a.md) — ${gap}about`;
+    for (const domain of ['work', 'personal'] as const) {
+      const once = tag(line, domain);
+      assert.equal(once, `- [A](a.md) — [${domain}] about`, JSON.stringify(gap));
+      assert.equal(tag(once, domain), once, JSON.stringify(gap));
+    }
+    // A general or unlabeled line without a tag run stays exactly as it is.
+    assert.equal(tag(line, 'general'), line, JSON.stringify(gap));
+    assert.equal(tagIndexText(line, new Map()), line, JSON.stringify(gap));
+  }
+});
