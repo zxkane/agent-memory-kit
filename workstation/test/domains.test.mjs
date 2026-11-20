@@ -159,6 +159,21 @@ test('tagLine leaves other lines alone', () => {
   }
 });
 
+test('tagLine also strips a tag token at the end of the line or before a tab', () => {
+  assert.equal(tagLine('- [A](a.md) — [work]', 'general'), '- [A](a.md) — ');
+  assert.equal(tagLine('- [A](a.md) — [work]', 'personal'), '- [A](a.md) — [personal] ');
+  assert.equal(tagLine('- [A](a.md) — [personal]\r', 'general'), '- [A](a.md) — \r');
+  assert.equal(tagLine('- [A](a.md) — [personal]\r', null), '- [A](a.md) — \r');
+  assert.equal(tagLine('- [A](a.md) — [work]\tabout a', 'general'), '- [A](a.md) — \tabout a');
+  assert.equal(tagLine('- [A](a.md) — [work]\tabout a', 'personal'), '- [A](a.md) — [personal] \tabout a');
+  assert.equal(tagLine('- [A](a.md) — about [work]', 'general'), '- [A](a.md) — about [work]');
+  assert.equal(tagLine('- [A](a.md) — [workx] about a', 'general'), '- [A](a.md) — [workx] about a');
+  for (const line of ['- [A](a.md) — [work]', '- [A](a.md) — [personal]\r', '- [A](a.md) — [work]\tx']) {
+    const once = tagLine(line, 'work');
+    assert.equal(tagLine(once, 'work'), once);
+  }
+});
+
 test('tagLine takes the tag only from the note', () => {
   assert.equal(tagLine('- [A](a.md) — [work] about a', 'personal'), '- [A](a.md) — [personal] about a');
   assert.equal(tagLine('- [A](a.md) — [work] about a', 'general'), '- [A](a.md) — about a');

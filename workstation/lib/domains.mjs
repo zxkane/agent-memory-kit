@@ -9,7 +9,7 @@ const MAX_DOMAINS_BYTES = 1024 * 1024;
 const MAX_PERSONA_CHARS = 20000;
 const MAX_NOTE_BYTES = 1024 * 1024;
 const TAG_LINE_RE = /^- \[[^\]]*\]\(([A-Za-z0-9][A-Za-z0-9._-]*\.md)\) — /;
-const TAG_RUN_RE = /^(?:\[(?:work|personal)\] )+/;
+const TAG_RUN_RE = /^(?:\[(?:work|personal)\](?: |(?=\t)|(?=\r?$)))+/;
 const SCOPE_RE = /^(?:global|projects\/([^/]+)|agents\/([^/]+))$/;
 
 // Same unquoting as parseNote.
@@ -158,7 +158,7 @@ export function readLabelInputs({ domainsFile, personaFile }) {
 }
 
 // The tag of an index line comes only from the note it links. In a line that links a note of its folder, the run
-// of `[work] ` / `[personal] ` tokens right after the dash is removed, then the note's own tag is inserted: work
+// of `[work]` / `[personal]` tokens right after the dash (each followed by a space, a tab or the end of the line) is removed, then the note's own tag is inserted: work
 // and personal get one, general and unlabeled notes none. Tagging a tagged line gives the same line.
 export function tagLine(line, label) {
   const m = TAG_LINE_RE.exec(line);
