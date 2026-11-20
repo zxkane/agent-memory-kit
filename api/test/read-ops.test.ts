@@ -205,6 +205,30 @@ test('memory_index tags work and personal lines', async () => {
   );
 });
 
+test('memory_index tags an agent scope from index/agents.json', async () => {
+  const entry = (path: string, domain?: string) => ({ ...note(path), ...(domain ? { domain } : {}) });
+  const store = fakeStore({
+    'agents/example-agent/MEMORY.md': '- [W](w.md) — about w\n- [P](p.md) — about p\n- [G](g.md) — [work] about g\n',
+    'index/agents.json': JSON.stringify({
+      version: 1,
+      notes: [
+        entry('agents/example-agent/w.md', 'work'),
+        entry('agents/example-agent/p.md', 'personal'),
+        entry('agents/example-agent/g.md', 'general'),
+        // The same file name in another agent's scope labels nothing here.
+        entry('agents/other-agent/g.md', 'work'),
+      ],
+    }),
+    'index/mem.json': JSON.stringify({ version: 1, notes: [entry('global/g.md', 'personal')] }),
+  });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/example-agent' });
+  assert.deepEqual(result, {
+    scope: 'agents/example-agent',
+    index: '- [W](w.md) — [work] about w\n- [P](p.md) — [personal] about p\n- [G](g.md) — about g\n',
+    truncated: false,
+  });
+});
+
 test('memory_index tags before it cuts to 25000 bytes', async () => {
   const lines = Array.from({ length: 400 }, (_, i) => `- [N${i}](n${i}.md) — ${'x'.repeat(80)}`);
   const store = fakeStore({
