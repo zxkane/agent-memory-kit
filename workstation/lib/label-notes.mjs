@@ -77,6 +77,15 @@ export function labelEntryProblem(entry) {
   return null;
 }
 
+// The record of what the label step last saw in the clone (`labels` in consolidate.json): path ->
+// SHA-256 of the note as the step wrote, found or confirmed it. Null without one, or with one of
+// another version: the next run is then a first run.
+export function labelRecordOf(state) {
+  const labels = state?.labels;
+  if (!isObject(labels) || labels.version !== 1 || !isObject(labels.notes)) return null;
+  return Object.fromEntries(Object.entries(labels.notes).filter(([, digest]) => typeof digest === 'string' && HASH_RE.test(digest)));
+}
+
 // The SHA-256 of each file of `files` (a name to content map, as noteFiles returns it), by name.
 export function digestsOf(files) {
   return new Map([...files].map(([name, buf]) => [name, sha256(buf)]));

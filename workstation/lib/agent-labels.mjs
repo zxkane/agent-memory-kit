@@ -223,17 +223,40 @@ async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
   return out;
 }
 
-// The line of a scope. `idle`: nothing of it was touched or left; `took`: a label was planned for it.
-// A scope whose only write was search entries given their note's label says how many.
-function headline(s, out, { dryRun, idle, took }) {
+// What came of a scope, as one word: `refreshed` (its only write was search entries given their
+// note's label), `nothing-to-do`, `dry-run`, `nothing-written` (notes of it were touched or left,
+// but no label was planned for it: its batches failed), `applied` or `no-change`. `idle`: nothing
+// of it was touched or left; `took`: a label was planned for it.
+function scopeOutcome(out, { dryRun, idle, took }) {
+  if (!took && out.refreshed > 0) return 'refreshed';
+  if (idle) return 'nothing-to-do';
+  if (dryRun) return 'dry-run';
+  if (!took) return 'nothing-written';
+  return out.written.length > 0 ? 'applied' : 'no-change';
+}
+
+// The line of a scope. A scope whose only write was search entries given their note's label says how many.
+function headline(s, out, outcome) {
   const scope = `label ${s.scope}`;
   const written = out.written.length;
-  if (!took && out.refreshed > 0) return `${scope}: no label written, ${out.refreshed} search entry(ies) refreshed`;
-  if (idle) return `${scope}: nothing to do`;
-  if (dryRun) return `${scope}: dry-run, ${written} label(s) to set or change`;
-  if (!took) return `${scope}: nothing written`;
+  if (outcome === 'refreshed') return `${scope}: no label written, ${out.refreshed} search entry(ies) refreshed`;
+  if (outcome === 'nothing-to-do') return `${scope}: nothing to do`;
+  if (outcome === 'dry-run') return `${scope}: dry-run, ${written} label(s) to set or change`;
+  if (outcome === 'nothing-written') return `${scope}: nothing written`;
   const notWritten = out.left.size > 0 ? `, ${out.left.size} not written` : '';
-  return `${scope}: ${written > 0 ? 'applied' : 'no-change'}, ${written} label(s) written, ${out.unchanged.length} unchanged${notWritten}`;
+  return `${scope}: ${outcome}, ${written} label(s) written, ${out.unchanged.length} unchanged${notWritten}`;
+}
+
+// The pass, for the run log: its outcome (`unreadable` when the bucket could not be read, `aborted`,
+// `nothing-to-do` without a scope, `dry-run`, otherwise `done`), whether it failed the run, why it
+// stopped before its last batch, the model's figures, and per scope what came of it (scopeOutcome)
+// with the labels written, found unchanged and not written.
+function passSummary(outcome, { failed = false, asked = null, scopes = [] } = {}) {
+  const sum = (key) => scopes.reduce((n, x) => n + x[key], 0);
+  return {
+    outcome, failed, stop: asked?.stop ?? null, costUsd: asked?.spent ?? 0, requests: asked?.requests ?? 0, sent: asked?.sent ?? 0,
+    written: sum('written'), unchanged: sum('unchanged'), notWritten: sum('notWritten'), scopes,
+  };
 }
 
 // The label pass over the agent scopes of the bucket (every scope, or `opts.agentNames`). `s3For`
@@ -244,7 +267,7 @@ function headline(s, out, { dryRun, idle, took }) {
 // `failed`: the bucket could not be read, the token source could not be made, a batch failed, or a
 // write failed. A signal before the writes stops it with nothing written; one later stops it before
 // the next scope's writes. Returns the lines to print: one per scope, then the report without the
-// model's reasons.
+// model's reasons; and `summary`, what it did, for the run log (passSummary).
 export async function labelAgentScopes({ config, opts, s3For, started, domains, persona, tokenSource, labelBatch = modelBatch, signal }) {
   const c = config.consolidate;
   const lines = [];
@@ -266,8 +289,9 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
       scopes.push({ agent, scope, files, record, ...(await readScope({ s3, scope, files, record, all: opts.all, domains, bare })) });
     }
   } catch (err) {
-    if (signal?.aborted) return { failed: false, lines };
-    return { failed: true, lines: [`label: the agent scopes could not be read (${errorText(err)}); no label was written.`] };
+    if (signal?.aborted) return { failed: false, lines, summary: passSummary('aborted') };
+    const why = `label: the agent scopes could not be read (${errorText(err)}); no label was written.`;
+    return { failed: true, lines: [why], summary: passSummary('unreadable', { failed: true }) };
   }
   // A run over every scope also names the exceptions of agent scopes it did not find: a typo there is never applied.
   const unread = opts.agentNames.length > 0 ? []
@@ -277,7 +301,7 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
     const report = labelReport([...results, ...unread], { reasons: false });
     return report === '' ? [] : report.trimEnd().split('\n');
   };
-  if (scopes.length === 0) return { failed: false, lines: ['label: nothing to do', ...reportLines([])] };
+  if (scopes.length === 0) return { failed: false, lines: ['label: nothing to do', ...reportLines([])], summary: passSummary('nothing-to-do') };
 
   // Only notes whose frontmatter the pass can edit go to the model or take an exception, and only
   // those that any label lets fit what the memory API accepts go to the model: the others stay
@@ -301,7 +325,7 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
   });
   if (asked.line) lines.push(asked.line);
   // Interrupted: nothing is written, and every note stays as it is.
-  if (asked.stop === 'interrupted' || signal?.aborted) return { failed: asked.failed, lines };
+  if (asked.stop === 'interrupted' || signal?.aborted) return { failed: asked.failed, lines, summary: passSummary('aborted', { failed: asked.failed, asked }) };
   if (asked.sent > 0) lines.push(`label: ${asked.sent} note(s) sent to the model, USD ${asked.spent.toFixed(2)}, ${asked.requests} request(s)`);
   let failed = asked.failed;
   const planned = plannedLabels(exceptions, asked.labels);
@@ -311,12 +335,13 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
   try {
     entries = await readSearchEntries(await s3For({ signal }));
   } catch (err) {
-    if (signal?.aborted) return { failed, lines };
+    if (signal?.aborted) return { failed, lines, summary: passSummary('aborted', { failed, asked }) };
     lines.push(`label: the search entries of the agent scopes could not be read (${errorText(err)}); no label was written.`);
-    return { failed: true, lines };
+    return { failed: true, lines, summary: passSummary('unreadable', { failed: true, asked }) };
   }
   const domainOf = new Map(entries.map((e) => [e.path, e.domain ?? null]));
   const results = [];
+  const done = [];
   for (const s of scopes) {
     if (signal?.aborted) break;
     const out = await writeScope({ s3For, s, planned, entries, started, dryRun: opts.dryRun });
@@ -324,7 +349,9 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
     const mine = (path) => path.startsWith(`${s.scope}/`);
     const took = [...planned.keys()].some(mine);
     const idle = !took && s.touched.length === 0 && s.left.size === 0;
-    lines.push(headline(s, out, { dryRun: opts.dryRun, idle, took }), ...out.details);
+    const outcome = scopeOutcome(out, { dryRun: opts.dryRun, idle, took });
+    done.push({ scope: s.scope, outcome, written: out.written.length, unchanged: out.unchanged.length, notWritten: out.left.size });
+    lines.push(headline(s, out, outcome), ...out.details);
     // The notes the pass did not read count with the label of their search entry.
     const read = new Set(s.read.map((n) => n.path));
     const notes = [
@@ -338,5 +365,6 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
     })[0]);
   }
   lines.push(...reportLines(results));
-  return { failed, lines };
+  const outcome = signal?.aborted ? 'aborted' : opts.dryRun ? 'dry-run' : 'done';
+  return { failed, lines, summary: passSummary(outcome, { failed, asked, scopes: done }) };
 }

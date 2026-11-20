@@ -173,13 +173,23 @@ test('the first run records labeled notes by ETag', async () => {
     'Labels after this run: 0 work, 1 personal, 0 general',
   ]);
   assert.doesNotMatch(out.lines.join('\n'), /MODEL-REASON|example-label-token/);
+  // What the pass did, for the run log: each scope's outcome as its line gives it, and the figures.
+  assert.deepEqual(out.summary, {
+    outcome: 'done', failed: false, stop: null, costUsd: 0.0028, requests: 2, sent: 2, written: 2, unchanged: 0, notWritten: 0,
+    scopes: [
+      { scope: 'agents/codex-alpha', outcome: 'applied', written: 1, unchanged: 0, notWritten: 0 },
+      { scope: 'agents/example-agent', outcome: 'applied', written: 1, unchanged: 0, notWritten: 0 },
+    ],
+  });
   // The next run finds nothing touched: it reads no note, takes no token source and asks no model.
   const from = b.fake.requests.length;
   const again = await pass(b, m, { tokenSource: t.tokenSource });
   assert.deepEqual(reads(b, from), []);
   assert.equal(t.made.length, 1);
   assert.equal(m.calls.length, 2);
-  assert.deepEqual(again, { failed: false, lines: ['label agents/codex-alpha: nothing to do', 'label agents/example-agent: nothing to do'] });
+  assert.deepEqual({ ...again, summary: undefined }, { failed: false, lines: ['label agents/codex-alpha: nothing to do', 'label agents/example-agent: nothing to do'], summary: undefined });
+  assert.deepEqual(again.summary.scopes.map((x) => x.outcome), ['nothing-to-do', 'nothing-to-do']);
+  assert.deepEqual([again.summary.outcome, again.summary.requests, again.summary.costUsd], ['done', 0, 0]);
   assert.deepEqual(b.scope('codex-alpha').labels, { 'deploy-steps.md': steps, 'deploys.md': b.etag('agents/codex-alpha/deploys.md') });
 });
 
@@ -494,7 +504,8 @@ test('a signal during the model calls writes nothing', async () => {
   assert.equal(m.calls.length, 1);
   assert.deepEqual(b.writes(), []);
   // The run says it was interrupted; the pass adds nothing to that.
-  assert.deepEqual(out, { failed: false, lines: [] });
+  assert.deepEqual({ ...out, summary: undefined }, { failed: false, lines: [], summary: undefined });
+  assert.deepEqual([out.summary.outcome, out.summary.requests, out.summary.written, out.summary.scopes], ['aborted', 1, 0, []]);
   assert.equal(b.text(STATE_KEY), undefined);
 });
 
@@ -667,7 +678,8 @@ test('a run over every agent scope names the exceptions of scopes it did not fin
   const empty = createFakeS3();
   const client = createS3({ bucket: 'example-bucket', region: 'ap-northeast-1', credentials, fetchImpl: empty.fetch, sleep: async () => {} });
   const none = await pass({ s3: async () => client }, model(), { domains: domainsOf({ exceptions }) });
-  assert.deepEqual(none, { failed: false, lines: ['label: nothing to do', '## agents/codex-alpha', '', 'Exceptions that name no note:', '- agents/codex-alpha/gone.md', '', '## agents/nobody', '', 'Exceptions that name no note:', '- agents/nobody/x.md'] });
+  assert.deepEqual({ ...none, summary: undefined }, { failed: false, lines: ['label: nothing to do', '## agents/codex-alpha', '', 'Exceptions that name no note:', '- agents/codex-alpha/gone.md', '', '## agents/nobody', '', 'Exceptions that name no note:', '- agents/nobody/x.md'], summary: undefined });
+  assert.equal(none.summary.outcome, 'nothing-to-do');
 });
 
 test('a search snapshot that cannot be read, before or after the model calls, writes no label', async () => {
@@ -675,7 +687,8 @@ test('a search snapshot that cannot be read, before or after the model calls, wr
   failOn(b, 'GET', SNAPSHOT_KEY, 1);
   const m = model();
   const first = await pass(b, m);
-  assert.deepEqual(first, { failed: true, lines: ['label: the agent scopes could not be read (get failed: 503 ServiceUnavailable); no label was written.'] });
+  assert.deepEqual({ ...first, summary: undefined }, { failed: true, lines: ['label: the agent scopes could not be read (get failed: 503 ServiceUnavailable); no label was written.'], summary: undefined });
+  assert.deepEqual([first.summary.outcome, first.summary.failed], ['unreadable', true]);
   assert.deepEqual(m.calls, []);
   // Read again right before the writes, for their limits.
   const c = bucket();
@@ -686,6 +699,8 @@ test('a search snapshot that cannot be read, before or after the model calls, wr
   assert.equal(n.calls.length, 2);
   assert.equal(second.lines.at(-1), 'label: the search entries of the agent scopes could not be read (get failed: 503 ServiceUnavailable); no label was written.');
   assert.deepEqual(c.writes(), []);
+  assert.deepEqual([second.summary.outcome, second.summary.failed, second.summary.requests], ['unreadable', true, 2]);
+  assert.doesNotMatch(JSON.stringify(second.summary), /ServiceUnavailable|503/);
 });
 
 test('when no S3 client can be made for the writes, the line says what was not done', async () => {

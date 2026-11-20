@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseDomains } from '../lib/domains.mjs';
 import {
-  FAILURES_IN_A_ROW, TOKEN_MAX_AGE_MS, askLabelModel, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched,
-  sendBatches, stopLine, unreadScopeResults,
+  FAILURES_IN_A_ROW, LABEL_STOPS, LEFT_WORDS, TOKEN_MAX_AGE_MS, askLabelModel, labelReport, labelResults, leftCategory, nextLabelRecord,
+  planLabelBatches, selectTouched, sendBatches, stopLine, unreadScopeResults,
 } from '../lib/label-run.mjs';
 
 const hex = (c) => c.repeat(64);
@@ -539,4 +539,31 @@ test('labelReport withholds a path or a reason that looks like a credential', ()
   const text = labelReport(results);
   assert.ok(!text.includes(key));
   assert.match(text, /^- \(file name withheld\): unlabeled → work — \(reason withheld\)$/m);
+});
+
+test('leftCategory names why a note was left with a fixed word, never with the text of an error', async () => {
+  // The reasons sendBatches and askLabelModel give.
+  const stopped = async (extra, model = fakeModel()) => Object.values(Object.fromEntries((await run(batchesOf('global', 'projects/p'), model, extra)).left));
+  assert.deepEqual((await stopped({ ceiling: 0 })).map(leftCategory), ['ceiling', 'ceiling']);
+  assert.deepEqual((await stopped({ now: () => TOKEN_MAX_AGE_MS, tokenAt: 0 })).map(leftCategory), ['token-age', 'token-age']);
+  assert.deepEqual((await stopped({}, fakeModel({ fails: [1, 2] }))).map(leftCategory), ['model-call-failed', 'model-call-failed']);
+  const abort = new AbortController();
+  abort.abort();
+  assert.deepEqual((await stopped({ signal: abort.signal })).map(leftCategory), ['interrupted', 'interrupted']);
+  const failures = await run(batchesOf('global', 'projects/p', 'projects/q'), fakeModel({ fails: [1, 2] }));
+  assert.equal(leftCategory(failures.left.get('projects/q/n.md')), 'failures');
+  const noToken = await askLabelModel({
+    batches: batchesOf('global'), tokenSource: async () => { throw new Error('no token'); }, labelBatch: fakeModel().labelBatch, ceiling: 5, now: () => 0,
+  });
+  assert.equal(leftCategory(noToken.left.get('global/n.md')), 'token-not-made');
+  // The reasons label-apply and the frontmatter give a note it does not write.
+  const skips = ['gone', 'changed since it was read', 'not UTF-8 text', 'no frontmatter', 'frontmatter not closed', 'metadata is not a block'];
+  assert.deepEqual(skips.map(leftCategory), ['gone', 'changed-since-read', 'not-utf8', 'frontmatter', 'frontmatter', 'frontmatter']);
+  assert.equal(leftCategory('anything else (with a detail)'), 'other');
+  // The lists the report checks a twin's words against.
+  assert.deepEqual(LEFT_WORDS, [
+    'interrupted', 'failures', 'ceiling', 'token-age', 'token-not-made', 'model-call-failed', 'gone', 'changed-since-read', 'not-utf8',
+    'frontmatter', 'other',
+  ]);
+  assert.deepEqual(LABEL_STOPS, ['completed', 'failures', 'ceiling', 'token-age']);
 });

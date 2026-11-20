@@ -5,7 +5,7 @@
 // (`run.sh consolidate-step scan|snapshot|apply`, and `label-read|label-apply` for the labels, under
 // the sync lock); the model only ever sees the work folder, and its result is applied only when the
 // rules in lib/workdir.mjs accept it. The label model sees only the notes it labels, and code writes
-// the labels.
+// the labels. Every run of the driver ends with its line in the run log (lib/run-log.mjs).
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -24,29 +24,32 @@ import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
 import { readLabelInputs } from './lib/domains.mjs';
 import { labelBatch, tokenForRun } from './lib/label-client.mjs';
 import {
-  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, digestsOf, fileDigests, folderDigest, labelEntryProblem,
+  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, folderDigest, labelEntryProblem, labelRecordOf,
 } from './lib/label-notes.mjs';
 import {
   askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, plannedLabels, selectTouched, unreadScopeResults,
 } from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
-import { scanText } from './lib/secret-scan.mjs';
+import {
+  REPORT_NAME_RE, buildReport, labelPlanData, labelReportData, labelReportHead, reportData, shown, usd,
+} from './lib/reports.mjs';
+import { RUN_LOG_SCHEMA_VERSION, appendRunLine } from './lib/run-log.mjs';
+import {
+  GLOBAL, INDEX_MAX_BYTES, INDEX_MAX_LINES, cloneProblem, isPlainName, listProjects, liveFolder, lstatOrNull, organizeScopes, projectsDir,
+  scopeFolder, scopeInfo, timeOf,
+} from './lib/scopes.mjs';
 import { runSync, writeStatus } from './lib/sync-engine.mjs';
 import { buildDigest, codexProjectSessions, filesChangedSince, projectSessionDirs, sessionFilesSince } from './lib/transcripts.mjs';
-import { apply, evaluate, noteFiles, readRegular, snapshot } from './lib/workdir.mjs';
+import { apply, evaluate, readRegular, snapshot } from './lib/workdir.mjs';
 
 const RUN_SH = join(dirname(fileURLToPath(import.meta.url)), 'run.sh');
 const KINDS = ['extract', 'organize'];
-const GLOBAL = 'global';
-const INDEX_MAX_LINES = 200;
-const INDEX_MAX_BYTES = 25000;
 const DAY_MS = 24 * 3600 * 1000;
 const EXTRACT_LOOKBACK_MS = 7 * DAY_MS;
 // The session window of a project that was extracted before never reaches back further than this.
 const EXTRACT_MAX_WINDOW_MS = 28 * DAY_MS;
 const REPORT_KEEP_DAYS = 90;
-const REVISIT_MS = 28 * DAY_MS;
 const KEEP_MARKER = '.keep';
 // The read-only reference copy of the scope's notes that a repair run gets, in the work folder.
 const ORIGINAL = 'original';
@@ -55,26 +58,17 @@ const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
-const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run]';
-const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
-const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
+const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run] | report [--since <YYYY-MM-DD> | --days <n>] [--format json|md]';
 const HASH_RE = /^[0-9a-f]{64}$/;
 const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const RETENTION_RE = /^(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)$/;
-const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 const isMissing = (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
-const usd = (value) => `USD ${value === null || value === undefined ? 'unknown' : value.toFixed(2)}`;
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const out = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
-
-// A folder name the driver may use as a project scope: no separator, not hidden, printable.
-// A project folder named `global` would be confused with the global scope and is never used.
-function isPlainName(name) {
-  return typeof name === 'string' && name.length > 0 && name.length <= 200 && !name.includes('/')
-    && !name.startsWith('.') && !CONTROL_RE.test(name) && name !== GLOBAL;
-}
+// A report's JSON twin as its file holds it.
+const jsonText = (obj) => `${JSON.stringify(obj, null, 2)}\n`;
 
 function parseRetention(value) {
   if (typeof value !== 'string' || !RETENTION_RE.test(value)) return null;
@@ -82,55 +76,7 @@ function parseRetention(value) {
   return Number.isFinite(n) && n >= 0 && n <= 1 ? n : null;
 }
 
-function lstatOrNull(path) {
-  try {
-    return lstatSync(path);
-  } catch (err) {
-    if (isMissing(err)) return null;
-    throw err;
-  }
-}
-
-function scopeInfo(dir) {
-  const files = noteFiles(dir);
-  const index = files.get(INDEX);
-  const stats = indexStats(index ? index.toString('utf8') : '');
-  const names = [...files.keys()];
-  return {
-    notes: names.filter((n) => n !== INDEX).length,
-    overLimit: stats.lines > INDEX_MAX_LINES || stats.bytes > INDEX_MAX_BYTES,
-    conflict: names.some((n) => CONFLICT_RE.test(n)),
-    digest: digestOfFiles(digestsOf(files)),
-  };
-}
-
 // ---- Folders of the clone that a run may touch ----
-
-function projectsDir(config) {
-  const dir = join(config.repoDir, 'projects');
-  return lstatOrNull(dir)?.isDirectory() ? dir : null;
-}
-
-// Plain, real folders directly under <repoDir>/projects.
-function listProjects(config) {
-  const dir = projectsDir(config);
-  if (!dir) return [];
-  return readdirSync(dir).filter((n) => isPlainName(n) && lstatOrNull(join(dir, n))?.isDirectory()).sort(byName);
-}
-
-// The live folder of a scope, or null when it may not be touched. global/ may be missing (an
-// apply creates it); a project folder must exist.
-function liveFolder(config, scope) {
-  if (scope === GLOBAL) {
-    const dir = join(config.repoDir, GLOBAL);
-    const st = lstatOrNull(dir);
-    return !st || st.isDirectory() ? dir : null;
-  }
-  const base = isPlainName(scope) ? projectsDir(config) : null;
-  if (!base) return null;
-  const dir = join(base, scope);
-  return lstatOrNull(dir)?.isDirectory() ? dir : null;
-}
 
 // Extract: the project folder. Organize: the scope folder, plus global/ for a project.
 function pairsFor(config, kind, scope, work) {
@@ -160,11 +106,6 @@ function checkWork(config, work) {
 
 const syncInfo = (s) => ({ ok: s.ok, error: s.error ?? null, committed: s.committed ?? 0, pushed: !!s.pushed });
 
-// A name shown in output or in a report; one that looks like a credential is not shown.
-function shown(text) {
-  return scanText(String(text)).length > 0 ? '(file name withheld)' : String(text);
-}
-
 // What reached the model of an Extract run: whether the digest was cut, how large it is, and how
 // many qualifying sessions it left out entirely. Passed to the apply step as one argument.
 function conversationOf(digest) {
@@ -173,12 +114,15 @@ function conversationOf(digest) {
 
 function conversationArg(conversation) {
   if (!conversation) return 'none';
-  return conversation.truncated ? `cut,${conversation.bytes},${conversation.sessionsLeftOut}` : 'complete';
+  return conversation.truncated ? `cut,${conversation.bytes},${conversation.sessionsLeftOut}` : `complete,${conversation.bytes}`;
 }
 
+// `complete` without a size is what a driver of an older kit gives.
 function parseConversationArg(value) {
   if (value === 'none') return null;
   if (value === 'complete') return { truncated: false, bytes: null, sessionsLeftOut: 0 };
+  const whole = /^complete,(\d{1,12})$/.exec(value ?? '');
+  if (whole) return { truncated: false, bytes: Number(whole[1]), sessionsLeftOut: 0 };
   const m = /^cut,(\d{1,12}),(\d{1,9})$/.exec(value ?? '');
   if (!m) throw new Error('invalid --conversation');
   return { truncated: true, bytes: Number(m[1]), sessionsLeftOut: Number(m[2]) };
@@ -205,19 +149,6 @@ function parseStepArgs(rest, valued, flags = [], repeated = []) {
   }
   for (const a of valued) if (!(a in opts)) throw new Error(`missing step argument ${a}`);
   return opts;
-}
-
-// Why the configured clone cannot be used, or null.
-function cloneProblem(config) {
-  let st = null;
-  try {
-    st = statSync(config.repoDir);
-  } catch (err) {
-    if (!isMissing(err)) throw err;
-  }
-  if (!st?.isDirectory()) return `the notes clone ${config.repoDir} does not exist`;
-  if (lstatOrNull(join(config.repoDir, '.git')) === null) return `${config.repoDir} is not a Git clone of the notes`;
-  return null;
 }
 
 // `--codex-since <ms>`: also the Codex sessions of each project changed after that time, the start
@@ -279,11 +210,6 @@ function validSnap(snap, pairs) {
   });
 }
 
-// `<label>/<file>` (as evaluate names it) shown relative to the scope: global/ keeps its prefix.
-function display(label, file) {
-  return label === GLOBAL ? `global/${file}` : file;
-}
-
 // Error lines of evaluate that name an entry which is not a note file quote its name, which the
 // model chose and which may hold any text. They are replaced by a count per folder.
 function safeErrors(errors, labels) {
@@ -301,71 +227,10 @@ function safeErrors(errors, labels) {
   return kept;
 }
 
-function splitLoc(entry) {
-  const slash = entry.indexOf('/');
-  return slash < 0 ? { label: 'notes', file: entry } : { label: entry.slice(0, slash), file: entry.slice(slash + 1) };
-}
-
 function cleanDescription(text) {
   const d = String(text ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
   if (d === '') return '(no description)';
   return d.length > 200 ? `${d.slice(0, 200)}…` : d;
-}
-
-function buildReport({ config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired = 0 }) {
-  const title = `${kind[0].toUpperCase()}${kind.slice(1)}`;
-  const suffix = (label) => (label === GLOBAL ? ' (global/)' : '');
-  const changed = (label) => ev.changes.some((c) => c.label === label);
-  const labels = pairs.map((p) => p.label);
-  const shownLabels = labels.filter((l) => l === 'notes' || changed(l));
-  const lines = [`# ${title} ${scope} — ${date} on ${config.host}`, ''];
-  lines.push(`- Model: ${model}; turns: ${turns ?? 'unknown'}; cost: ${usd(costUsd)}; stopped: ${stopReason}; denials: ${denials ?? 'unknown'}`);
-  if (repaired > 0) lines.push(`- Repair: one repair run; the first check found ${repaired} problem(s)`);
-  if (conversation) {
-    lines.push(conversation.truncated
-      ? `- Conversation text: cut to ${conversation.bytes} bytes; ${conversation.sessionsLeftOut} session(s) left out`
-      : '- Conversation text: complete');
-  }
-  for (const l of shownLabels) {
-    const { indexBefore: b, indexAfter: a } = ev.stats[l];
-    lines.push(`- Index${suffix(l)}: ${b.lines} lines, ${b.bytes} bytes → ${a.lines} lines, ${a.bytes} bytes`);
-  }
-  for (const l of shownLabels) {
-    lines.push(`- Notes not listed in the index${suffix(l)}: ${ev.stats[l].unlistedBefore} → ${ev.stats[l].unlistedAfter}`);
-  }
-  for (const l of labels.filter(changed)) {
-    const s = ev.stats[l];
-    lines.push(`- Notes${suffix(l)}: ${s.notesBytesBefore} bytes → ${s.notesBytesAfter} bytes; retired: ${s.retiredBytes} bytes`);
-  }
-  const r = ev.stats.retention;
-  lines.push(`- Distinct terms kept: ${Math.floor(r.share * 100)}% (${r.termsKept} of ${r.termsBefore})`);
-  const order = (c) => `${labels.indexOf(c.label)}\u0000${c.file}`;
-  const sorted = [...ev.changes].sort((x, y) => byName(order(x), order(y)));
-  let first = true;
-  const section = (heading, items) => {
-    if (items.length === 0) return;
-    if (first) lines.push('');
-    first = false;
-    lines.push(`## ${heading}`, ...items);
-  };
-  section('Added', sorted.filter((c) => c.kind === 'add')
-    .map((c) => `- ${shown(display(c.label, c.file))} — ${descriptions.get(`${c.label}/${c.file}`) ?? '(no description)'}`));
-  section('Changed', sorted.filter((c) => c.kind === 'change').map((c) => `- ${shown(display(c.label, c.file))}`));
-  section('Retired', sorted.filter((c) => c.kind === 'retire')
-    .map((c) => `- ${shown(display(c.label, c.file))} → ${shown(display(c.target.label, c.target.file))}`));
-  // Entries that are not notes at all are counted per folder, never named.
-  const notNotes = labels.filter((l) => ev.ignoredEntries?.[l] > 0).map((l) => {
-    const n = ev.ignoredEntries[l];
-    const what = n === 1 ? '1 entry that is not a note file' : `${n} entries that are not note files`;
-    return `- ${l === GLOBAL ? 'global/' : ''}(${what}): ignored`;
-  });
-  section('Not applied', [...ev.ignored.map((entry) => {
-    const { label, file } = splitLoc(entry);
-    const known = snap[label] && Object.hasOwn(snap[label], file);
-    const why = known ? 'retiring a note is not part of an extract run' : 'a new file cannot be a retirement';
-    return `- ${display(label, file)}: ${why}`;
-  }), ...notNotes]);
-  return `${lines.join('\n')}\n`;
 }
 
 function writeReport(config, name, text) {
@@ -386,13 +251,13 @@ function writeReport(config, name, text) {
   }
 }
 
-// Deletes reports whose date is more than REPORT_KEEP_DAYS days before `now`.
+// Deletes reports, and their JSON twins, whose date is more than REPORT_KEEP_DAYS days before `now`.
 function pruneReports(config, now) {
   const dir = join(config.repoDir, '_reports');
   if (!lstatOrNull(dir)?.isDirectory()) return;
   const cutoff = new Date(now.getTime() - REPORT_KEEP_DAYS * DAY_MS).toISOString().slice(0, 10);
   for (const name of readdirSync(dir)) {
-    const m = REPORT_RE.exec(name);
+    const m = REPORT_NAME_RE.exec(name);
     if (!m || m[1] >= cutoff) continue;
     if (lstatOrNull(join(dir, name))?.isFile()) unlinkSync(join(dir, name));
   }
@@ -462,9 +327,11 @@ function stepApply(config, rest) {
     const buf = readRegular(join(pair.workDir, c.file));
     if (buf && sha256(buf) === c.hash) descriptions.set(`${c.label}/${c.file}`, cleanDescription(parseNote(buf.toString('utf8')).description));
   }
-  const report = () => buildReport({
-    config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired,
-  });
+  const reportArgs = {
+    config, kind, scope, date, endedAt: now.toISOString(), model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation,
+    repaired,
+  };
+  const report = () => buildReport(reportArgs);
 
   let outcome;
   if (ev.liveChanged.length > 0) outcome = 'changed-meanwhile';
@@ -498,7 +365,11 @@ function stepApply(config, rest) {
   const digest = folderDigest(pairs[0].liveDir);
   let reportError = null;
   try {
-    writeReport(config, `${date}-${config.host}-${kind}-${scope}.md`, report());
+    // The twin first: when it cannot be written, neither is the report, so that no twin of an
+    // earlier run of the day stays paired with a new report.
+    const name = `${date}-${config.host}-${kind}-${scope}`;
+    writeReport(config, `${name}.json`, jsonText(reportData(reportArgs)));
+    writeReport(config, `${name}.md`, report());
     if (kind === 'organize') pruneReports(config, now);
   } catch (err) {
     reportError = errorText(err);
@@ -511,7 +382,6 @@ function stepApply(config, rest) {
 // The two locked steps of the label step. A scope is named as consolidate.json names it (`global`
 // or the project's folder name); the paths of its notes start with its folder (`global/`,
 // `projects/<name>/`).
-const scopeFolder = (name) => (name === GLOBAL ? GLOBAL : `projects/${name}`);
 const scopeOfPath = (path) => (path.startsWith('projects/') ? path.split('/')[1] : GLOBAL);
 // A scope folder of the clone (`global` or `projects/<name>`), not one of the agent scopes.
 const isCloneScope = (folder) => folder === GLOBAL || folder.startsWith('projects/');
@@ -567,7 +437,9 @@ function labelReportText(report, skipped) {
 }
 
 // Writes the labels that `<work>/label-plan.json` names (`{ entries: [{ path, label, sha256 }],
-// report }`, whose SHA-256 the driver gives) and commits them with the report. The plan is checked
+// report, data }`, whose SHA-256 the driver gives) and commits them with the report and its JSON
+// twin, made from `data` (labelPlanData's; a plan without it gives a twin with what this step did
+// only) and what this step did. The plan is checked
 // whole before anything else: one that is not well formed is rejected and nothing is written.
 // `digests` holds, for each scope the entries name, its digest after the first sync (`before`, right
 // before writing) and right after writing (`after`); `after` is null when anything but this step's
@@ -629,7 +501,12 @@ function stepLabelApply(config, rest) {
   }
   let reportError = null;
   try {
-    writeReport(config, `${new Date().toISOString().slice(0, 10)}-${config.host}-label.md`, labelReportText(plan.report, skipped));
+    // The twin first, as in the apply step.
+    const endedAt = new Date().toISOString();
+    const date = endedAt.slice(0, 10);
+    const twin = labelReportData({ host: config.host, date, endedAt, data: plan.data, written, unchanged, skipped });
+    writeReport(config, `${date}-${config.host}-label.json`, jsonText(twin));
+    writeReport(config, `${date}-${config.host}-label.md`, labelReportText(plan.report, skipped));
   } catch (err) {
     reportError = errorText(err);
   }
@@ -673,6 +550,74 @@ function stepMain(args) {
 // The kinds of run the driver starts: the model runs on the notes (KINDS, which the locked steps
 // take too) and `label`, the label pass on its own.
 const DRIVER_KINDS = [...KINDS, 'label'];
+
+// What this run did, for its line in the run log. beginRun starts the record once the configuration
+// lets the run start; the run then notes each scope it took (noteScope), its label pass
+// (noteLabel), why it stopped before the end of its list (noteStop) and why it failed before or
+// beside its scopes (noteError), the last two as fixed words, never a message; finishRun adds the
+// line when the run ends, also after a crash. A command line that the driver refuses, a
+// configuration without a consolidate block or with an invalid one, and a start that run.sh refuses
+// because another consolidation runs leave no line.
+const runRecord = { start: null, scopes: [], label: null, stop: null, error: null };
+
+function beginRun(config, opts, started) {
+  runRecord.start = { config, opts, started };
+}
+
+// A scope as its headline gives it: its outcome, the model's stop reason and cost (0 when no model
+// ran for it, null when the cost is not known) and, for Extract, whether the conversation text was
+// cut and how many sessions it left out.
+function noteScope(scope, res) {
+  const entry = { scope, outcome: res.outcome, stopReason: res.model?.stopReason ?? null, costUsd: res.model ? res.model.costUsd : 0 };
+  if (res.conversation) Object.assign(entry, { truncated: res.conversation.truncated, sessionsLeftOut: res.conversation.sessionsLeftOut });
+  runRecord.scopes.push(entry);
+}
+
+// The first reason counts: `max-projects`, `ceiling`, `sync-failed`, `step-failed`,
+// `model-not-started` or `interrupted`.
+const noteStop = (stop) => {
+  runRecord.stop ??= stop;
+};
+// `scan-failed`, `lock-timeout`, `usage`, `agents-not-configured`, `agents-unreadable`,
+// `label-not-configured` or `crash`.
+const noteError = (error) => {
+  runRecord.error ??= error;
+};
+const noteLabel = (summary) => {
+  runRecord.label = summary;
+};
+
+// Adds the run's line to the run log. The run's cost is that of its scopes and its label pass
+// together, null when one of them is not known. A log that cannot be written changes neither the
+// run nor its exit code; the run says so.
+function finishRun(exitCode) {
+  const s = runRecord.start;
+  if (s === null) return;
+  const costs = [...runRecord.scopes.map((x) => x.costUsd), ...(runRecord.label ? [runRecord.label.costUsd] : [])];
+  const line = {
+    schemaVersion: RUN_LOG_SCHEMA_VERSION, runId: `${stampOf(s.started)}-${process.pid}`, host: s.config.host, kind: s.opts.kind,
+    agents: s.opts.agents, dryRun: s.opts.dryRun, startedAt: s.started.toISOString(), endedAt: new Date().toISOString(), exitCode,
+    scopes: runRecord.scopes, ...(runRecord.label ? { label: runRecord.label } : {}),
+    costUsd: costs.includes(null) ? null : Math.round(costs.reduce((a, b) => a + b, 0) * 1e6) / 1e6,
+    ...(runRecord.stop ? { stop: runRecord.stop } : {}), ...(runRecord.error ? { error: runRecord.error } : {}),
+  };
+  try {
+    appendRunLine(s.config.stateDir, line);
+  } catch (err) {
+    process.stderr.write(`agent-memory consolidate: the run could not be added to the run log (${errorText(err)})\n`);
+  }
+}
+
+// The label pass of a run, for the run log: its outcome as its headline gives it, whether it failed
+// the run, why it stopped before its last batch (askLabelModel's stop), the model's figures, and
+// the labels it wrote, found unchanged (with the exceptions whose notes held their labels) and did
+// not write.
+function labelSummary(outcome, { failed = false, asked = null, applied = null, held = 0 } = {}) {
+  return {
+    outcome, failed, stop: asked?.stop ?? null, costUsd: asked?.spent ?? 0, requests: asked?.requests ?? 0, sent: asked?.sent ?? 0,
+    written: applied?.written?.length ?? 0, unchanged: (applied?.unchanged?.length ?? 0) + held, notWritten: applied?.skipped?.length ?? 0,
+  };
+}
 
 function parseDriverArgs(argv) {
   const [kind, ...rest] = argv;
@@ -783,11 +728,6 @@ function writeState(config, state) {
   }
 }
 
-const timeOf = (iso) => {
-  const t = typeof iso === 'string' ? Date.parse(iso) : NaN;
-  return Number.isFinite(t) ? t : null;
-};
-
 // Where a project's session window starts: at its last extract, but never more than
 // EXTRACT_MAX_WINDOW_MS back (a run that stopped early keeps lastExtract, and the window must not
 // grow without end); EXTRACT_LOOKBACK_MS back when it was never extracted.
@@ -829,56 +769,6 @@ function extractScopes(scan, state, opts, now) {
     list.sort((x, y) => older(x.tried, y.tried) || older(x.last, y.last) || y.newest - x.newest || byName(x.scope, y.scope));
   }
   return list;
-}
-
-// Organize: a scope with notes is due when its content changed since it was last organized (or
-// it never was). One that did not change but is still over the index limits or still holds a
-// conflict copy is due again only after REVISIT_MS: the model could not fix it last time, and
-// taking it every week would crowd out the scopes that changed.
-// Order, in two groups:
-// - A, every due scope except those of group B: by class (over the limits, then a conflict copy,
-//   then the others), then by lastOrganizeTried (falling back to lastOrganize), oldest first,
-//   never tried first;
-// - B, scopes whose last model run left them unorganized (lastOrganizeTried is set and lastOrganize
-//   is absent or older) within the last REVISIT_MS: after all of A, by lastOrganizeTried only,
-//   whatever their class, so that scopes failing every run rotate among themselves and cannot keep
-//   the others waiting. A failed try older than REVISIT_MS puts the scope back into group A, at the
-//   front of its class, so that it waits behind the others for at most REVISIT_MS.
-function organizeScopes(scan, state, opts, now) {
-  const infos = [...(scan.global.usable ? [{ name: GLOBAL, ...scan.global }] : []), ...scan.projects];
-  if (opts.projects.length > 0) return opts.projects.map((name) => ({ scope: name }));
-  const entry = (i) => state.projects[i.name];
-  const last = (i) => timeOf(entry(i)?.lastOrganize) ?? -Infinity;
-  const isDue = (i) => {
-    if (i.notes === 0) return false;
-    if (i.digest !== entry(i)?.organizedDigest) return true;
-    return (i.overLimit || i.conflict) && now - last(i) > REVISIT_MS;
-  };
-  const rank = (i) => (i.overLimit ? 0 : i.conflict ? 1 : 2);
-  const failedTry = (i) => {
-    const t = timeOf(entry(i)?.lastOrganizeTried);
-    const l = timeOf(entry(i)?.lastOrganize);
-    return t !== null && (l === null || t > l) ? t : null;
-  };
-  const leftUnorganized = (i) => {
-    const t = failedTry(i);
-    return t !== null && now - t <= REVISIT_MS;
-  };
-  // A scope whose failed try is older than REVISIT_MS counts as the oldest of its class.
-  const tried = (i) => {
-    const t = failedTry(i);
-    if (t !== null && now - t > REVISIT_MS) return -Infinity;
-    return timeOf(entry(i)?.lastOrganizeTried) ?? last(i);
-  };
-  const older = (a, b) => (a === b ? 0 : a - b);
-  const due = infos.filter(isDue);
-  due.sort((x, y) => {
-    const gx = leftUnorganized(x);
-    const gy = leftUnorganized(y);
-    if (gx !== gy) return gx ? 1 : -1;
-    return (gx ? 0 : rank(x) - rank(y)) || older(tried(x), tried(y)) || byName(x.name, y.name);
-  });
-  return due.map((i) => ({ scope: i.name }));
 }
 
 // Removes a folder tree, also one whose folders lost their permissions. Never throws.
@@ -1248,6 +1138,7 @@ function agentLines(res) {
 async function agentsMain({ config, opts, model, started }) {
   const c = config.consolidate;
   if (!c.agents) {
+    noteError('agents-not-configured');
     process.stdout.write(`agent-memory: organizing the agent scopes needs "agents" in the consolidate block of ${configPath()}; nothing was run.\n`);
     return 1;
   }
@@ -1260,13 +1151,18 @@ async function agentsMain({ config, opts, model, started }) {
     state = await readOrganizerState(s3);
   } catch (err) {
     if (await signalsHandled()) {
+      noteStop('interrupted');
       process.stdout.write(`organize: interrupted by ${interrupted}; nothing was applied\n`);
       return SIGNAL_CODES[interrupted];
     }
+    noteError('agents-unreadable');
     process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${errorText(err)})\n`);
     return 1;
   }
-  if (unknownAgent(scopes, opts)) return 2;
+  if (unknownAgent(scopes, opts)) {
+    noteError('usage');
+    return 2;
+  }
   const list = agentScopesDue(scopes, state, opts);
   const limit = opts.agentNames.length > 0 ? Infinity : c.maxProjects;
   const ceiling = (opts.agentNames.length > 0 ? opts.agentNames.length : c.maxProjects) * c.maxBudgetUsd;
@@ -1276,8 +1172,13 @@ async function agentsMain({ config, opts, model, started }) {
   let failed = false;
   try {
     for (const item of list) {
-      if ((await signalsHandled()) || calls >= limit) break;
+      if (await signalsHandled()) break;
+      if (calls >= limit) {
+        noteStop('max-projects');
+        break;
+      }
       if (spent >= ceiling) {
+        noteStop('ceiling');
         process.stdout.write(`organize: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}\n`);
         break;
       }
@@ -1303,16 +1204,19 @@ async function agentsMain({ config, opts, model, started }) {
           failed = true;
         }
       }
+      noteScope(scope, res);
       printScope('organize', scope, res, opts, config.repoDir);
       process.stdout.write(agentLines(res));
       if (res.outcome === 'aborted') break;
       if (res.outcome === 'step-failed' || res.outcome === 'error' || res.outcome === 'apply-interrupted') {
+        noteStop('step-failed');
         failed = true;
         break;
       }
       if (res.outcome === 'model-failed') {
         failed = true;
         if (NOT_STARTED.includes(res.model.stopReason)) {
+          noteStop('model-not-started');
           process.stdout.write(`organize: stopped; the model command could not be started (${res.model.stopReason})\n`);
           break;
         }
@@ -1325,9 +1229,14 @@ async function agentsMain({ config, opts, model, started }) {
   // ones, or every one), whatever Organize did. A failed pass fails the run.
   if (!(await signalsHandled())) {
     if (list.length === 0) process.stdout.write('organize: nothing to do\n');
-    if (c.label && (await agentLabelPass({ config, opts, s3For, started })).failed) failed = true;
+    if (c.label) {
+      const pass = await agentLabelPass({ config, opts, s3For, started });
+      noteLabel(pass.summary);
+      if (pass.failed) failed = true;
+    }
   }
   if (await signalsHandled()) {
+    noteStop('interrupted');
     process.stdout.write(`organize: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
@@ -1345,7 +1254,8 @@ function unknownAgent(scopes, opts) {
 // The label pass over the agent scopes, with the S3 clients of the agent-scope organizer (`s3For`)
 // and the label block's model and token, which only the label requests get: never the model
 // client of Organize. Without a notes clone (a GitHub Actions job) the label block must name both
-// input files. Prints the pass's lines; `failed` as labelAgentScopes says, or for missing inputs.
+// input files. Prints the pass's lines; `failed` and `summary` as labelAgentScopes says, or for
+// missing inputs.
 async function agentLabelPass({ config, opts, s3For, started }) {
   const label = config.consolidate.label;
   let inputs;
@@ -1356,7 +1266,7 @@ async function agentLabelPass({ config, opts, s3For, started }) {
   }
   if (inputs.problem) {
     process.stdout.write(`label: the label inputs are missing or invalid (${inputs.problem}); no label was written.\n`);
-    return { failed: true };
+    return { failed: true, summary: { ...labelSummary('inputs-invalid', { failed: true }), scopes: [] } };
   }
   const pass = await labelAgentScopes({
     config, opts, s3For, started, domains: inputs.domains, persona: inputs.persona,
@@ -1370,10 +1280,12 @@ async function agentLabelPass({ config, opts, s3For, started }) {
 async function labelAgentsMain({ config, opts, started }) {
   const c = config.consolidate;
   if (!c.label) {
+    noteError('label-not-configured');
     process.stdout.write(`agent-memory: labeling needs "label" in the consolidate block of ${configPath()}; nothing was run.\n`);
     return 1;
   }
   if (!c.agents) {
+    noteError('agents-not-configured');
     process.stdout.write(`agent-memory: labeling the agent scopes needs "agents" in the consolidate block of ${configPath()}; nothing was run.\n`);
     return 1;
   }
@@ -1385,14 +1297,22 @@ async function labelAgentsMain({ config, opts, started }) {
       scopes = await listAgentScopes(await s3For({ signal: abort.signal }));
     } catch (err) {
       if (!(await signalsHandled())) {
+        noteError('agents-unreadable');
         process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${errorText(err)})\n`);
         return 1;
       }
     }
-    if (scopes !== null && unknownAgent(scopes, opts)) return 2;
+    if (scopes !== null && unknownAgent(scopes, opts)) {
+      noteError('usage');
+      return 2;
+    }
   }
-  if (!(await signalsHandled())) pass = await agentLabelPass({ config, opts, s3For, started });
+  if (!(await signalsHandled())) {
+    pass = await agentLabelPass({ config, opts, s3For, started });
+    noteLabel(pass.summary);
+  }
   if (await signalsHandled()) {
+    noteStop('interrupted');
     process.stdout.write(`label: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
@@ -1528,15 +1448,6 @@ function printScope(kind, scope, res, opts, repoDir) {
 // (isPlainName), so it is never the work folder of an Organize scope of the same run.
 const LABEL_WORK = '.label';
 
-// The record of what the label pass last saw (`labels` in consolidate.json): path -> SHA-256 of the
-// note as the pass wrote, found or confirmed it. Null without one, or with one of another version:
-// the run is then a first run.
-function labelRecordOf(state) {
-  const labels = state.labels;
-  if (!isObject(labels) || labels.version !== 1 || !isObject(labels.notes)) return null;
-  return Object.fromEntries(Object.entries(labels.notes).filter(([, digest]) => typeof digest === 'string' && HASH_RE.test(digest)));
-}
-
 // The two label inputs, read and checked: the files the label block names, else those under
 // .agent-memory/ in the notes clone.
 function labelInputs(config) {
@@ -1554,7 +1465,8 @@ function labelInputs(config) {
 // labels given and the exceptions' (label-apply), records what it saw in `state.labels`, and moves
 // Organize's record of each scope it wrote into, where that was the content it found. Prints what
 // it did. `failed`: the inputs are missing or invalid, the token source could not be made, a batch
-// failed, or a step failed. A signal stops it before label-apply, with nothing written.
+// failed, or a step failed; `summary`: what it did, for the run log (labelSummary). A signal stops
+// it before label-apply, with nothing written.
 async function labelPass({ config, opts, state, scopes, runFolder }) {
   const c = config.consolidate;
   // In an Organize run --model names the Organize model; in a label run, the label model.
@@ -1563,7 +1475,7 @@ async function labelPass({ config, opts, state, scopes, runFolder }) {
   const inputs = labelInputs(config);
   if (inputs.problem) {
     say(`label: the label inputs are missing or invalid (${inputs.problem}); no label was written.`);
-    return { failed: true };
+    return { failed: true, summary: labelSummary('inputs-invalid', { failed: true }) };
   }
   const work = join(runFolder(), LABEL_WORK);
   mkdirSync(work, { mode: 0o700 });
@@ -1580,16 +1492,17 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   // A first run reads every scope, whatever the run names, so that it records every label it finds.
   const readAll = scopes.length === 0 || record === null;
   const readStep = runStep(['label-read', '--work', work, ...(readAll ? [] : scopes.flatMap((name) => ['--scope', name]))]);
-  if (await signalsHandled()) return { failed: false };
+  if (await signalsHandled()) return { failed: false, summary: labelSummary('aborted') };
   const read = readStep.result;
   if (read?.outcome === 'sync-failed') {
     say(`label: sync-failed, no label was written\n  - the sync before reading the notes failed: ${read.sync?.error ?? 'unknown error'}`);
-    return { failed: false };
+    return { failed: false, summary: labelSummary('sync-failed') };
   }
   if (read?.outcome !== 'label-read') {
-    if (read?.outcome === 'error') say(`label: error, no label was written\n  - the label-read step failed: ${read.error ?? 'unknown error'}`);
+    const outcome = read?.outcome === 'error' ? 'error' : 'step-failed';
+    if (outcome === 'error') say(`label: error, no label was written\n  - the label-read step failed: ${read.error ?? 'unknown error'}`);
     else say(`label: step-failed, no label was written\n  - the label-read step could not run${lockTimedOut(readStep) ? ': the wait for the sync lock timed out' : ''}`);
-    return { failed: true };
+    return { failed: true, summary: labelSummary(outcome, { failed: true }) };
   }
   const data = JSON.parse(readFileSync(join(work, 'label-notes.json'), 'utf8'));
   if (!Array.isArray(data?.notes) || !Array.isArray(data.scopes)) throw new Error('label-notes.json does not hold what label-read writes');
@@ -1616,7 +1529,7 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   });
   if (asked.line) say(asked.line);
   // Interrupted: nothing is written, and every note stays as it is.
-  if (asked.stop === 'interrupted' || (await signalsHandled())) return { failed: asked.failed };
+  if (asked.stop === 'interrupted' || (await signalsHandled())) return { failed: asked.failed, summary: labelSummary('aborted', { failed: asked.failed, asked }) };
   let failed = asked.failed;
   const planned = plannedLabels(exceptions, asked.labels);
   const results = [
@@ -1626,9 +1539,10 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   ];
   const sections = labelReport(results, { reasons: true });
   const report = [
-    `# Labels — ${new Date().toISOString().slice(0, 10)} on ${config.host}`, '',
-    `- Model: ${label.model}; requests: ${asked.requests}; cost: ${usd(asked.spent)}`,
-    `- Notes: ${touched.length} touched, ${asked.sent} sent to the model, ${exceptions.length} with an exception, ${confirmed.length} recorded as they were`,
+    ...labelReportHead({
+      date: new Date().toISOString().slice(0, 10), host: config.host, model: label.model, requests: asked.requests, costUsd: asked.spent,
+      touched: touched.length, sent: asked.sent, exceptions: exceptions.length, confirmed: confirmed.length,
+    }),
     ...(sections === '' ? [] : ['', sections.trimEnd()]),
   ].join('\n').concat('\n');
   const figures = `${usd(asked.spent)}, ${asked.requests} request(s)`;
@@ -1647,14 +1561,21 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
     const changes = results.reduce((n, r) => n + r.labels.length, 0);
     say(nothing ? 'label: nothing to do' : `label: dry-run, ${changes} label(s) to set or change, ${figures}`);
     process.stdout.write(report);
-    return { failed };
+    return { failed, summary: labelSummary(nothing ? 'nothing-to-do' : 'dry-run', { failed, asked }) };
   }
 
-  let outcome = { applied: null, headline: nothing ? 'label: nothing to do' : `label: nothing written, ${figures}`, details: [], failed: false };
+  let outcome = {
+    outcome: nothing ? 'nothing-to-do' : 'nothing-written', applied: null,
+    headline: nothing ? 'label: nothing to do' : `label: nothing written, ${figures}`, details: [], failed: false,
+  };
   if (entries.length > 0) {
-    if (await signalsHandled()) return { failed };
-    outcome = await applyLabelPlan({ config, work, entries, report, figures, held: held.length });
-    if (outcome.interrupted) return { failed };
+    if (await signalsHandled()) return { failed, summary: labelSummary('aborted', { failed, asked }) };
+    const reportFigures = labelPlanData({
+      model: label.model, asked, touched: touched.length, exceptions: exceptions.length, confirmed: confirmed.length, results,
+      held: held.map((e) => e.path),
+    });
+    outcome = await applyLabelPlan({ config, work, entries, report, data: reportFigures, figures, held: held.length });
+    if (outcome.interrupted) return { failed, summary: labelSummary('aborted', { failed, asked }) };
   }
   failed ||= outcome.failed;
   const { applied } = outcome;
@@ -1692,17 +1613,20 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   const planApplied = entries.length === 0 || applied?.outcome === 'applied' || applied?.outcome === 'no-change';
   if (sections !== '' && planApplied) process.stdout.write(labelReport(results, { reasons: false }));
   for (const line of outcome.details) say(line);
-  return { failed };
+  const wrote = ['applied', 'no-change', 'apply-interrupted'].includes(applied?.outcome) ? applied : null;
+  return { failed, summary: labelSummary(outcome.outcome, { failed, asked, applied: wrote, held: held.length }) };
 }
 
 // Writes the plan and runs label-apply on it: the step's result (`applied`, null when it ended
-// without one), the headline and the lines to print, and whether the step failed the pass. `held`:
+// without one), the headline and the lines to print, and whether the step failed the pass. `data`:
+// the figures of the report's JSON twin (labelPlanData). `held`:
 // the exceptions left out of the plan because their notes hold their labels; the headline counts
-// them as unchanged.
+// them as unchanged. `outcome`: the step's outcome as the headline gives it, `apply-interrupted`
+// also for a step that ended without its result.
 // `interrupted` when a signal killed the step, which is possible only before its handlers existed,
 // so before it did anything (see stepMain). A step that finished stands, signal or not.
-async function applyLabelPlan({ config, work, entries, report, figures, held }) {
-  const planText = `${JSON.stringify({ entries, report }, null, 2)}\n`;
+async function applyLabelPlan({ config, work, entries, report, data, figures, held }) {
+  const planText = `${JSON.stringify({ entries, report, data }, null, 2)}\n`;
   writeFileSync(join(work, 'label-plan.json'), planText, { mode: 0o600, flag: 'wx' });
   const step = runStep(['label-apply', '--work', work, '--plan-sha256', sha256(planText)]);
   await signalsHandled();
@@ -1721,28 +1645,32 @@ async function applyLabelPlan({ config, work, entries, report, figures, held }) 
       details.push(`  - push pending: the sync after writing failed (${applied.sync.error ?? 'unknown error'}); the next sync retries`);
     }
     const headline = `label: ${o}, ${applied.written.length} label(s) written, ${applied.unchanged.length + held} unchanged${notWritten}, ${figures}`;
-    return { applied, headline, details, failed: false };
+    return { outcome: o, applied, headline, details, failed: false };
   }
   if (o === 'sync-failed') {
-    return { applied, headline: `label: sync-failed, ${nothing}`, details: [`  - the sync before writing failed: ${applied.sync?.error ?? 'unknown error'}`], failed: false };
+    const details = [`  - the sync before writing failed: ${applied.sync?.error ?? 'unknown error'}`];
+    return { outcome: o, applied, headline: `label: sync-failed, ${nothing}`, details, failed: false };
   }
-  const fail = (headline, line) => ({ applied, headline, details: [line], failed: true });
-  if (!applied && lockTimedOut(step)) return fail(`label: step-failed, ${nothing}`, '  - the label-apply step could not run: the wait for the sync lock timed out');
+  const fail = (outcome, headline, line) => ({ outcome, applied, headline, details: [line], failed: true });
+  if (!applied && lockTimedOut(step)) {
+    return fail('step-failed', `label: step-failed, ${nothing}`, '  - the label-apply step could not run: the wait for the sync lock timed out');
+  }
   if (!applied) {
-    return fail(`label: apply interrupted, labels may have been written, ${figures}`, '  - the label-apply step ended without reporting its result;'
+    return fail('apply-interrupted', `label: apply interrupted, labels may have been written, ${figures}`, '  - the label-apply step ended without reporting its result;'
       + ` look at the log of the notes repository (git -C ${config.repoDir} log) for a consolidate(...) commit, and at its working tree`);
   }
   if (o === 'apply-interrupted') {
-    return fail(`label: apply interrupted, labels may have been written, ${figures}`,
+    return fail(o, `label: apply interrupted, labels may have been written, ${figures}`,
       `  - ${applied.reason ?? 'a write failed'}; the labels written before it are committed by the next sync`);
   }
-  if (o === 'rejected') return fail(`label: rejected, ${nothing}`, `  - ${applied.reason ?? 'the plan was refused'}`);
-  return fail(`label: error, ${nothing}`, `  - the label-apply step failed: ${applied.error ?? 'unknown error'}`);
+  if (o === 'rejected') return fail(o, `label: rejected, ${nothing}`, `  - ${applied.reason ?? 'the plan was refused'}`);
+  return fail('error', `label: error, ${nothing}`, `  - the label-apply step failed: ${applied.error ?? 'unknown error'}`);
 }
 
 // `run.sh consolidate label`: the label pass on its own.
 async function labelMain({ config, opts, started }) {
   if (!config.consolidate.label) {
+    noteError('label-not-configured');
     process.stdout.write(`agent-memory: labeling needs "label" in the consolidate block of ${configPath()}; nothing was run.\n`);
     return 1;
   }
@@ -1754,7 +1682,9 @@ async function labelMain({ config, opts, started }) {
   } finally {
     if (runDir && !opts.keep) removeTree(runDir);
   }
+  noteLabel(pass.summary);
   if (await signalsHandled()) {
+    noteStop('interrupted');
     process.stdout.write(`label: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
@@ -1783,6 +1713,7 @@ async function driverMain(argv) {
   const model = opts.model ?? c.model;
   const started = new Date();
   const now = started.getTime();
+  beginRun(config, opts, started);
   removeStaleRuns(config, now);
   if (opts.agents && opts.kind === 'label') return labelAgentsMain({ config, opts, started });
   if (opts.agents) return agentsMain({ config, opts, model, started });
@@ -1793,12 +1724,14 @@ async function driverMain(argv) {
   const scanStep = runStep(opts.kind === 'extract' ? ['scan', '--codex-since', String(now - EXTRACT_MAX_WINDOW_MS)] : ['scan']);
   const scan = scanStep.result;
   if (await signalsHandled()) {
+    noteStop('interrupted');
     process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
   if (!scan || scan.outcome !== 'scan') {
     let why = scan?.outcome === 'error' ? scan.error : 'the scan of the notes could not run';
     if (lockTimedOut(scanStep)) why += ': the wait for the sync lock timed out';
+    noteError(lockTimedOut(scanStep) ? 'lock-timeout' : 'scan-failed');
     process.stderr.write(`agent-memory consolidate: ${why}\n`);
     return 1;
   }
@@ -1806,6 +1739,7 @@ async function driverMain(argv) {
   for (const name of opts.projects) {
     const ok = name === GLOBAL ? scan.global.usable : projects.has(name);
     if (!ok) {
+      noteError('usage');
       process.stderr.write(`agent-memory consolidate: ${JSON.stringify(name)} is not a project folder of the notes.\n${USAGE}\n`);
       return 2;
     }
@@ -1828,8 +1762,13 @@ async function driverMain(argv) {
   try {
     for (const item of list) {
       // A signal during the previous scope's apply step stops the run before the next snapshot.
-      if ((await signalsHandled()) || calls >= limit) break;
+      if (await signalsHandled()) break;
+      if (calls >= limit) {
+        noteStop('max-projects');
+        break;
+      }
       if (spent >= ceiling) {
+        noteStop('ceiling');
         process.stdout.write(`${opts.kind}: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}\n`);
         break;
       }
@@ -1840,6 +1779,7 @@ async function driverMain(argv) {
         if (digest.sessions === 0) {
           const res = { outcome: 'no-session', conversation: conversationOf(digest) };
           record(config, state, { kind: opts.kind, scope: item.scope, res, started, dryRun: opts.dryRun });
+          noteScope(item.scope, res);
           printScope(opts.kind, item.scope, res, opts);
           continue;
         }
@@ -1850,13 +1790,16 @@ async function driverMain(argv) {
       digest = null;
       spent += spentBy(res, c);
       record(config, state, { kind: opts.kind, scope: item.scope, res, started, dryRun: opts.dryRun });
+      noteScope(item.scope, res);
       printScope(opts.kind, item.scope, res, opts, config.repoDir);
       if (res.outcome === 'aborted') break;
       if (res.outcome === 'step-failed' || res.outcome === 'error' || res.outcome === 'apply-interrupted') {
+        noteStop('step-failed');
         failed = true;
         break;
       }
       if (res.outcome === 'sync-failed') {
+        noteStop('sync-failed');
         process.stdout.write(`${opts.kind}: stopped; the sync failed, and the remaining scopes would wait for it too\n`);
         break;
       }
@@ -1865,6 +1808,7 @@ async function driverMain(argv) {
       if (res.outcome === 'model-failed') {
         failed = true;
         if (NOT_STARTED.includes(res.model.stopReason)) {
+          noteStop('model-not-started');
           process.stdout.write(`${opts.kind}: stopped; the model command could not be started (${res.model.stopReason})\n`);
           break;
         }
@@ -1876,6 +1820,7 @@ async function driverMain(argv) {
       // whatever Organize did. A failed pass fails the run.
       if (opts.kind === 'organize' && c.label) {
         const pass = await labelPass({ config, opts, state, scopes: opts.projects, runFolder });
+        noteLabel(pass.summary);
         if (pass.failed) failed = true;
       }
     }
@@ -1883,6 +1828,7 @@ async function driverMain(argv) {
     if (runDir && !opts.keep) removeTree(runDir);
   }
   if (await signalsHandled()) {
+    noteStop('interrupted');
     process.stdout.write(`${opts.kind}: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
@@ -1894,9 +1840,12 @@ if (argv[0] === '--step') {
   process.exitCode = stepMain(argv.slice(1));
 } else {
   driverMain(argv).then((code) => {
+    finishRun(code);
     process.exitCode = code;
   }, (err) => {
     process.stderr.write(`agent-memory consolidate failed: ${errorText(err)}\n`);
+    noteError('crash');
+    finishRun(1);
     process.exitCode = 1;
   });
 }
