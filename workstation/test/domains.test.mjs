@@ -154,9 +154,20 @@ test('tagLine tags work and personal only', () => {
 });
 
 test('tagLine leaves other lines alone', () => {
-  for (const line of ['- [A](a.md) about a', '- [A](../x/a.md) — about a', '- [A](a.md) — [work] about a', '# Heading']) {
+  for (const line of ['- [A](a.md) about a', '- [A](../x/a.md) — about a', '# Heading']) {
     assert.equal(tagLine(line, 'work'), line);
   }
+});
+
+test('tagLine takes the tag only from the note', () => {
+  assert.equal(tagLine('- [A](a.md) — [work] about a', 'personal'), '- [A](a.md) — [personal] about a');
+  assert.equal(tagLine('- [A](a.md) — [work] about a', 'general'), '- [A](a.md) — about a');
+  assert.equal(tagLine('- [A](a.md) — [personal] about a', null), '- [A](a.md) — about a');
+  assert.equal(tagLine('- [A](a.md) — [personal] [work] about a', 'work'), '- [A](a.md) — [work] about a');
+  assert.equal(tagLine('- [A](a.md) — [personal] [work] about a', 'general'), '- [A](a.md) — about a');
+  assert.equal(tagLine('- [A](a.md) — [work] about a', 'work'), '- [A](a.md) — [work] about a');
+  assert.equal(tagLine('- [A](a.md) — about [work] a', 'personal'), '- [A](a.md) — [personal] about [work] a');
+  assert.equal(tagLine('- [A](../x/a.md) — [work] about a', 'personal'), '- [A](../x/a.md) — [work] about a');
 });
 
 test('tagIndexLines reads each linked note of the folder', t => {
