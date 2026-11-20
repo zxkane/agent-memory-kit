@@ -449,6 +449,81 @@ check 'failing reload after a removal exits 0' test "$status" -eq 0
 check 'failing reload still removed the organize files' test ! -e "$udir/agent-memory-organize.timer" -a ! -e "$udir/agent-memory-organize.service"
 check 'failing reload is reported' has_text "$out" 'could not reload systemd'
 
+# The packages of the label step: npm ci in the kit only when a label block signs its tokens.
+npm_log="$tmp/npm.log"
+printf '%s\n' '#!/bin/bash' "printf '%s|%s\\n' \"\$PWD\" \"\$*\" >> \"$npm_log\"" > "$bin/npm"
+chmod +x "$bin/npm"
+npm_call="$kit|ci --omit=dev --ignore-scripts"
+would_npm="would run npm ci --omit=dev --ignore-scripts in $kit (the packages of the label step)"
+installed="installed the packages of the label step (npm ci --omit=dev --ignore-scripts in $kit)"
+label_of() { # label_of <json of the label part>: a valid consolidate block with that label part
+    printf '{"command":"/path/to/claude","model":"model-id","label":%s}' "$1"
+}
+prices='"inputUsdPerMillion":1,"outputUsdPerMillion":1'
+fresh_home
+run_setup --init alpha --repo-url "$remote" --no-enable
+rm -f "$npm_log"
+# No consolidate block, a block without a label part, a label part with a token file, an invalid
+# block: nothing to install, and nothing is said about it.
+for block in none '{"command":"/path/to/claude","model":"model-id"}' \
+    "$(label_of "{\"model\":\"label-model-id\",\"region\":\"us-east-1\",\"tokenFile\":\"/path/to/label-token\",$prices}")" \
+    "$(label_of "{\"model\":\"label-model-id\",\"region\":\"us-east-1\",\"credentials\":\"other\",$prices}")"; do
+    set_consolidate "$block"
+    run_setup --dry-run
+    check "no signing label block: dry run exits 0 ($block)" test "$status" -eq 0
+    check "no signing label block: dry run says nothing of npm ($block)" bash -c '! grep -q npm <<< "$1"' _ "$out"
+    run_setup --no-enable
+    check "no signing label block: run exits 0 ($block)" test "$status" -eq 0
+    check "no signing label block: no npm ($block)" test ! -e "$npm_log"
+done
+# A label part that signs: instance credentials (the default), or a role over the environment's.
+for label in "{\"model\":\"label-model-id\",\"region\":\"us-east-1\",$prices}" \
+    "{\"model\":\"label-model-id\",\"region\":\"us-east-1\",\"credentials\":\"environment\",\"roleArn\":\"arn:aws:iam::123456789012:role/example-label\",$prices}"; do
+    set_consolidate "$(label_of "$label")"
+    rm -f "$npm_log"
+    run_setup --dry-run
+    check "signing label block: dry run exits 0 ($label)" test "$status" -eq 0
+    check "signing label block: dry run names the install ($label)" has_text "$out" "$would_npm"
+    check "signing label block: dry run runs no npm ($label)" test ! -e "$npm_log"
+    run_setup --prepare
+    check "signing label block: --prepare runs no npm ($label)" test ! -e "$npm_log"
+    run_setup --no-enable
+    check "signing label block: run exits 0 ($label)" test "$status" -eq 0
+    check "signing label block: npm ci in the kit, once ($label)" test "$(cat "$npm_log" 2> /dev/null)" = "$npm_call"
+    check "signing label block: run says so ($label)" has_text "$out" "$installed"
+done
+# A failed npm ci fails setup with one line, before the hooks and the units are written.
+npm_fail="$tmp/npm-fail"
+mkdir -p "$npm_fail"
+printf '%s\n' '#!/bin/bash' 'echo "npm error code ECONNREFUSED" >&2' 'exit 1' > "$npm_fail/npm"
+chmod +x "$npm_fail/npm"
+rm -rf "$udir" "$calls"
+setup_path="$npm_fail:$bin:$PATH" run_setup
+check 'failed npm ci exits 1' test "$status" -eq 1
+check 'failed npm ci says so' has_text "$out" "setup.sh: npm ci --omit=dev --ignore-scripts failed in $kit; the label step cannot make its tokens without the AWS token generator. Fix the cause above and run setup.sh again."
+check 'failed npm ci writes no unit' test ! -e "$udir"
+check 'failed npm ci enables nothing' no_calls
+# Without npm, setup stops at its checks and writes nothing, in a dry run too.
+no_npm="$tmp/no-npm"
+mkdir -p "$no_npm"
+IFS=: read -ra path_dirs <<< "$bin:$PATH"
+for d in "${path_dirs[@]}"; do
+    for f in "$d"/*; do
+        n="${f##*/}"
+        [[ -f "$f" && -x "$f" && "$n" != npm && ! -e "$no_npm/$n" ]] || continue
+        ln -s "$f" "$no_npm/$n"
+    done
+done
+for mode in dry real; do
+    if [[ $mode == dry ]]; then setup_path="$no_npm" run_setup --dry-run; else setup_path="$no_npm" run_setup; fi
+    check "without npm ($mode) exits 1" test "$status" -eq 1
+    check "without npm ($mode) says why" has_text "$out" "setup.sh: npm is required: the label block in $cfg signs its tokens, and setup installs the AWS token generator for it with npm ci --omit=dev --ignore-scripts."
+    check "without npm ($mode) writes no unit" test ! -e "$udir"
+done
+set_consolidate none
+rm -f "$bin/npm" "$npm_log"
+run_setup --no-enable
+
 # Bridge: the second repository is cloned where bridge.agentsRepoDir says, when it is missing.
 agents_remote="$tmp/agents-remote.git"
 agents_dir="$tmp/agents-clone"

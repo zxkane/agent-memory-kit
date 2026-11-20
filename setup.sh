@@ -11,6 +11,8 @@
 # The same holds for canary.schedule (the timer of the deployed checks of the memory API).
 # When the config has a bridge block with agentsRepoUrl and its agentsRepoDir does not exist,
 # that repository is cloned there (the URL is never printed).
+# When the config has a consolidate.label block that signs its tokens (no tokenFile), the packages
+# of the label step are installed with npm ci --omit=dev --ignore-scripts in the kit's folder.
 # --no-hooks does everything else but does not register the Claude Code, Codex and
 #   Kiro hooks (and removes the kit's own entries if present).
 set -euo pipefail
@@ -40,6 +42,7 @@ agents_url=""
 bridge_problem=""
 canary_cal=""
 canary_problem=""
+label_signs=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
@@ -131,7 +134,8 @@ else
         const { loadConfig } = await import(process.argv[1]);
         const c = loadConfig({ HOME: process.env.HOME });
         if (!c) process.exit(3);
-        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? "", c.consolidate?.extract ?? "", c.consolidate?.organize ?? "", c.consolidateProblem ?? "", c.bridge?.agentsRepoDir ?? "", c.bridge?.agentsRepoUrl ?? "", c.bridgeProblem ?? "", c.canary?.schedule ?? "", c.canaryProblem ?? ""]));
+        const label = c.consolidate?.label ?? null;
+        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? "", c.consolidate?.extract ?? "", c.consolidate?.organize ?? "", c.consolidateProblem ?? "", c.bridge?.agentsRepoDir ?? "", c.bridge?.agentsRepoUrl ?? "", c.bridgeProblem ?? "", c.canary?.schedule ?? "", c.canaryProblem ?? "", label !== null && label.tokenFile === null ? 1 : 0]));
     ' "file://$kit_dir/workstation/lib/config.mjs")" || die "$config_file is not a valid, enabled configuration."
     repo_dir="$(node -p 'JSON.parse(process.argv[1])[0]' "$cfg")"
     repo_url="$(node -p 'JSON.parse(process.argv[1])[1]' "$cfg")"
@@ -143,6 +147,8 @@ else
     bridge_problem="$(node -p 'JSON.parse(process.argv[1])[7]' "$cfg")"
     canary_cal="$(node -p 'JSON.parse(process.argv[1])[8]' "$cfg")"
     canary_problem="$(node -p 'JSON.parse(process.argv[1])[9]' "$cfg")"
+    # A valid label block without a token file signs its tokens with the token generator.
+    label_signs="$(node -p 'JSON.parse(process.argv[1])[10]' "$cfg")"
 fi
 # A consolidate or canary block that is present but invalid leaves its units as they are:
 # reading it as "no schedule" would remove timers that the person did not ask to remove.
@@ -250,6 +256,10 @@ if [[ $init -eq 1 || $clone_needed -eq 1 ]]; then
     GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$repo_url" main > /dev/null \
         || die "the notes repository does not answer: git ls-remote --exit-code $repo_url main failed."
 fi
+# A label block that signs its tokens needs the packages of the label step, which npm installs.
+if [[ $label_signs -eq 1 ]] && ! command -v npm > /dev/null 2>&1; then
+    die "npm is required: the label block in $config_file signs its tokens, and setup installs the AWS token generator for it with npm ci --omit=dev --ignore-scripts."
+fi
 
 launchd_flags=()
 launchd_init_flags=()
@@ -269,6 +279,9 @@ if [[ $dry_run -eq 1 ]]; then
     if [[ $prepare -eq 1 ]]; then
         printf '%s\n' 'would prepare the note clones and state directory; hooks and schedulers left unchanged'
         exit 0
+    fi
+    if [[ $label_signs -eq 1 ]]; then
+        printf 'would run npm ci --omit=dev --ignore-scripts in %s (the packages of the label step)\n' "$kit_dir"
     fi
     if [[ $hooks -eq 1 ]]; then
         printf 'would run node %s/workstation/install.mjs (hooks in %s)\n' "$kit_dir" "$settings_file"
@@ -365,6 +378,16 @@ mkdir -p -m 700 "$state_dir"
 if [[ $prepare -eq 1 ]]; then
     printf '%s\n' 'prepared note clones; hooks, launcher and schedulers left unchanged'
     exit 0
+fi
+
+# The packages of the label step (the official AWS token generator), in the kit's node_modules:
+# only for a label block that signs its tokens, so that a machine that does not sign needs no
+# registry. No package script runs. A failure stops setup before the hooks and the timers.
+if [[ $label_signs -eq 1 ]]; then
+    if ! (cd "$kit_dir" && npm ci --omit=dev --ignore-scripts); then
+        die "npm ci --omit=dev --ignore-scripts failed in $kit_dir; the label step cannot make its tokens without the AWS token generator. Fix the cause above and run setup.sh again."
+    fi
+    printf 'installed the packages of the label step (npm ci --omit=dev --ignore-scripts in %s)\n' "$kit_dir"
 fi
 
 # 6. Hooks and the recorded Node.js path.
