@@ -2,11 +2,11 @@
 // Responses endpoint (Amazon Bedrock Mantle), with a short-term bearer token, and no agent loop or
 // tools. No dependencies. No error text holds a response body, a header, the token or the prompt.
 
-import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { assumeRole, bedrockToken, environmentCredentials, imdsCredentials } from './aws.mjs';
 import { LABELS } from './domains.mjs';
 import { CUT_MARKER, NOTE_TEXT_CAP, capped } from './label-notes.mjs';
 import { renderPrompt } from './model-run.mjs';
+import { readRegular } from './workdir.mjs';
 
 export { CUT_MARKER, NOTE_TEXT_CAP };
 
@@ -211,32 +211,22 @@ export async function labelBatch({ notes, persona, label, token, fetchImpl, sign
 }
 
 const BAD_TOKEN_FILE = 'the label token file is not a token';
+const UNREADABLE_TOKEN_FILE = 'the label token file cannot be read';
 
-// The token of a file, a regular file of at most 16 KiB and never a link, with the file's
-// modification time (ms) from the same open file.
+// The token of a file, a regular file of at most 16 KiB and never a link (workdir's reader), with
+// the file's modification time (ms) from the same open file.
 function readTokenFile(path) {
-  let fd;
+  const info = {};
+  let buf;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  } catch (err) {
-    throw new Error(err.code === 'ELOOP' ? BAD_TOKEN_FILE : 'the label token file cannot be read');
+    buf = readRegular(path, info, { maxBytes: MAX_TOKEN_FILE_BYTES });
+  } catch {
+    throw new Error(UNREADABLE_TOKEN_FILE);
   }
-  try {
-    const st = fstatSync(fd);
-    if (!st.isFile() || st.size > MAX_TOKEN_FILE_BYTES) throw new Error(BAD_TOKEN_FILE);
-    const buf = Buffer.alloc(st.size);
-    let off = 0;
-    while (off < st.size) {
-      const n = readSync(fd, buf, off, st.size - off, off);
-      if (n === 0) break;
-      off += n;
-    }
-    const token = buf.subarray(0, off).toString('utf8').trim();
-    if (!TOKEN_RE.test(token)) throw new Error(BAD_TOKEN_FILE);
-    return { token, mtimeMs: st.mtimeMs };
-  } finally {
-    closeSync(fd);
-  }
+  if (buf === null) throw new Error(info.missing ? UNREADABLE_TOKEN_FILE : BAD_TOKEN_FILE);
+  const token = buf.toString('utf8').trim();
+  if (!TOKEN_RE.test(token)) throw new Error(BAD_TOKEN_FILE);
+  return { token, mtimeMs: info.mtimeMs };
 }
 
 // A bearer token for the label endpoint: the token file when the label block names one, otherwise

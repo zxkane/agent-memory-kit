@@ -1213,6 +1213,28 @@ test('m8: readRegular and noteFiles are exported', (t) => {
   assert.equal(noteFiles(join(dir, 'missing')).size, 0);
 });
 
+test('readRegular refuses a file over maxBytes and gives what the open file says of itself', (t) => {
+  const dir = tempDir(t);
+  write(dir, { 'a.md': '0123456789' });
+  const file = join(dir, 'a.md');
+  assert.equal(readRegular(file, null, { maxBytes: 10 }).toString(), '0123456789');
+  assert.equal(readRegular(file, null, { maxBytes: 9 }), null);
+  const issued = new Date('2026-11-22T03:50:00Z');
+  utimesSync(file, issued, issued);
+  chmodSync(file, 0o640);
+  const info = {};
+  assert.equal(readRegular(file, info).toString(), '0123456789');
+  assert.deepEqual(info, { mode: 0o640, mtimeMs: issued.getTime() });
+  // Why a read gave nothing: the path is missing, or it is something else (a link, a folder).
+  const gone = {};
+  assert.equal(readRegular(join(dir, 'gone.md'), gone), null);
+  assert.equal(gone.missing, true);
+  symlinkSync(file, join(dir, 'link.md'));
+  const link = {};
+  assert.equal(readRegular(join(dir, 'link.md'), link), null);
+  assert.equal(link.missing, false);
+});
+
 // C1: a retired note keeps a term that is in its target, or that another note written in this run
 // newly contains (an added note, or a changed note whose body did not have it).
 function splitScope(t) {

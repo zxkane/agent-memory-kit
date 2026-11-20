@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -229,4 +230,32 @@ test('tagIndexLines reads each linked note of the folder', t => {
   assert.deepEqual(tagIndexLines(lines, dir), [
     '# Index', '- [A](a.md) — [work] about a', '- [B](b.md) — about b', '- [C](c.md) — about c', '- [D](d.md) — about d',
   ]);
+});
+
+test('tagIndexLines leaves the line of a note it may not read as it was', t => {
+  const dir = tmp(t);
+  const labeled = NOTE.replace('  originSessionId: x', '  domain: work');
+  writeFileSync(join(dir, 'real.md'), labeled);
+  symlinkSync(join(dir, 'real.md'), join(dir, 'link.md'));
+  // Over the size limit, even with its label in the first lines.
+  writeFileSync(join(dir, 'big.md'), labeled + 'x'.repeat(1024 * 1024));
+  writeFileSync(join(dir, 'MEMORY.md'), '- [L](link.md) — [personal] about l\n- [B](big.md) — about b\n- [R](real.md) — about r\n');
+  const index = readFileSync(join(dir, 'MEMORY.md'), 'utf8');
+  assert.deepEqual(tagIndexLines(index.split('\n'), dir), [
+    '- [L](link.md) — [personal] about l', '- [B](big.md) — about b', '- [R](real.md) — [work] about r', '',
+  ]);
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), index, 'MEMORY.md itself is never written');
+});
+
+test('tagIndexLines refuses a FIFO in place of a note without waiting for a writer', t => {
+  const dir = tmp(t);
+  assert.equal(spawnSync('mkfifo', [join(dir, 'f.md')]).status, 0);
+  // In a child process with a time limit: a read that waited on the FIFO would hang the test run.
+  const url = new URL('../lib/domains.mjs', import.meta.url).href;
+  const code = `import { tagIndexLines } from ${JSON.stringify(url)};\n`
+    + `process.stdout.write(JSON.stringify(tagIndexLines(['- [F](f.md) — about f'], ${JSON.stringify(dir)})));`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(r.signal, null, 'the read did not wait');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), ['- [F](f.md) — about f']);
 });

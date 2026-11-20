@@ -1,7 +1,9 @@
 // Note labels: the `domain` of a note, the private inputs that decide it, and the tags on index lines.
-import { closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+// Its imports are node built-ins and kit modules that have no side effects at import and load no AWS
+// code, so that the session-start hook may use it.
 import { join } from 'node:path';
 import { AGENT_RE, INDEX, NOTE_NAME_RE, PROJECT_RE } from './notes.mjs';
+import { readRegular } from './workdir.mjs';
 
 export const LABELS = Object.freeze(['work', 'personal', 'general']);
 
@@ -134,32 +136,25 @@ export function scopeDefault(domains, scope) {
   return domains.defaults.get(scope) ?? 'general';
 }
 
-// Reads at most `limit` bytes of a regular file (not a symlink). Returns null when it cannot.
-function readRegular(file, limit) {
-  let fd;
+// The text of a regular file of at most `maxBytes` bytes (workdir's reader: never a link, never a
+// wait on a FIFO), or null when it cannot be read.
+function readText(file, maxBytes) {
   try {
-    if (!lstatSync(file).isFile()) return null;
-    fd = openSync(file, 'r');
-    if (!fstatSync(fd).isFile()) return null;
-    const buf = Buffer.alloc(limit + 1);
-    const n = readSync(fd, buf, 0, limit + 1, 0);
-    return { text: buf.subarray(0, Math.min(n, limit)).toString('utf8'), truncated: n > limit };
+    return readRegular(file, null, { maxBytes })?.toString('utf8') ?? null;
   } catch {
     return null;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
 }
 
 // Reads the two private inputs. Names the first one that cannot be used.
 export function readLabelInputs({ domainsFile, personaFile }) {
-  const d = readRegular(domainsFile, MAX_DOMAINS_BYTES);
-  if (!d || d.truncated) return { problem: 'domainsFile' };
-  const parsed = parseDomains(d.text);
+  const d = readText(domainsFile, MAX_DOMAINS_BYTES);
+  if (d === null) return { problem: 'domainsFile' };
+  const parsed = parseDomains(d);
   if (parsed.problem) return { problem: `domainsFile: ${parsed.problem}` };
   // A persona over the limit has more than MAX_PERSONA_CHARS characters, so a few extra bytes are enough to tell.
-  const p = readRegular(personaFile, 4 * MAX_PERSONA_CHARS + 4096);
-  const persona = p && !p.truncated ? p.text.trim() : '';
+  const p = readText(personaFile, 4 * MAX_PERSONA_CHARS + 4096);
+  const persona = p === null ? '' : p.trim();
   if (!persona || persona.length > MAX_PERSONA_CHARS) return { problem: 'personaFile' };
   return { domains: parsed.value, persona };
 }
@@ -176,12 +171,13 @@ export function tagLine(line, label) {
   return `${line.slice(0, m[0].length)}${tag}${rest}`;
 }
 
-// Tags every index line by the label of the note it links in `dir`. A note that cannot be read leaves its line as it was.
+// Tags every index line by the label of the note it links in `dir`. A note that cannot be read (also a link, a
+// FIFO or a file over MAX_NOTE_BYTES) leaves its line as it was.
 export function tagIndexLines(lines, dir) {
   return lines.map(line => {
     const m = TAG_LINE_RE.exec(line);
     if (!m) return line;
-    const note = readRegular(join(dir, m[1]), MAX_NOTE_BYTES);
-    return note ? tagLine(line, readDomain(note.text)) : line;
+    const note = readText(join(dir, m[1]), MAX_NOTE_BYTES);
+    return note === null ? line : tagLine(line, readDomain(note));
   });
 }

@@ -45,21 +45,25 @@ function loc(label, name) {
   return `${label}/${s}`;
 }
 
-// The bytes of a regular file, or null when the path is missing, is a symbolic link or is not a
-// regular file. The open itself refuses a symbolic link, so a swap between check and read is safe.
-// With `info`, the file's permission bits are stored in `info.mode`, read from the open descriptor.
-export function readRegular(path, info = null) {
+// The bytes of a regular file, or null when the path is missing, is a symbolic link, is not a
+// regular file or holds more than `maxBytes` bytes. The open itself refuses a symbolic link and
+// never waits (a FIFO is opened without a writer, then refused), so a swap between check and read
+// is safe; the buffer is the size the open file has. With `info`, the file's permission bits and
+// modification time are stored in `info.mode` and `info.mtimeMs`, read from the open descriptor,
+// and a missing path or a link sets `info.missing` (true for a missing path).
+export function readRegular(path, info = null, { maxBytes = Infinity } = {}) {
   let fd;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (err) {
-    if (isMissing(err) || err.code === 'ELOOP') return null;
-    throw err;
+    if (!isMissing(err) && err.code !== 'ELOOP') throw err;
+    if (info) info.missing = isMissing(err);
+    return null;
   }
   try {
     const st = fstatSync(fd);
-    if (!st.isFile()) return null;
-    if (info) info.mode = st.mode & 0o777;
+    if (!st.isFile() || st.size > maxBytes) return null;
+    if (info) Object.assign(info, { mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
     const buf = Buffer.alloc(st.size);
     let off = 0;
     while (off < st.size) {

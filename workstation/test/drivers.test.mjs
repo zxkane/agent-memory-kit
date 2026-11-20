@@ -258,7 +258,7 @@ test('sync.mjs loads no bridge module on a machine without a bridge block', (t) 
   assert.equal('bridge' in JSON.parse(readFileSync(join(f.state, 'status.json'), 'utf8')), false);
 });
 
-test('the config and the session-start text load no AWS code', (t) => {
+test('the config, the session-start text and the note labels load no AWS code', (t) => {
   const dir = tempDir(t);
   const hook = join(dir, 'record-loads.mjs');
   writeFileSync(hook, [
@@ -268,11 +268,13 @@ test('the config and the session-start text load no AWS code', (t) => {
     '',
   ].join('\n'));
   const log = join(dir, 'loads.log');
-  const code = `await import(${JSON.stringify(join(PKG, 'lib/config.mjs'))}); await import(${JSON.stringify(join(PKG, 'lib/context.mjs'))});`;
+  // lib/domains.mjs gives the index lines of the session-start text their tags.
+  const code = ['lib/config.mjs', 'lib/context.mjs', 'lib/domains.mjs'].map((name) => `await import(${JSON.stringify(join(PKG, name))});`).join(' ');
   const r = spawnSync(process.execPath, ['--import', hook, '--input-type=module', '-e', code], { env: { ...process.env, AM_LOAD_LOG: log }, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   const loads = readFileSync(log, 'utf8');
   assert.match(loads, /lib\/config\.mjs/);
+  assert.match(loads, /lib\/domains\.mjs/);
   assert.doesNotMatch(loads, /lib\/(aws|s3)\.mjs/);
 });
 
