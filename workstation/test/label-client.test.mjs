@@ -306,7 +306,7 @@ const askAll = (batches, { tokenSource, fetchImpl }) => askLabelModel({
   labelBatch: (notes, provideToken) => labelBatch({ notes, persona: 'p', label: LABEL, provideToken, fetchImpl, sleep: noSleep }),
 });
 
-test('a label block that signs gets one provider of the official token generator: its region, an hour, its credentials', async () => {
+test('a label block that signs gets one provider of the official token generator: its region, 15 minutes, its credentials', async () => {
   // The instance metadata service. The provider makes a new token for every request: no age stop.
   let aws = fakeAws();
   let run = await tokenForRun({ ...LABEL, credentials: 'instance' }, { deps: aws.deps });
@@ -315,7 +315,7 @@ test('a label block that signs gets one provider of the official token generator
   assert.deepEqual(aws.made[0][1], { ec2MetadataV1Disabled: true });
   let config = generatorConfig(aws);
   assert.deepEqual(Object.keys(config).sort(), ['credentials', 'expiresInSeconds', 'region']);
-  assert.deepEqual([config.region, config.expiresInSeconds, config.credentials], ['us-east-1', 3600, aws.made[0][2]]);
+  assert.deepEqual([config.region, config.expiresInSeconds, config.credentials], ['us-east-1', 900, aws.made[0][2]]);
   // One provider for the pass, which asks the credentials for every token.
   assert.deepEqual([await run.provideToken(), await run.provideToken()], ['bedrock-api-key-example1', 'bedrock-api-key-example2']);
   assert.deepEqual(aws.asked, ['instance', 'instance']);
@@ -328,11 +328,11 @@ test('a label block that signs gets one provider of the official token generator
   assert.deepEqual(madeNames(aws), ['fromEnv', 'getTokenProvider']);
   assert.deepEqual(aws.made[0][1], []);
   config = generatorConfig(aws);
-  assert.deepEqual([config.region, config.expiresInSeconds], ['us-east-1', 3600]);
+  assert.deepEqual([config.region, config.expiresInSeconds], ['us-east-1', 900]);
   assert.deepEqual(await config.credentials(), CREDS);
   assert.deepEqual(aws.asked, ['environment']);
 
-  // A role, whose master is the block's source: a session of an hour in the block's region.
+  // A role, whose master is the block's source: a session of 15 minutes, the shortest STS allows, in the block's region.
   for (const [credentials, master] of [['instance', 'fromInstanceMetadata'], ['environment', 'fromEnv']]) {
     aws = fakeAws();
     run = await tokenForRun({ ...LABEL, credentials, roleArn: ROLE }, { deps: aws.deps });
@@ -340,12 +340,12 @@ test('a label block that signs gets one provider of the official token generator
     assert.deepEqual(madeNames(aws), [master, 'fromTemporaryCredentials', 'getTokenProvider'], credentials);
     const [, options, roleCredentials] = aws.made[1];
     assert.deepEqual(Object.keys(options).sort(), ['clientConfig', 'masterCredentials', 'params']);
-    assert.deepEqual(options.params, { RoleArn: ROLE, RoleSessionName: 'agent-memory-label', DurationSeconds: 3600 });
+    assert.deepEqual(options.params, { RoleArn: ROLE, RoleSessionName: 'agent-memory-label', DurationSeconds: 900 });
     assert.deepEqual(options.clientConfig, { region: 'us-east-1' });
     assert.deepEqual(await options.masterCredentials(), CREDS);
     assert.deepEqual(aws.asked, [credentials]);
     config = generatorConfig(aws);
-    assert.deepEqual([config.region, config.expiresInSeconds, config.credentials], ['us-east-1', 3600, roleCredentials]);
+    assert.deepEqual([config.region, config.expiresInSeconds, config.credentials], ['us-east-1', 900, roleCredentials]);
   }
 });
 
@@ -538,15 +538,16 @@ test('a pass that signs without the AWS packages fails closed, naming the comman
   assert.equal(r.stdout, `the AWS token generator is not installed; run npm ci --omit=dev --ignore-scripts in ${kit}\n`);
 });
 
-test('the official token generator makes a short-term Bedrock token offline', async () => {
-  const { getTokenProvider } = await import('@aws/bedrock-token-generator');
-  // Static credentials and a region: there is nothing to look up and nothing to send.
-  const provideToken = getTokenProvider({ region: 'us-east-1', credentials: CREDS, expiresInSeconds: 3600 });
-  const token = await provideToken();
+test('the official token generator makes the kit\'s short-term Bedrock token offline, valid for 15 minutes', async () => {
+  // The real packages; only the credentials are a stand-in. Static credentials and a region: there
+  // is nothing to look up and nothing to send.
+  const aws = await loadTokenPackages();
+  const run = await tokenForRun({ ...LABEL, credentials: 'environment' }, { deps: { ...aws, fromEnv: () => async () => CREDS } });
+  const token = await run.provideToken();
   assert.ok(token.startsWith('bedrock-api-key-'));
   const url = decodeToken(token);
   assert.match(url, /^bedrock\.amazonaws\.com\/\?Action=CallWithBearerToken&/);
-  assert.match(url, /&X-Amz-Expires=3600&/);
+  assert.match(url, /&X-Amz-Expires=900&/);
   assert.match(url, /&X-Amz-Credential=AKIDEXAMPLE%2F\d{8}%2Fus-east-1%2Fbedrock%2Faws4_request&/);
   assert.match(url, /&Version=1$/);
   assert.ok(!url.includes('example-signing-value'));

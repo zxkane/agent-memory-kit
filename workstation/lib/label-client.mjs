@@ -23,7 +23,9 @@ const BACKOFF_MS = [500, 1500];
 const MAX_REASON_CHARS = 300;
 const MAX_TOKEN_FILE_BYTES = 16 * 1024;
 const TOKEN_RE = /^[A-Za-z0-9+/=._-]+$/;
-const TOKEN_LIFETIME_SECONDS = 3600;
+// A token, and a role's session, carry one request of at most ATTEMPT_TIMEOUT_MS: they last the
+// shortest time STS allows a role session.
+const TOKEN_LIFETIME_SECONDS = 900;
 const NO_TOKEN = 'the label token could not be made';
 // The kit's checkout, whose node_modules holds the packages of the label step.
 const KIT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -336,7 +338,7 @@ function labelCredentials(label, aws) {
 //   is not known (null), so it stops nothing; once such a key has expired, its requests get 401 or
 //   403, which count toward the failure stop.
 // - Otherwise one provider of the official token generator (`deps` replaces the packages in tests)
-//   for the block's region, which makes a new token of an hour from the block's credentials for
+//   for the block's region, which makes a new token of 15 minutes from the block's credentials for
 //   every request, so that no token gets old (null). No token is kept: a provider that fails fails
 //   that request, and no other source is tried.
 export async function tokenForRun(label, { now = () => new Date(), deps } = {}) {
