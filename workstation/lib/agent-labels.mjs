@@ -111,7 +111,7 @@ function misfit(s, n, scopeEntries) {
 // listing. `entries`: the search entries as read before the writes. In a dry run, only what would be
 // written.
 async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
-  const out = { written: [], unchanged: [], left: new Map(), notWritten: 0, details: [], failed: false };
+  const out = { written: [], unchanged: [], left: new Map(), notWritten: 0, refreshed: 0, details: [], failed: false };
   const scopeEntries = scopeEntriesOf(entries, s.scope);
   const skip = (path, why) => {
     out.left.set(path, why);
@@ -192,6 +192,7 @@ async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
   if (updates.length > 0) {
     try {
       await setNoteEntries(client, s.agent, updates);
+      out.refreshed = updates.length - out.written.length;
     } catch (err) {
       entriesWritten = false;
       out.failed = true;
@@ -225,9 +226,11 @@ async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
 }
 
 // The line of a scope. `idle`: nothing of it was touched or left; `took`: a label was planned for it.
+// A scope whose only write was search entries given their note's label says how many.
 function headline(s, out, { dryRun, idle, took }) {
   const scope = `label ${s.scope}`;
   const written = out.written.length;
+  if (!took && out.refreshed > 0) return `${scope}: no label written, ${out.refreshed} search entry(ies) refreshed`;
   if (idle) return `${scope}: nothing to do`;
   if (dryRun) return `${scope}: dry-run, ${written} label(s) to set or change`;
   if (!took) return `${scope}: nothing written`;

@@ -595,6 +595,11 @@ test('the search entries of the notes read get their note\'s label in the same u
   assert.equal(out.failed, false, out.lines.join('\n'));
   assert.deepEqual(m.calls, []);
   assert.deepEqual(reads(b, from), ['agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md', 'agents/example-agent/family.md']);
+  // A scope whose only write was its entries says how many it refreshed.
+  assert.deepEqual(out.lines, [
+    'label agents/codex-alpha: no label written, 2 search entry(ies) refreshed',
+    'label agents/example-agent: no label written, 1 search entry(ies) refreshed',
+  ]);
   assert.deepEqual(['codex-alpha/deploy-steps', 'codex-alpha/deploys', 'example-agent/family'].map((n) => b.entry(`agents/${n}.md`).domain), ['work', 'work', 'general']);
   assert.equal(snapshotPuts(from), 2);
   // Then nothing is read again.
