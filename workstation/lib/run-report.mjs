@@ -29,7 +29,6 @@ const MAX_FIELD_PROBLEMS = 10;
 const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const MAX_DAYS = 365;
 const DATE_RE = /^\d{4}-\d\d-\d\d$/;
-const KINDS = ['extract', 'organize', 'label'];
 export const REPORT_USAGE = 'usage: run.sh consolidate report [--since <YYYY-MM-DD> | --days <n>] [--format json|md]';
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -112,10 +111,12 @@ const oneOf = (words) => ({ test: (v) => words.includes(v), word: true });
 const orNull = (rule) => ({ ...rule, nullable: true });
 const maybe = (rule) => ({ ...rule, optional: true });
 const SIZES = { fields: { lines: INT, bytes: INT } };
+// The kinds of a twin of one scope's run; the label step's twin has kind `label`.
+const SCOPE_KINDS = ['extract', 'organize'];
 
 const SCOPE_TWIN = {
   fields: {
-    schemaVersion: INT, host: HOST, kind: oneOf(['extract', 'organize']), scope: STR, date: DAY, endedAt: TIME, model: STR, stopReason: STOP,
+    schemaVersion: INT, host: HOST, kind: oneOf(SCOPE_KINDS), scope: STR, date: DAY, endedAt: TIME, model: STR, stopReason: STOP,
     costUsd: orNull(NUM), turns: orNull(INT), denials: orNull(INT), repaired: INT,
     conversation: orNull({ fields: { truncated: BOOL, bytes: orNull(INT), sessionsLeftOut: INT } }),
     folders: {
@@ -157,6 +158,10 @@ const LABEL_TWIN = {
   },
 };
 
+// The field rules of a twin by its kind: twinOf takes as a twin only a kind this table names, so the
+// check of a twin and the rules of its fields cannot disagree.
+const TWIN_RULES = new Map([...SCOPE_KINDS.map((kind) => [kind, SCOPE_TWIN]), ['label', LABEL_TWIN]]);
+
 // `value` as `rule` takes it: only the keys a rule names, each of its type or null (a list's entry
 // that is not is left out). `problem(name, what)` is told of each field that is not; its name is
 // the rule's, never a text of the file.
@@ -195,7 +200,8 @@ function clean(value, rule, name, problem) {
 // A twin as the report gives it: its known fields, cleaned, with each problem named once (at most
 // MAX_FIELD_PROBLEMS); null when it is not a twin of schemaVersion 1 at all.
 function twinOf(data, file, problems) {
-  if (!isObject(data) || data.schemaVersion !== REPORT_SCHEMA_VERSION || !KINDS.includes(data.kind)) {
+  const rule = isObject(data) && data.schemaVersion === REPORT_SCHEMA_VERSION ? TWIN_RULES.get(data.kind) : undefined;
+  if (rule === undefined) {
     problems.push({ file, problem: 'not a report of schemaVersion 1' });
     return null;
   }
@@ -207,7 +213,7 @@ function twinOf(data, file, problems) {
     if (seen.size <= MAX_FIELD_PROBLEMS) problems.push({ file, problem: text });
     else if (seen.size === MAX_FIELD_PROBLEMS + 1) problems.push({ file, problem: 'more fields have the wrong type' });
   };
-  return clean(data, data.kind === 'label' ? LABEL_TWIN : SCOPE_TWIN, '', problem);
+  return clean(data, rule, '', problem);
 }
 
 // The reports of the window: each `.json` twin, and each `.md` report without one, which
@@ -437,14 +443,19 @@ function reportLine(r) {
   return `- ${plain(r.date)} ${plain(r.host)} ${r.kind}${scope}: ${what}, ${money(r.costUsd)}${from}`;
 }
 
+// What the summary says of the label step and the agent scopes being configured.
+function configuredSentence({ label, agents }) {
+  if (label && agents) return 'the label step and the agent scopes are configured';
+  if (label) return 'the label step is configured, the agent scopes are not';
+  if (agents) return 'the agent scopes are configured, the label step is not';
+  return 'neither the label step nor the agent scopes are configured';
+}
+
 // The report as a short text for a terminal.
 export function reportSummary(report) {
   const lines = [`Consolidation on ${report.host}, ${minute(report.window.since)} to ${minute(report.window.until)} UTC`];
-  const { label, agents } = report.configured;
-  const parts = label && agents ? 'the label step and the agent scopes are configured'
-    : label ? 'the label step is configured, the agent scopes are not'
-      : agents ? 'the agent scopes are configured, the label step is not' : 'neither the label step nor the agent scopes are configured';
-  lines.push(`Schedule: Extract ${report.schedule.extract ?? 'none'}, Organize ${report.schedule.organize ?? 'none'}; ${parts}`, '');
+  const configuredText = configuredSentence(report.configured);
+  lines.push(`Schedule: Extract ${report.schedule.extract ?? 'none'}, Organize ${report.schedule.organize ?? 'none'}; ${configuredText}`, '');
   const failed = report.runs.filter((r) => r.exitCode !== 0).length;
   lines.push(report.runs.length === 0 ? 'Runs on this machine: none' : `Runs on this machine: ${report.runs.length}, ${failed} failed`);
   lines.push(...report.runs.map(runLine), '');
