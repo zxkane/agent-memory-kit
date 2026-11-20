@@ -76,9 +76,32 @@ test('setDomain rejects a label outside LABELS', () => {
 });
 
 test('setDomain keeps what parseNote reads', () => {
-  for (const text of [NOTE, NOTE.replace(/\n/g, '\r\n'), '---\nname: a\ndescription: d\n---\nb\n']) {
+  const gapped = NOTE.replace('  originSessionId: x', '\n  originSessionId: x\n  \n  domain: general');
+  for (const text of [NOTE, NOTE.replace(/\n/g, '\r\n'), '---\nname: a\ndescription: d\n---\nb\n', gapped, gapped.replace(/\n/g, '\r\n')]) {
     assert.deepEqual(parseNote(setDomain(text, 'work').text), parseNote(text));
   }
+});
+
+test('a blank or white-space line inside the metadata block belongs to it', () => {
+  for (const gap of ['', '   ', '\t']) {
+    for (const eol of ['\n', '\r\n']) {
+      const text = NOTE.replace('  originSessionId: x', `  originSessionId: x\n${gap}\n  domain: personal`).replace(/\n/g, eol);
+      assert.equal(readDomain(text), 'personal', JSON.stringify(gap));
+      // Replaced in place: one key, so that no YAML reader sees the old label or two keys.
+      const out = setDomain(text, 'work').text;
+      assert.equal(out, text.replace('  domain: personal', '  domain: work'), JSON.stringify(gap));
+      assert.equal(out.match(/domain:/g).length, 1);
+    }
+  }
+  // A new key goes after the block's last line, also when a blank line comes before it.
+  const later = NOTE.replace('  originSessionId: x', '\n  originSessionId: x');
+  assert.equal(setDomain(later, 'general').text, later.replace('  originSessionId: x\n', '  originSessionId: x\n  domain: general\n'));
+  // A blank line before a key of the frontmatter, or before its end, does not belong to the block.
+  const outside = '---\nname: a\nmetadata:\n  type: project\n\ndescription: d\n\n  domain: work\n---\n';
+  assert.equal(readDomain(outside), null);
+  assert.equal(setDomain(outside, 'personal').text, outside.replace('  type: project\n', '  type: project\n  domain: personal\n'));
+  const atEnd = '---\nname: a\nmetadata:\n  type: project\n \n---\nbody\n';
+  assert.equal(setDomain(atEnd, 'work').text, '---\nname: a\nmetadata:\n  type: project\n  domain: work\n \n---\nbody\n');
 });
 
 test('parseDomains accepts the schema and names the first problem', () => {

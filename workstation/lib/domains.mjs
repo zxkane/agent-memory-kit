@@ -31,7 +31,8 @@ function unquote(value) {
 const bare = line => line.replace(/\r$/, '');
 
 // Finds the frontmatter block and the metadata block in it, by parseNote's rules. Lines keep their `\r`.
-// `children` holds the indexes of the lines under `metadata:`.
+// `children` holds the indexes of the indented lines under `metadata:`. A blank or white-space line
+// belongs to the block when an indented line of it follows, as in YAML; it is not a child.
 function locate(text) {
   const lines = String(text).split('\n');
   if (bare(lines[0]) !== '---') return { skip: 'no frontmatter' };
@@ -46,7 +47,10 @@ function locate(text) {
   }
   const children = [];
   if (meta !== -1) {
-    for (let i = meta + 1; i < end && /^\s+\S/.test(lines[i]); i++) children.push(i);
+    for (let i = meta + 1; i < end; i++) {
+      if (/^\s+\S/.test(lines[i])) children.push(i);
+      else if (/\S/.test(lines[i])) break;
+    }
   }
   return { lines, end, meta, children };
 }
