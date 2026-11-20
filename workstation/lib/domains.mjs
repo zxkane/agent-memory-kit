@@ -2,7 +2,7 @@
 // Its imports are node built-ins and kit modules that have no side effects at import and load no AWS
 // code, so that the session-start hook may use it.
 import { join } from 'node:path';
-import { AGENT_RE, INDEX, NOTE_NAME_RE, PROJECT_RE } from './notes.mjs';
+import { AGENT_RE, INDEX, NOTE_NAME_RE, PROJECT_RE, unquote } from './notes.mjs';
 import { readRegular } from './workdir.mjs';
 
 export const LABELS = Object.freeze(['work', 'personal', 'general']);
@@ -20,13 +20,6 @@ const spaced = (word) => [...word].join(GAP);
 // inside and after them. Homoglyphs and full-width brackets are not tags.
 const TAG_RUN_RE = new RegExp(`^${GAP}(?:\\[${GAP}(?:${spaced('work')}|${spaced('personal')})${GAP}\\]${GAP})+`, 'iv');
 const SCOPE_RE = /^(?:global|projects\/([^/]+)|agents\/([^/]+))$/;
-
-// Same unquoting as parseNote.
-function unquote(value) {
-  const v = value.trim();
-  if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) return v.slice(1, -1);
-  return v;
-}
 
 const bare = line => line.replace(/\r$/, '');
 

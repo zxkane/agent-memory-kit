@@ -24,10 +24,10 @@ import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
 import { readLabelInputs } from './lib/domains.mjs';
 import { labelBatch, tokenForRun } from './lib/label-client.mjs';
 import {
-  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, labelEntryProblem,
+  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, digestsOf, fileDigests, folderDigest, labelEntryProblem,
 } from './lib/label-notes.mjs';
 import {
-  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, unreadScopeResults,
+  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, plannedLabels, selectTouched, unreadScopeResults,
 } from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
@@ -91,11 +91,6 @@ function lstatOrNull(path) {
   }
 }
 
-// SHA-256 over the sorted `name:hash` lines of a folder's note files.
-function folderDigest(dir) {
-  return sha256([...noteFiles(dir)].map(([name, buf]) => `${name}:${sha256(buf)}`).join('\n'));
-}
-
 function scopeInfo(dir) {
   const files = noteFiles(dir);
   const index = files.get(INDEX);
@@ -105,7 +100,7 @@ function scopeInfo(dir) {
     notes: names.filter((n) => n !== INDEX).length,
     overLimit: stats.lines > INDEX_MAX_LINES || stats.bytes > INDEX_MAX_BYTES,
     conflict: names.some((n) => CONFLICT_RE.test(n)),
-    digest: sha256(names.map((n) => `${n}:${sha256(files.get(n))}`).join('\n')),
+    digest: digestOfFiles(digestsOf(files)),
   };
 }
 
@@ -522,7 +517,7 @@ const scopeOfPath = (path) => (path.startsWith('projects/') ? path.split('/')[1]
 const isCloneScope = (folder) => folder === GLOBAL || folder.startsWith('projects/');
 
 // Writes `<work>/label-notes.json`: the notes of the named scopes (of every scope without
-// `--scope`) as collectScopeNotes lists them, and each scope's digest. A named scope whose folder
+// `--scope`) as collectScopeNotes lists them, and the names of the scopes it read. A named scope whose folder
 // is missing or may not be touched is left out.
 function stepLabelRead(config, rest) {
   const a = parseStepArgs(rest, ['--work'], [], ['--scope']);
@@ -541,8 +536,7 @@ function stepLabelRead(config, rest) {
   const scopes = (named.length > 0 ? named : [GLOBAL, ...listProjects(config)])
     .map((name) => ({ name, dir: liveFolder(config, name) })).filter((s) => s.dir);
   const notes = scopes.flatMap((s) => collectScopeNotes(s.dir, scopeFolder(s.name)));
-  const digests = Object.fromEntries(scopes.map((s) => [s.name, folderDigest(s.dir)]));
-  writeFileSync(join(work, 'label-notes.json'), `${JSON.stringify({ notes, digests }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  writeFileSync(join(work, 'label-notes.json'), `${JSON.stringify({ notes, scopes: scopes.map((s) => s.name) }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
   out({ outcome: 'label-read', notes: notes.length, sync });
 }
 
@@ -624,7 +618,7 @@ function stepLabelApply(config, rest) {
   // Each written note goes from the digest it was read with (the entry's) to the one written.
   const readAs = new Map(plan.entries.map((e) => [e.path, e.sha256]));
   const writesIn = (name) => applied.written.filter((w) => scopeOfPath(w.path) === name)
-    .map((w) => ({ file: w.path.slice(w.path.lastIndexOf('/') + 1), from: readAs.get(w.path), to: w.sha256 }));
+    .map((w) => ({ file: basename(w.path), from: readAs.get(w.path), to: w.sha256 }));
   const digests = Object.fromEntries(scopes.map((s) => [s.name, {
     before: digestOfFiles(s.before), after: digestAfterLabels(s.before, writesIn(s.name), folderDigest(s.dir)),
   }]));
@@ -1543,8 +1537,6 @@ function labelRecordOf(state) {
   return Object.fromEntries(Object.entries(labels.notes).filter(([, digest]) => typeof digest === 'string' && HASH_RE.test(digest)));
 }
 
-const notesFolderOf = (path) => path.slice(0, path.lastIndexOf('/'));
-
 // The two label inputs, read and checked: the files the label block names, else those under
 // .agent-memory/ in the notes clone.
 function labelInputs(config) {
@@ -1600,11 +1592,11 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
     return { failed: true };
   }
   const data = JSON.parse(readFileSync(join(work, 'label-notes.json'), 'utf8'));
-  if (!Array.isArray(data?.notes) || !isObject(data.digests)) throw new Error('label-notes.json does not hold what label-read writes');
+  if (!Array.isArray(data?.notes) || !Array.isArray(data.scopes)) throw new Error('label-notes.json does not hold what label-read writes');
   const listed = data.notes.map((n) => ({
     path: n.path, scope: n.scope, digest: n.sha256, domain: n.domain, name: n.name, description: n.description, body: n.body, skip: n.skip,
   }));
-  const readNames = Object.keys(data.digests);
+  const readNames = data.scopes;
   for (const name of scopes) if (!readNames.includes(name)) say(`label: no folder for project ${name}; nothing labeled there.`);
   const runScopes = (scopes.length === 0 ? readNames : readNames.filter((name) => scopes.includes(name))).map(scopeFolder);
   const inRun = (n) => runScopes.includes(n.scope);
@@ -1612,10 +1604,10 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   const editable = listed.filter((n) => n.skip === null);
   const runNotes = editable.filter(inRun);
   const { touched } = selectTouched({ notes: runNotes, record, all: opts.all });
-  const sent = new Set(touched.map((n) => n.path));
+  const touchedPaths = new Set(touched.map((n) => n.path));
   // On a first run the labeled notes of every scope read are recorded as they are, except those
   // that --all sends to the model.
-  const confirmed = selectTouched({ notes: editable, record, all: false }).confirmed.filter((x) => !sent.has(x.path));
+  const confirmed = selectTouched({ notes: editable, record, all: false }).confirmed.filter((x) => !touchedPaths.has(x.path));
   const { exceptions, batches } = planLabelBatches({ notes: runNotes, touched, domains, batchNotes: label.batchNotes });
 
   const asked = await askLabelModel({
@@ -1626,10 +1618,7 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   // Interrupted: nothing is written, and every note stays as it is.
   if (asked.stop === 'interrupted' || (await signalsHandled())) return { failed: asked.failed };
   let failed = asked.failed;
-  const planned = new Map([
-    ...exceptions.map((e) => [e.path, { label: e.label, reason: null, exception: true }]),
-    ...[...asked.labels].map(([path, given]) => [path, { ...given, exception: false }]),
-  ]);
+  const planned = plannedLabels(exceptions, asked.labels);
   const results = [
     ...labelResults({ scopes: runScopes, notes: listed.filter(inRun), planned, left: asked.left, exceptions: domains.exceptions }),
     // A run over every scope also names the exceptions of folders it did not read: a typo there is never applied.
@@ -1679,7 +1668,7 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   const unchanged = [...held.map((e) => ({ path: e.path, digest: e.digest })), ...recorded(done.unchanged)];
   const kept = new Set([...(done.written ?? []), ...unchanged].map((x) => x.path));
   const readFolders = readNames.map(scopeFolder);
-  const elsewhere = readAll ? [] : Object.keys(record ?? {}).filter((path) => !readFolders.includes(notesFolderOf(path)));
+  const elsewhere = readAll ? [] : Object.keys(record ?? {}).filter((path) => !readFolders.includes(dirname(path)));
   state.labels = {
     version: 1,
     notes: nextLabelRecord(record, {

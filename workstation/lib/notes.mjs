@@ -9,7 +9,7 @@ export const NOTE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
 const STUB_RE = /^MOVED TO \[\[(?:(global):)?([A-Za-z0-9][A-Za-z0-9._-]{0,193})\]\]$/;
 const LINK_RE = /\]\(([^()\s]+)\)/g;
 
-function unquote(value) {
+export function unquote(value) {
   const v = value.trim();
   if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) return v.slice(1, -1);
   return v;

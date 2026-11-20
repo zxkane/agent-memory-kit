@@ -77,17 +77,23 @@ export function labelEntryProblem(entry) {
   return null;
 }
 
-// The SHA-256 of each regular note file of a folder (name to digest), sorted by name: the inputs of
-// folderDigest in consolidate.mjs.
-export function fileDigests(dir) {
-  return new Map([...noteFiles(dir)].map(([name, buf]) => [name, sha256(buf)]));
+// The SHA-256 of each file of `files` (a name to content map, as noteFiles returns it), by name.
+export function digestsOf(files) {
+  return new Map([...files].map(([name, buf]) => [name, sha256(buf)]));
 }
 
-// A folder's digest from its file digests, as folderDigest computes it from the folder: SHA-256 over
-// the `name:hash` lines, sorted by name.
+// The SHA-256 of each regular note file of a folder (name to digest), sorted by name.
+export function fileDigests(dir) {
+  return digestsOf(noteFiles(dir));
+}
+
+// A folder's digest from its file digests: SHA-256 over the `name:hash` lines, sorted by name.
 export function digestOfFiles(files) {
   return sha256([...files.keys()].sort().map((name) => `${name}:${files.get(name)}`).join('\n'));
 }
+
+// The digest of a folder's note files: the one the sync-side records are compared with.
+export const folderDigest = (dir) => digestOfFiles(fileDigests(dir));
 
 // A scope folder's digest after label-apply wrote into it: `before` (its file digests right before
 // the writes) with each written note going from the digest it was written over (`from`) to the one

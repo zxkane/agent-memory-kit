@@ -2362,7 +2362,7 @@ test('label-read lists the notes of every scope', (t) => {
     'projects/p/old.md': 'MOVED TO [[b]]\n',
     'projects/p/x.conflict-host.md': note('b', 'About b', 'Beta, as another machine wrote it.'),
   });
-  const { work, result, notes, digests } = labelRead(f);
+  const { work, result, notes, scopes } = labelRead(f);
   assert.equal(result.outcome, 'label-read');
   assert.equal(result.notes, 2);
   assert.equal(result.sync.ok, true);
@@ -2377,7 +2377,7 @@ test('label-read lists the notes of every scope', (t) => {
       name: 'b', description: 'About b', body: '\nBeta.\n', skip: null,
     },
   ]);
-  assert.deepEqual(digests, { global: folderDigest(join(f.repo, 'global')), p: folderDigest(join(f.repo, 'projects/p')) });
+  assert.deepEqual(scopes, ['global', 'p']);
   assert.equal(statSync(join(work, 'label-notes.json')).mode & 0o777, 0o600);
 });
 
@@ -2390,12 +2390,12 @@ test('label-read takes only the named scopes', (t) => {
   });
   // A session's note that is not committed yet: the step's sync commits it before the notes are read.
   write(f.repo, 'projects/p/d.md', note('d', 'D', 'Delta.'));
-  const { work, result, notes, digests } = labelRead(f, '--scope', 'p', '--scope', 'gone', '--scope', 'p');
+  const { work, result, notes, scopes } = labelRead(f, '--scope', 'p', '--scope', 'gone', '--scope', 'p');
   assert.equal(result.notes, 2);
   assert.equal(result.sync.committed, 1);
   assert.deepEqual(notes.map((n) => n.path), ['projects/p/b.md', 'projects/p/d.md']);
   // A named scope without a folder is left out.
-  assert.deepEqual(Object.keys(digests), ['p']);
+  assert.deepEqual(scopes, ['p']);
   // A work folder that is not empty, or a scope name no scope folder may have, is an error before anything is read.
   assert.equal(runLabelStep(f, 'label-read', '--work', work).result.outcome, 'error');
   for (const bad of [['--scope', '../p'], ['--scope', '.p'], ['--scope', 'a/b'], ['--scope'], ['--other', 'x']]) {

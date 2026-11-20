@@ -6,11 +6,11 @@
 // what the record keeps for it (the file's SHA-256 in the clone, the object's ETag in the bucket),
 // `domain` its label or null, `scope` its folder (`global`, `projects/<name>` or `agents/<agent>`).
 
+import { dirname } from 'node:path';
 import { LABELS, scopeDefault } from './domains.mjs';
 import { scanText } from './secret-scan.mjs';
 
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-const scopeOf = (path) => path.slice(0, path.lastIndexOf('/'));
 
 // What an error may print, never a response body: the first line of its message, or `failed`. An
 // AwsError or AgentScopeError message is one fixed line (an operation, a status and a code, or a
@@ -224,6 +224,15 @@ export async function askLabelModel({ batches, token, labelBatch, ceiling, now, 
   return { ...asked, line: stopLine(asked.stop, ceiling) };
 }
 
+// The labels a run gives, path -> { label, reason, exception }: the `exceptions` of the domains file
+// (planLabelBatches' list) and the labels the model gave (`labels`, path -> { label, reason }).
+export function plannedLabels(exceptions, labels) {
+  return new Map([
+    ...exceptions.map((e) => [e.path, { label: e.label, reason: null, exception: true }]),
+    ...[...labels].map(([path, given]) => [path, { ...given, exception: false }]),
+  ]);
+}
+
 // What a run did in each of its `scopes` (folder names, in order), for labelReport.
 // - `notes`: every present note of those scopes, with `skip` (why setDomain cannot label it) or null;
 // - `planned`: path -> { label, reason, exception }, the labels the run gives;
@@ -238,8 +247,8 @@ export function labelResults({ scopes, notes, planned, left, exceptions }) {
     const labels = [];
     for (const n of mine) {
       const p = planned.get(n.path);
-      const now = p ? p.label : n.domain;
-      counts[LABELS.includes(now) ? now : 'unlabeled'] += 1;
+      const after = p ? p.label : n.domain;
+      counts[LABELS.includes(after) ? after : 'unlabeled'] += 1;
       if (p && p.label !== n.domain) labels.push({ path: n.path, from: n.domain, to: p.label, reason: p.reason, exception: p.exception });
     }
     return {
@@ -248,7 +257,7 @@ export function labelResults({ scopes, notes, planned, left, exceptions }) {
       counts,
       left: mine.filter((n) => left.has(n.path)).map((n) => ({ path: n.path, why: left.get(n.path) })),
       repair: mine.filter((n) => n.skip).map((n) => ({ path: n.path, why: n.skip })),
-      unmatched: [...exceptions.keys()].filter((path) => scopeOf(path) === scope && !present.has(path)).sort(byName),
+      unmatched: [...exceptions.keys()].filter((path) => dirname(path) === scope && !present.has(path)).sort(byName),
     };
   });
 }
@@ -261,7 +270,7 @@ export function unreadScopeResults({ scopes, exceptions, own }) {
   const read = new Set(scopes);
   const unread = new Map();
   for (const path of [...exceptions.keys()].sort(byName)) {
-    const scope = scopeOf(path);
+    const scope = dirname(path);
     if (read.has(scope) || !own(scope)) continue;
     if (!unread.has(scope)) unread.set(scope, []);
     unread.get(scope).push(path);

@@ -22,7 +22,7 @@ import { LABELS, readDomain, setDomain } from './domains.mjs';
 import { labelBatch as modelBatch } from './label-client.mjs';
 import { isLabelNoteName, labelNoteOf } from './label-notes.mjs';
 import {
-  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, unreadScopeResults,
+  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, plannedLabels, selectTouched, unreadScopeResults,
 } from './label-run.mjs';
 
 const bytes = (text) => Buffer.byteLength(text, 'utf8');
@@ -99,9 +99,15 @@ async function getNote(s3, key) {
 // that it is not sent: its text after the frontmatter is over the API's limit, or with the longest
 // label its scope's search entries (`scopeEntries`) would be. Null when every label fits.
 function misfit(s, n, scopeEntries) {
-  const entry = noteEntry(s.agent, n.file, setDomain(n.text, LONGEST).text);
+  return refusal(scopeEntries, n.path, noteEntry(s.agent, n.file, setDomain(n.text, LONGEST).text));
+}
+
+// Why the memory API would refuse `entry` for note `path` among a scope's search entries
+// (`scopeEntries`): LEFT.content (its text is over the limit), LEFT.scope (the scope's entries
+// would be), or null when it fits.
+function refusal(scopeEntries, path, entry) {
   if (bytes(entry.body) > API_LIMITS.contentBytes) return LEFT.content;
-  return fits(new Map(scopeEntries).set(n.path, entry)) ? null : LEFT.scope;
+  return fits(new Map(scopeEntries).set(path, entry)) ? null : LEFT.scope;
 }
 
 // Writes the labels `planned` gives the notes of scope `s`, each only while it fits what the memory
@@ -111,12 +117,8 @@ function misfit(s, n, scopeEntries) {
 // listing. `entries`: the search entries as read before the writes. In a dry run, only what would be
 // written.
 async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
-  const out = { written: [], unchanged: [], left: new Map(), notWritten: 0, refreshed: 0, details: [], failed: false };
+  const out = { written: [], unchanged: [], left: new Map(), refreshed: 0, details: [], failed: false };
   const scopeEntries = scopeEntriesOf(entries, s.scope);
-  const skip = (path, why) => {
-    out.left.set(path, why);
-    out.notWritten += 1;
-  };
   let client = null;
   let broken = null;
   for (const n of s.editable) {
@@ -128,13 +130,9 @@ async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
     }
     const text = setDomain(n.text, p.label).text;
     const entry = noteEntry(s.agent, n.file, text);
-    if (bytes(entry.body) > API_LIMITS.contentBytes) {
-      skip(n.path, LEFT.content);
-      continue;
-    }
-    const next = new Map(scopeEntries).set(n.path, entry);
-    if (!fits(next)) {
-      skip(n.path, LEFT.scope);
+    const refused = refusal(scopeEntries, n.path, entry);
+    if (refused !== null) {
+      out.left.set(n.path, refused);
       continue;
     }
     if (dryRun) {
@@ -143,7 +141,7 @@ async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
       continue;
     }
     if (broken !== null) {
-      skip(n.path, LEFT.failed);
+      out.left.set(n.path, LEFT.failed);
       continue;
     }
     let put = null;
@@ -152,11 +150,11 @@ async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
       put = await client.put(n.path, text, { ifMatch: n.digest, contentType: MARKDOWN });
     } catch (err) {
       broken = errorText(err);
-      skip(n.path, LEFT.failed);
+      out.left.set(n.path, LEFT.failed);
       continue;
     }
     if (put.status !== 'ok') {
-      skip(n.path, LEFT.meanwhile);
+      out.left.set(n.path, LEFT.meanwhile);
       continue;
     }
     out.written.push({ path: n.path, file: n.file, text, etag: put.etag });
@@ -234,7 +232,7 @@ function headline(s, out, { dryRun, idle, took }) {
   if (idle) return `${scope}: nothing to do`;
   if (dryRun) return `${scope}: dry-run, ${written} label(s) to set or change`;
   if (!took) return `${scope}: nothing written`;
-  const notWritten = out.notWritten > 0 ? `, ${out.notWritten} not written` : '';
+  const notWritten = out.left.size > 0 ? `, ${out.left.size} not written` : '';
   return `${scope}: ${written > 0 ? 'applied' : 'no-change'}, ${written} label(s) written, ${out.unchanged.length} unchanged${notWritten}`;
 }
 
@@ -305,10 +303,7 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
   if (asked.stop === 'interrupted' || signal?.aborted) return { failed: asked.failed, lines };
   if (asked.sent > 0) lines.push(`label: ${asked.sent} note(s) sent to the model, USD ${asked.spent.toFixed(2)}, ${asked.requests} request(s)`);
   let failed = asked.failed;
-  const planned = new Map([
-    ...exceptions.map((e) => [e.path, { label: e.label, reason: null, exception: true }]),
-    ...[...asked.labels].map(([path, given]) => [path, { ...given, exception: false }]),
-  ]);
+  const planned = plannedLabels(exceptions, asked.labels);
 
   // The entries again, right before the writes that are checked against them: the model calls take a while.
   let entries;
