@@ -801,3 +801,49 @@ test('tool context: a project shared under this machine\'s identity is told so',
   assert.ok(lines.some((l) => l.startsWith('Project index')));
   assert.ok(!buildToolContext({ ...tool, project: null, reason: 'mismatch', localShare: 'local/alpha/x' }).includes('machine\'s identity'));
 });
+
+// Notes for the index-tag tests: a note file with a `metadata.domain` label.
+const noteWith = (dir, file, domain) => writeFileSync(join(dir, file), `---\nname: n\ndescription: d\nmetadata:\n  type: user\n  domain: ${domain}\n---\nbody\n`);
+
+test('the global index shows work and personal tags', (t) => {
+  const { repo, base, writeGlobal } = fixture(t);
+  noteWith(join(repo, 'global'), 'hook.md', 'work');
+  noteWith(join(repo, 'global'), 'misc.md', 'general');
+  noteWith(join(repo, 'global'), 'home.md', 'personal');
+  const index = '- [Hook](hook.md) — a hook\n- [Misc](misc.md) — a misc\n- [Home](home.md) — a home\n- [Gone](gone.md) — no note\n';
+  writeGlobal(index);
+  const out = buildSessionContext(base);
+  assert.ok(out.endsWith('Global index:\n- [Hook](hook.md) — [work] a hook\n- [Misc](misc.md) — a misc\n- [Home](home.md) — [personal] a home\n- [Gone](gone.md) — no note\n'));
+  assert.equal(readFileSync(join(repo, 'global', 'MEMORY.md'), 'utf8'), index);
+});
+
+test('the tool context tags both indexes', (t) => {
+  const { repo, tool, writeProject, writeGlobal } = toolFixture(t);
+  noteWith(join(repo, 'projects', 'p'), 'a.md', 'work');
+  noteWith(join(repo, 'global'), 'b.md', 'personal');
+  noteWith(join(repo, 'global'), 'a.md', 'general');
+  writeProject('- [A](a.md) — alpha\n');
+  writeGlobal('- [B](b.md) — beta\n- [A](a.md) — gamma\n');
+  const lines = buildToolContext(tool).split('\n');
+  assert.ok(lines.includes('- [A](a.md) — [work] alpha'));
+  assert.ok(lines.includes('- [B](b.md) — [personal] beta'));
+  assert.ok(lines.includes('- [A](a.md) — gamma'));
+});
+
+test('the cap still cuts tagged lines', (t) => {
+  const { repo, base, writeGlobal } = fixture(t);
+  const count = 200;
+  const lines = [];
+  for (let i = 0; i < count; i++) {
+    noteWith(join(repo, 'global'), `n${i}.md`, 'work');
+    lines.push(`- [N${i}](n${i}.md) — ${'x'.repeat(60)}`);
+  }
+  writeGlobal(`${lines.join('\n')}\n`);
+  const cap = 4000;
+  const out = buildSessionContext({ ...base, cap });
+  assert.ok(out.length <= cap);
+  assert.ok(out.endsWith(`[truncated; full index: ${repo}/global/MEMORY.md]\n`));
+  const kept = out.split('\n').filter((l) => l.startsWith('- ['));
+  assert.ok(kept.length > 0 && kept.length < count);
+  assert.ok(kept.every((l) => l.includes(' — [work] x')));
+});
