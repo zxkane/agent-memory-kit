@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseDomains } from '../lib/domains.mjs';
 import {
-  FAILURES_IN_A_ROW, TOKEN_MAX_AGE_MS, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, sendBatches,
+  FAILURES_IN_A_ROW, TOKEN_MAX_AGE_MS, askLabelModel, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched,
+  sendBatches, stopLine,
 } from '../lib/label-run.mjs';
 
 const hex = (c) => c.repeat(64);
@@ -138,15 +139,17 @@ test('nextLabelRecord drops the entries of notes the run took but did not label'
 const batchesOf = (...scopes) => scopes.map((scope) => ({ scope, notes: [{ ...note(`${scope}/n.md`), id: 'n001', default: 'general' }] }));
 const leftOf = (out) => Object.fromEntries(out.left);
 
-// A stand-in for the caller's labelBatch call: the calls whose number (from 1) is in `fails` fail,
-// the others label every note `work`; each costs `cost` and moves `clock` on by `step` ms.
-function fakeModel({ fails = [], cost = 0.25, clock = null, step = 0, onCall = () => {} } = {}) {
+// A stand-in for the caller's labelBatch call: the calls whose number (from 1) is in `fails` fail
+// as an endpoint out of reach does, those in `refused` as an answer that fails does; the others
+// label every note `work`. Each costs `cost` and moves `clock` on by `step` ms.
+function fakeModel({ fails = [], refused = [], cost = 0.25, clock = null, step = 0, onCall = () => {} } = {}) {
   const calls = [];
   const labelBatch = async (notes) => {
     calls.push(notes.map((n) => n.path));
     if (clock) clock.ms += step;
     onCall(calls.length);
-    if (fails.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 500', costUsd: 0, requests: 1 };
+    if (fails.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 500', transport: true, costUsd: 0, requests: 1 };
+    if (refused.includes(calls.length)) return { ok: false, error: 'model refused', transport: false, costUsd: 0.01, requests: 1 };
     return { ok: true, labels: new Map(notes.map((n) => [n.id, { label: 'work', reason: `reason for ${n.path}` }])), costUsd: cost, requests: 1 };
   };
   return { labelBatch, calls };
@@ -182,9 +185,67 @@ test('sendBatches stops after two failed batches in a row', async () => {
   assert.deepEqual(leftOf(out), {
     'projects/p/n.md': 'the model call failed (Mantle Responses HTTP 500)',
     'projects/q/n.md': 'the model call failed (Mantle Responses HTTP 500)',
-    'projects/r/n.md': 'not sent; two batches in a row failed',
-    'projects/s/n.md': 'not sent; two batches in a row failed',
+    'projects/r/n.md': 'not sent; 2 batches in a row failed',
+    'projects/s/n.md': 'not sent; 2 batches in a row failed',
   });
+});
+
+test('sendBatches counts only the failures that did not reach the model toward the stop', async () => {
+  // Answers that fail (a refusal, an incomplete answer, a 400) say nothing about the endpoint:
+  // batches are sent in a fixed order, and two such batches side by side must not stop every run.
+  const refused = fakeModel({ refused: [1, 2, 3] });
+  const out = await run(batchesOf('global', 'projects/p', 'projects/q', 'projects/r'), refused);
+  assert.equal(refused.calls.length, 4);
+  assert.equal(out.stop, null);
+  assert.equal(out.failed, true);
+  assert.deepEqual(leftOf(out), {
+    'global/n.md': 'the model call failed (model refused)',
+    'projects/p/n.md': 'the model call failed (model refused)',
+    'projects/q/n.md': 'the model call failed (model refused)',
+  });
+  assert.deepEqual([...out.labels.keys()], ['projects/r/n.md']);
+  // An answer, even one that fails, ends a row of failures that did not reach the model.
+  const between = fakeModel({ fails: [1, 3], refused: [2] });
+  assert.equal((await run(batchesOf('global', 'projects/p', 'projects/q', 'projects/r'), between)).stop, null);
+  assert.equal(between.calls.length, 4);
+  // Two in a row stop it, after a refused batch too.
+  const unreachable = fakeModel({ refused: [1], fails: [2, 3] });
+  assert.equal((await run(batchesOf('global', 'projects/p', 'projects/q', 'projects/r'), unreachable)).stop, 'failures');
+  assert.equal(unreachable.calls.length, 3);
+});
+
+test('askLabelModel makes the run\'s one token only for a batch, and says why it stopped', async () => {
+  const made = [];
+  const token = async () => { made.push(1); return { token: 'example-label-token', tokenAt: 0 }; };
+  const seen = [];
+  const labelBatch = async (notes, tok) => { seen.push(tok); return { ok: true, labels: new Map(notes.map((n) => [n.id, { label: 'work', reason: 'r' }])), costUsd: 0.6, requests: 1 }; };
+  const ask = (batches, extra = {}) => askLabelModel({ batches, token, labelBatch, ceiling: 1, now: () => 0, ...extra });
+  // No batch, no token.
+  assert.deepEqual(await ask([]), { labels: new Map(), left: new Map(), stop: null, failed: false, spent: 0, requests: 0, sent: 0, line: null });
+  assert.equal(made.length, 0);
+  // One token for every batch of the run; the second batch reaches the ceiling.
+  const out = await ask(batchesOf('global', 'projects/p', 'projects/q'));
+  assert.equal(made.length, 1);
+  assert.deepEqual(seen, ['example-label-token', 'example-label-token']);
+  assert.equal(out.stop, 'ceiling');
+  assert.equal(out.line, 'label: stopped; the model cost of this run reached its ceiling of USD 1.00');
+  // The token's age counts from when the token says it was issued, not from when the run took it.
+  const old = await ask(batchesOf('global'), { now: () => TOKEN_MAX_AGE_MS });
+  assert.equal(old.stop, 'token-age');
+  assert.equal(old.sent, 0);
+  assert.equal(old.line, 'label: stopped; the label token of this run is near the end of its hour');
+  // A token that cannot be made leaves every note of every batch, and fails the pass.
+  const broken = await askLabelModel({
+    batches: batchesOf('global', 'projects/p'), token: async () => { throw new Error('the label token file is not a token\nmore'); },
+    labelBatch, ceiling: 1, now: () => 0,
+  });
+  assert.equal(broken.failed, true);
+  assert.equal(broken.line, 'label: the label token could not be made (the label token file is not a token); no note was sent to the model.');
+  assert.deepEqual(leftOf(broken), { 'global/n.md': 'not sent; the label token could not be made', 'projects/p/n.md': 'not sent; the label token could not be made' });
+  // The stop lines, the same for every pass.
+  assert.equal(stopLine('failures', 1), `label: stopped; ${FAILURES_IN_A_ROW} batches in a row failed`);
+  assert.equal(stopLine('interrupted', 1), null);
+  assert.equal(stopLine(null, 1), null);
 });
 
 test('sendBatches stops at the cost ceiling, which is not a failure', async () => {

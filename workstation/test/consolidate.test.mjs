@@ -2996,7 +2996,7 @@ test('two failed batches in a row stop the pass', (t) => {
   f.mantle({ labels: { 'global/g.md': 'work' }, fail: { status: 500, times: 6, after: 1 } });
   const r = f.label();
   assert.equal(r.status, 1);
-  assert.match(r.stdout, /^label: stopped; two batches in a row failed$/m);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
   // The fourth batch is never sent.
   assert.deepEqual(f.requests().map((q) => q.paths),
     [['global/g.md'], ...Array(3).fill(['projects/p/a.md']), ...Array(3).fill(['projects/q/b.md'])]);
@@ -3007,7 +3007,7 @@ test('two failed batches in a row stop the pass', (t) => {
   const report = f.labelReport();
   assert.match(report, /^- projects\/p\/a\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
   assert.match(report, /^- projects\/q\/b\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
-  assert.match(report, /^- projects\/r\/c\.md: not sent; two batches in a row failed$/m);
+  assert.match(report, /^- projects\/r\/c\.md: not sent; 2 batches in a row failed$/m);
   assert.doesNotMatch(r.stdout + r.stderr + report, /FAKE-MANTLE-BODY/);
 });
 
@@ -3161,4 +3161,24 @@ test('label: usage errors, and a named project without a folder', (t) => {
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.equal(r.stdout, 'label: no folder for project gone; nothing labeled there.\nlabel: nothing to do\n');
   assert.deepEqual(f.requests(), []);
+});
+
+test('failed answers do not stop the pass', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'),
+    'projects/q/b.md': note('b', 'B', 'Beta.'), 'projects/r/c.md': note('c', 'C', 'Gamma.'),
+  });
+  // The first two batches get an answer that is a failure (HTTP 400, not retried): the endpoint
+  // is in reach, so the batches after them are still sent.
+  f.mantle({ labels: { 'projects/q/b.md': 'work', 'projects/r/c.md': 'personal' }, fail: { status: 400, times: 2 } });
+  const r = f.label();
+  assert.equal(r.status, 1);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md'], ['projects/p/a.md'], ['projects/q/b.md'], ['projects/r/c.md']]);
+  assert.equal(liveText(f, 'projects/q/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
+  assert.equal(liveText(f, 'projects/r/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/q/b.md', 'projects/r/c.md']);
+  assert.match(r.stdout, /^- global\/g\.md: the model call failed \(Mantle Responses HTTP 400\)$/m);
+  assert.doesNotMatch(r.stdout + r.stderr, /FAKE-MANTLE-BODY/);
 });

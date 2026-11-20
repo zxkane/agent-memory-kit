@@ -116,8 +116,14 @@ function readResponse(data) {
   return { ok: true, text, usage };
 }
 
+// The HTTP statuses that mean the request did not reach the model: busy, failing, or not taking
+// the token. Every later request would most likely fail the same way.
+const OUT_OF_REACH = (status) => status === 429 || status >= 500 || status === 401 || status === 403;
+
 // One Responses request, with up to ATTEMPTS attempts for 429, 5xx and network errors (a timeout
-// of one attempt is a network error). An abort of the caller's signal stops it at once.
+// of one attempt is a network error). An abort of the caller's signal stops it at once. A failure
+// has `transport` true when the request did not reach the model (a network error or a timeout, or
+// HTTP 429, 5xx, 401 or 403), false when the endpoint answered.
 export async function requestLabels({ prompt, label, token, fetchImpl = fetch, signal, sleep = defaultSleep }) {
   const started = Date.now();
   const done = (result) => ({ ...result, ms: Date.now() - started });
@@ -129,7 +135,7 @@ export async function requestLabels({ prompt, label, token, fetchImpl = fetch, s
     if (attempt > 0) {
       await sleep(BACKOFF_MS[attempt - 1] * (0.8 + Math.random() * 0.4));
     }
-    if (signal?.aborted) return done({ ok: false, error: 'request aborted' });
+    if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false });
     const limit = AbortSignal.timeout(ATTEMPT_TIMEOUT_MS);
     try {
       const res = await fetchImpl(`${label.endpoint}/responses`, {
@@ -146,23 +152,25 @@ export async function requestLabels({ prompt, label, token, fetchImpl = fetch, s
       }
       if (res.status < 200 || res.status >= 300) {
         await res.body?.cancel().catch(() => {});
-        return done({ ok: false, error: `Mantle Responses HTTP ${res.status}` });
+        return done({ ok: false, error: `Mantle Responses HTTP ${res.status}`, transport: OUT_OF_REACH(res.status) });
       }
       let data;
       try {
         data = JSON.parse(await readAnswer(res));
       } catch (err) {
-        if (err instanceof Failure) return done({ ok: false, error: err.message });
-        if (err instanceof SyntaxError) return done({ ok: false, error: 'Mantle Responses answer is not JSON' });
+        if (err instanceof Failure) return done({ ok: false, error: err.message, transport: false });
+        if (err instanceof SyntaxError) return done({ ok: false, error: 'Mantle Responses answer is not JSON', transport: false });
         throw err;
       }
-      return done(readResponse(data));
+      const read = readResponse(data);
+      return done(read.ok ? read : { ...read, transport: false });
     } catch (err) {
-      if (signal?.aborted) return done({ ok: false, error: 'request aborted' });
+      if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false });
       error = 'Mantle Responses request failed';
     }
   }
-  return done({ ok: false, error });
+  // Every attempt got 429 or 5xx, or no answer.
+  return done({ ok: false, error, transport: true });
 }
 
 export function costOf(usage, label) {
@@ -170,13 +178,16 @@ export function costOf(usage, label) {
 }
 
 // Labels a batch of notes. An answer that fails parseLabelAnswer is asked once more; an HTTP or
-// network failure (after its own retries) ends the batch.
+// network failure (after its own retries) ends the batch. A failed batch has `transport` true when
+// its request did not reach the model (see requestLabels); a refusal, an incomplete answer, two
+// answers that fail the check and any other 4xx are answers, with `transport` false.
 export async function labelBatch({ notes, persona, label, token, fetchImpl, signal, sleep }) {
   const prompt = labelPrompt({ notes, persona });
   const ids = notes.map((n) => n.id);
   const usage = { input: 0, output: 0 };
   let requests = 0;
   let error = 'no answer';
+  let transport = false;
   for (let round = 0; round < 2; round += 1) {
     requests += 1;
     const res = await requestLabels({ prompt, label, token, fetchImpl, signal, sleep });
@@ -186,6 +197,7 @@ export async function labelBatch({ notes, persona, label, token, fetchImpl, sign
     }
     if (!res.ok) {
       error = res.error;
+      transport = res.transport === true;
       break;
     }
     try {
@@ -195,12 +207,13 @@ export async function labelBatch({ notes, persona, label, token, fetchImpl, sign
       error = err.message;
     }
   }
-  return { ok: false, usage, costUsd: costOf(usage, label), requests, error };
+  return { ok: false, usage, costUsd: costOf(usage, label), requests, error, transport };
 }
 
 const BAD_TOKEN_FILE = 'the label token file is not a token';
 
-// The token of a file: a regular file of at most 16 KiB, never a link.
+// The token of a file, a regular file of at most 16 KiB and never a link, with the file's
+// modification time (ms) from the same open file.
 function readTokenFile(path) {
   let fd;
   try {
@@ -220,7 +233,7 @@ function readTokenFile(path) {
     }
     const token = buf.subarray(0, off).toString('utf8').trim();
     if (!TOKEN_RE.test(token)) throw new Error(BAD_TOKEN_FILE);
-    return token;
+    return { token, mtimeMs: st.mtimeMs };
   } finally {
     closeSync(fd);
   }
@@ -231,7 +244,7 @@ function readTokenFile(path) {
 // block names one). The role session lasts as long as the token, which stops working with the
 // credentials that signed it.
 export async function labelToken(label, { now = () => new Date(), env = process.env, fetchImpl } = {}) {
-  if (label.tokenFile) return readTokenFile(label.tokenFile);
+  if (label.tokenFile) return readTokenFile(label.tokenFile).token;
   let credentials;
   if (label.credentials === 'environment') credentials = environmentCredentials(env);
   else if (label.credentials === 'instance') credentials = await imdsCredentials({ fetchImpl });
@@ -243,4 +256,16 @@ export async function labelToken(label, { now = () => new Date(), env = process.
     });
   }
   return bedrockToken({ region: label.region, credentials, now: now(), expiresInSeconds: TOKEN_LIFETIME_SECONDS });
+}
+
+// The token of a run and the moment its age counts from (ms since the epoch), for the stop before
+// a token gets too old: a token file's modification time, as the job that issues the token writes
+// the file at once (it may be long before this run starts), or the moment the token is signed.
+export async function tokenForRun(label, { now = () => new Date(), env = process.env, fetchImpl } = {}) {
+  if (label.tokenFile) {
+    const { token, mtimeMs } = readTokenFile(label.tokenFile);
+    return { token, tokenAt: mtimeMs };
+  }
+  const signedAt = now();
+  return { token: await labelToken(label, { now: () => signedAt, env, fetchImpl }), tokenAt: signedAt.getTime() };
 }

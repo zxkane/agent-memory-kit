@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { chmodSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  CUT_MARKER, NOTE_TEXT_CAP, costOf, labelBatch, labelPrompt, labelToken, noteBlock, parseLabelAnswer, requestLabels,
+  CUT_MARKER, NOTE_TEXT_CAP, costOf, labelBatch, labelPrompt, labelToken, noteBlock, parseLabelAnswer, requestLabels, tokenForRun,
 } from '../lib/label-client.mjs';
 import { tempDir } from './helpers.mjs';
 
@@ -333,4 +333,41 @@ test('parseLabelAnswer keeps model text out of errors and reasons', () => {
   assert.equal(got.isWellFormed(), true);
   const cut = parseLabelAnswer(JSON.stringify({ labels: [{ id: 'n001', label: 'work', reason: `${'a'.repeat(299)}\u{1F600}` }] }), ['n001']);
   assert.equal(cut.get('n001').reason, 'a'.repeat(299));
+});
+
+test('labelBatch marks the failures that did not reach the model', async () => {
+  const batch = (fetchImpl) => labelBatch({ notes: [note('n001')], persona: 'p', label: LABEL, token: 't', fetchImpl, sleep: noSleep });
+  const status = (code) => async () => new Response('x', { status: code });
+  const refusal = { status: 'completed', output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'no' }] }] };
+  // Out of reach: a network error or a timeout, 429 and 5xx after their retries, and a token the endpoint does not take.
+  for (const [what, fetchImpl] of [
+    ['network', async () => { throw new TypeError('connect failed'); }],
+    ['429', status(429)], ['500', status(500)], ['503', status(503)], ['401', status(401)], ['403', status(403)],
+  ]) {
+    const out = await batch(fetchImpl);
+    assert.deepEqual({ ok: out.ok, transport: out.transport }, { ok: false, transport: true }, what);
+  }
+  // Answered: a refusal, an incomplete answer, an answer that fails the check twice, any other 4xx.
+  for (const [what, fetchImpl] of [
+    ['refusal', async () => json(refusal)], ['incomplete', async () => json(answer('x', {}, { status: 'incomplete' }))],
+    ['bad answer', async () => json(answer('nonsense'))], ['400', status(400)], ['404', status(404)], ['413', status(413)],
+  ]) {
+    const out = await batch(fetchImpl);
+    assert.deepEqual({ ok: out.ok, transport: out.transport }, { ok: false, transport: false }, what);
+  }
+});
+
+test('tokenForRun says when the age of the run\'s token starts', async (t) => {
+  // A token file is written when its token is issued: its age counts from the file's modification time.
+  const dir = tempDir(t);
+  const file = join(dir, 'token');
+  writeFileSync(file, 'tok\n');
+  const issued = new Date('2026-11-22T03:50:00Z');
+  utimesSync(file, issued, issued);
+  assert.deepEqual(await tokenForRun({ ...LABEL, tokenFile: file }, { now: NOW }), { token: 'tok', tokenAt: issued.getTime() });
+  // A token signed for the run counts from its signing.
+  const signed = await tokenForRun({ ...LABEL, credentials: 'environment' }, { now: NOW, env: ENV });
+  assert.equal(signed.tokenAt, NOW().getTime());
+  assert.equal(signed.token, await labelToken({ ...LABEL, credentials: 'environment' }, { now: NOW, env: ENV }));
+  await assert.rejects(tokenForRun({ ...LABEL, tokenFile: join(dir, 'missing') }, { now: NOW }), { message: 'the label token file cannot be read' });
 });
