@@ -8,10 +8,11 @@
 
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { HOST_RE } from './config.mjs';
 import { LABELS } from './domains.mjs';
 import { collectScopeNotes, labelRecordOf } from './label-notes.mjs';
-import { selectTouched } from './label-run.mjs';
-import { REPORT_NAME_RE, REPORT_SCHEMA_VERSION, parseReport, shown, usd } from './reports.mjs';
+import { LABEL_STOPS, LEFT_WORDS, selectTouched } from './label-run.mjs';
+import { CHANGE_KINDS, REPORT_NAME_RE, REPORT_SCHEMA_VERSION, parseReport, shown, usd } from './reports.mjs';
 import { readRunLog } from './run-log.mjs';
 import {
   GLOBAL, cloneProblem, listProjects, liveFolder, lstatOrNull, neverOrganized, organizeDue, scopeFolder, scopeInfo,
@@ -20,6 +21,12 @@ import { readRegular } from './workdir.mjs';
 
 const DAY_MS = 24 * 3600 * 1000;
 const MAX_REPORT_BYTES = 1024 * 1024;
+// The most report files of a window that are read.
+const MAX_REPORT_FILES = 5000;
+// The most problems named for the fields of one twin.
+const MAX_FIELD_PROBLEMS = 10;
+// A stop reason of the model client, as the apply step takes it.
+const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const MAX_DAYS = 365;
 const DATE_RE = /^\d{4}-\d\d-\d\d$/;
 const KINDS = ['extract', 'organize', 'label'];
@@ -86,6 +93,123 @@ function readState(stateDir, problems) {
   return { projects, labels: labelRecordOf(raw) };
 }
 
+// ---- The fields of a twin ----
+
+// What a value of a twin may be. `test` for one value (`word`: a word of a list), `fields` for an
+// object of which only those keys are read, `list` for a list of values of one rule (one that is not
+// is left out), `counts` for an object of word keys and counts; `nullable`, and `optional` for a key
+// that may be absent.
+const is = (test) => ({ test });
+const INT = is((v) => Number.isSafeInteger(v) && v >= 0);
+const NUM = is((v) => Number.isFinite(v) && v >= 0);
+const STR = is((v) => typeof v === 'string');
+const BOOL = is((v) => typeof v === 'boolean');
+const DAY = is((v) => typeof v === 'string' && isDay(v));
+const TIME = is((v) => typeof v === 'string' && Number.isFinite(Date.parse(v)));
+const HOST = is((v) => typeof v === 'string' && HOST_RE.test(v));
+const STOP = is((v) => typeof v === 'string' && STOP_RE.test(v));
+const oneOf = (words) => ({ test: (v) => words.includes(v), word: true });
+const orNull = (rule) => ({ ...rule, nullable: true });
+const maybe = (rule) => ({ ...rule, optional: true });
+const SIZES = { fields: { lines: INT, bytes: INT } };
+
+const SCOPE_TWIN = {
+  fields: {
+    schemaVersion: INT, host: HOST, kind: oneOf(['extract', 'organize']), scope: STR, date: DAY, endedAt: TIME, model: STR, stopReason: STOP,
+    costUsd: orNull(NUM), turns: orNull(INT), denials: orNull(INT), repaired: INT,
+    conversation: orNull({ fields: { truncated: BOOL, bytes: orNull(INT), sessionsLeftOut: INT } }),
+    folders: {
+      list: {
+        fields: {
+          folder: STR, changed: BOOL, indexBefore: SIZES, indexAfter: SIZES, unlistedBefore: INT, unlistedAfter: INT,
+          notesBytesBefore: INT, notesBytesAfter: INT, retiredBytes: INT,
+        },
+      },
+    },
+    retention: { fields: { termsKept: INT, termsBefore: INT, share: NUM } },
+    counts: { fields: { added: INT, changed: INT, retired: INT, notApplied: INT } },
+    changes: {
+      list: {
+        fields: {
+          kind: oneOf(CHANGE_KINDS), path: orNull(STR), folder: maybe(STR), withheld: maybe(BOOL),
+          target: maybe(orNull(STR)), targetFolder: maybe(STR), targetWithheld: maybe(BOOL),
+        },
+      },
+    },
+  },
+};
+
+const LABEL_TWIN = {
+  fields: {
+    schemaVersion: INT, host: HOST, kind: oneOf(['label']), date: DAY, endedAt: TIME, model: orNull(STR), stopReason: orNull(oneOf(LABEL_STOPS)),
+    costUsd: orNull(NUM), turns: orNull(INT), denials: orNull(INT), repaired: orNull(INT), requests: orNull(INT), sent: orNull(INT),
+    notes: { fields: { touched: orNull(INT), exceptions: orNull(INT), recordedAsTheyWere: orNull(INT) } },
+    written: INT, unchanged: INT, notWritten: INT,
+    scopes: {
+      list: {
+        fields: {
+          scope: STR, set: orNull(INT), changed: orNull(INT), unchanged: INT, left: INT, leftReasons: { counts: LEFT_WORDS },
+          needsRepair: orNull(INT), unmatchedExceptions: orNull(INT),
+          labelsAfter: orNull({ fields: { work: INT, personal: INT, general: INT, unlabeled: INT } }),
+        },
+      },
+    },
+  },
+};
+
+// `value` as `rule` takes it: only the keys a rule names, each of its type or null (a list's entry
+// that is not is left out). `problem(name, what)` is told of each field that is not; its name is
+// the rule's, never a text of the file.
+function clean(value, rule, name, problem) {
+  if (value === null && rule.nullable) return null;
+  const wrong = (what = 'has the wrong type') => {
+    problem(name, what);
+    return null;
+  };
+  if (rule.test) return rule.test(value) ? value : wrong(rule.word ? 'is not a known word' : undefined);
+  if (rule.list) {
+    if (!Array.isArray(value)) return wrong();
+    return value.map((item, i) => clean(item, rule.list, `${name}[${i}]`, problem)).filter((item) => item !== null);
+  }
+  if (!isObject(value)) return wrong();
+  const out = {};
+  if (rule.counts) {
+    for (const [key, n] of Object.entries(value)) {
+      if (!rule.counts.includes(key)) problem(name, 'holds a word that is not known');
+      else if (!INT.test(n)) problem(`${name}.${key}`, 'has the wrong type');
+      else out[key] = n;
+    }
+    return out;
+  }
+  for (const [key, r] of Object.entries(rule.fields)) {
+    const at = name === '' ? key : `${name}.${key}`;
+    if (Object.hasOwn(value, key)) out[key] = clean(value[key], r, at, problem);
+    else if (!r.optional) {
+      problem(at, 'has the wrong type');
+      out[key] = null;
+    }
+  }
+  return out;
+}
+
+// A twin as the report gives it: its known fields, cleaned, with each problem named once (at most
+// MAX_FIELD_PROBLEMS); null when it is not a twin of schemaVersion 1 at all.
+function twinOf(data, file, problems) {
+  if (!isObject(data) || data.schemaVersion !== REPORT_SCHEMA_VERSION || !KINDS.includes(data.kind)) {
+    problems.push({ file, problem: 'not a report of schemaVersion 1' });
+    return null;
+  }
+  const seen = new Set();
+  const problem = (name, what) => {
+    const text = `${name} ${what}`;
+    if (seen.has(text)) return;
+    seen.add(text);
+    if (seen.size <= MAX_FIELD_PROBLEMS) problems.push({ file, problem: text });
+    else if (seen.size === MAX_FIELD_PROBLEMS + 1) problems.push({ file, problem: 'more fields have the wrong type' });
+  };
+  return clean(data, data.kind === 'label' ? LABEL_TWIN : SCOPE_TWIN, '', problem);
+}
+
 // The reports of the window: each `.json` twin, and each `.md` report without one, which
 // parseReport reads (`source: 'markdown'`), by the end of their run (or their day), then by name. A
 // twin is in the window when its run ended in it (`endedAt` in [since, until), as a run line); a
@@ -111,6 +235,7 @@ function readReports(repoDir, window, problems) {
   }
   const twins = new Set(names.filter((n) => n.endsWith('.json')));
   const reports = [];
+  let read = 0;
   for (const name of names) {
     const m = REPORT_NAME_RE.exec(name);
     // A twin is named by the day its run ended: only those of the window's days can be in it.
@@ -119,6 +244,16 @@ function readReports(repoDir, window, problems) {
     if (m[2] === 'md' && twins.has(`${base}.json`)) continue;
     // The name of a file in the clone may hold anything; one that looks like a credential is withheld.
     const file = `_reports/${shown(name)}`;
+    if (read === MAX_REPORT_FILES) {
+      problems.push({ file: '_reports', problem: `more than ${MAX_REPORT_FILES} reports in the window; the rest were not read` });
+      break;
+    }
+    read += 1;
+    const st = lstatOrNull(join(dir, name));
+    if (st?.isFile() && st.size > MAX_REPORT_BYTES) {
+      problems.push({ file, problem: 'too large' });
+      continue;
+    }
     let buf = null;
     try {
       buf = readRegular(join(dir, name), null, { maxBytes: MAX_REPORT_BYTES });
@@ -138,23 +273,21 @@ function readReports(repoDir, window, problems) {
         continue;
       }
     } else {
+      let parsed;
       try {
-        data = JSON.parse(text);
+        parsed = JSON.parse(text);
       } catch {
         problems.push({ file, problem: 'not valid JSON' });
         continue;
       }
-      if (!isObject(data) || data.schemaVersion !== REPORT_SCHEMA_VERSION || !KINDS.includes(data.kind)
-        || typeof data.host !== 'string' || typeof data.date !== 'string') {
-        problems.push({ file, problem: 'not a report of schemaVersion 1' });
-        continue;
-      }
+      data = twinOf(parsed, file, problems);
+      if (data === null) continue;
     }
     const source = m[2] === 'md' ? 'markdown' : 'json';
     const ended = typeof data.endedAt === 'string' ? Date.parse(data.endedAt) : NaN;
-    if (source === 'json' && !Number.isFinite(ended)) problems.push({ file, problem: 'endedAt has the wrong type' });
+    // A twin without a time of its own counts by its day, as a report from its Markdown.
     const inWindow = Number.isFinite(ended) ? ended >= since && ended < until : m[1] < last;
-    if (inWindow) reports.push(Object.assign({ file, source }, data, { file, source }));
+    if (inWindow) reports.push({ file, source, ...data });
   }
   const key = (r) => (typeof r.endedAt === 'string' ? r.endedAt : String(r.date));
   return reports.sort((a, b) => byName(key(a), key(b)) || byName(a.file, b.file));
@@ -274,7 +407,7 @@ export function consolidationReport({ config, now, since }) {
 
 // What the summary shows of a value read from a file: text without control characters, a number,
 // or `?` for a figure that is missing or not a number.
-const plain = (v) => String(v).replace(/[\u0000-\u001f\u007f-\u009f]/g, '?');
+const plain = (v) => (v === null || v === undefined ? '?' : String(v).replace(/[\u0000-\u001f\u007f-\u009f]/g, '?'));
 const num = (v) => (Number.isFinite(v) ? v : '?');
 const money = (v) => usd(Number.isFinite(v) ? v : null);
 const minute = (iso) => plain(`${iso.slice(0, 10)} ${iso.slice(11, 16)}`);

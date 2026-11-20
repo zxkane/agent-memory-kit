@@ -93,6 +93,13 @@ const NOT_WRITTEN = {
   'no frontmatter': 'frontmatter', 'frontmatter not closed': 'frontmatter', 'metadata is not a block': 'frontmatter',
 };
 
+// Every word leftCategory gives.
+export const LEFT_WORDS = Object.freeze([
+  ...Object.keys(NOT_SENT), 'token-not-made', 'model-call-failed', ...new Set(Object.values(NOT_WRITTEN)), 'other',
+]);
+// Why a pass stopped before its last batch, in its report: `completed` when it did not.
+export const LABEL_STOPS = Object.freeze(['completed', ...Object.keys(NOT_SENT).filter((stop) => stop !== 'interrupted')]);
+
 // Why a note was left for the next run or not written, as one fixed word for the JSON report: a
 // stop of sendBatches (`interrupted`, `failures`, `ceiling`, `token-age`), `token-not-made`,
 // `model-call-failed`, a reason of label-apply or of the frontmatter, or `other`. Never the text of

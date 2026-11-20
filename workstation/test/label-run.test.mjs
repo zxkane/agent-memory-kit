@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseDomains } from '../lib/domains.mjs';
 import {
-  FAILURES_IN_A_ROW, TOKEN_MAX_AGE_MS, askLabelModel, labelReport, labelResults, leftCategory, nextLabelRecord, planLabelBatches,
-  selectTouched, sendBatches, stopLine, unreadScopeResults,
+  FAILURES_IN_A_ROW, LABEL_STOPS, LEFT_WORDS, TOKEN_MAX_AGE_MS, askLabelModel, labelReport, labelResults, leftCategory, nextLabelRecord,
+  planLabelBatches, selectTouched, sendBatches, stopLine, unreadScopeResults,
 } from '../lib/label-run.mjs';
 
 const hex = (c) => c.repeat(64);
@@ -560,4 +560,10 @@ test('leftCategory names why a note was left with a fixed word, never with the t
   const skips = ['gone', 'changed since it was read', 'not UTF-8 text', 'no frontmatter', 'frontmatter not closed', 'metadata is not a block'];
   assert.deepEqual(skips.map(leftCategory), ['gone', 'changed-since-read', 'not-utf8', 'frontmatter', 'frontmatter', 'frontmatter']);
   assert.equal(leftCategory('anything else (with a detail)'), 'other');
+  // The lists the report checks a twin's words against.
+  assert.deepEqual(LEFT_WORDS, [
+    'interrupted', 'failures', 'ceiling', 'token-age', 'token-not-made', 'model-call-failed', 'gone', 'changed-since-read', 'not-utf8',
+    'frontmatter', 'other',
+  ]);
+  assert.deepEqual(LABEL_STOPS, ['completed', 'failures', 'ceiling', 'token-age']);
 });

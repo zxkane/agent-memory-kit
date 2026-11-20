@@ -12,6 +12,8 @@ import { scanText } from './secret-scan.mjs';
 
 // The version of the JSON reports' form. It changes only with a change that breaks a reader.
 export const REPORT_SCHEMA_VERSION = 1;
+// The kinds of a twin's changes.
+export const CHANGE_KINDS = Object.freeze(['add', 'change', 'retire']);
 // The file of a report: its date, the rest of its name, and `.md` or `.json`.
 export const REPORT_NAME_RE = /^(\d{4}-\d\d-\d\d)-.+\.(md|json)$/;
 
@@ -131,7 +133,7 @@ export function reportData({ config, kind, scope, date, endedAt, model, stopReas
     const text = display(label, file);
     return shown(text) === text ? { path: `${folderOf(scope, label)}/${file}` } : { path: null, folder: folderOf(scope, label), withheld: true };
   };
-  const changes = ['add', 'change', 'retire'].flatMap((k) => sorted.filter((c) => c.kind === k)).map((c) => {
+  const changes = CHANGE_KINDS.flatMap((k) => sorted.filter((c) => c.kind === k)).map((c) => {
     const entry = { kind: c.kind, ...where(c.label, c.file) };
     if (c.kind !== 'retire') return entry;
     const t = where(c.target.label, c.target.file);

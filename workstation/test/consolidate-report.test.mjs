@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadConfig } from '../lib/config.mjs';
 import { buildReport, reportData } from '../lib/reports.mjs';
 import { consolidationReport, parseReportArgs } from '../lib/run-report.mjs';
 import { isolatedEnv, isolateGit, sh, tempDir } from './helpers.mjs';
@@ -315,7 +316,8 @@ test('the summary shows a figure it cannot use as ? and no control character; a 
   assert.equal(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stdout, /[\u0000-\u0008\u000b-\u001f\u007f]/);
   assert.match(r.stdout, /organize\?\[31m: exit \?, label applied, \? written, USD unknown$/m);
-  assert.match(r.stdout, new RegExp(`^- ${day(1)} alpha\\? organize odd: \\? added, \\? changed, \\? retired, USD unknown$`, 'm'));
+  // A host with a control character is not a host: the twin's host is null, shown as ?.
+  assert.match(r.stdout, new RegExp(`^- ${day(1)} \\? organize odd: \\? added, \\? changed, \\? retired, USD unknown$`, 'm'));
   const json = f.json();
   assert.ok(json.problems.some((p) => p.file === '_reports/(file name withheld)' && p.problem === 'not valid JSON'), JSON.stringify(json.problems));
   assert.doesNotMatch(r.stdout + JSON.stringify(json), new RegExp(key));
@@ -367,4 +369,65 @@ test('back-to-back windows count each report and each run exactly once', (t) => 
   assert.deepEqual(one.runs.map((r) => r.runId), ['first', 'end-of-first']);
   assert.deepEqual(two.runs.map((r) => r.runId), ['second', 'end-of-second']);
   assert.deepEqual([...one.problems, ...two.problems], []);
+});
+
+// The report of the last seven days, from the library, for the fixture's configuration.
+function libReport(f) {
+  const config = loadConfig({ HOME: f.home, AGENT_MEMORY_CONFIG: f.configFile });
+  const now = new Date();
+  return consolidationReport({ config, now, since: new Date(now.getTime() - 7 * DAY_MS) });
+}
+const problemsOf = (report, name) => report.problems.filter((p) => p.file === `_reports/${name}`).map((p) => p.problem);
+
+test('a twin gives only the fields the kit knows, each of its type and words; any other is null and named', (t) => {
+  const f = reportFixture(t);
+  const label = {
+    schemaVersion: 1, host: 'alpha', kind: 'label', date: day(1), endedAt: at(1), model: 'example-label-model', stopReason: 'interrupted',
+    costUsd: 0.01, turns: null, denials: null, repaired: null, requests: 1, sent: 1, notes: { touched: 1, exceptions: 0, recordedAsTheyWere: 0 },
+    written: 1, unchanged: 0, notWritten: 0, extra: 'not a field',
+    scopes: [{
+      scope: 'global', set: 1, changed: 0, unchanged: 0, left: 0, needsRepair: 0, unmatchedExceptions: 0,
+      leftReasons: JSON.parse('{"gone": 1, "__proto__": 2, "weird": 3, "ceiling": "many"}'), labelsAfter: { work: 1, personal: 0, general: 0, unlabeled: 0 },
+    }],
+  };
+  const scope = {
+    ...extractJson('alpha', 1, 'odd'), costUsd: 'free', turns: -1, stopReason: 'two words', repaired: 1.5, conversation: 'none',
+    changes: ['not a change', { kind: 'moved', path: 'projects/odd/a.md' }, { kind: 'add', path: 7 }, { kind: 'change', path: 'projects/odd/b.md', note: 'x' }],
+  };
+  write(f.repo, `_reports/${day(1)}-alpha-label.json`, `${JSON.stringify(label).slice(0, -1)},"__proto__":{"polluted":true}}`);
+  write(f.repo, `_reports/${day(1)}-alpha-extract-odd.json`, JSON.stringify(scope));
+  const report = libReport(f);
+  const twin = report.reports.find((r) => r.kind === 'label');
+  assert.equal(Object.getPrototypeOf(twin), Object.prototype);
+  assert.equal(twin.polluted, undefined);
+  assert.equal('extra' in twin, false);
+  assert.equal(twin.stopReason, null);
+  assert.deepEqual(twin.scopes[0].leftReasons, { gone: 1 });
+  assert.deepEqual(problemsOf(report, `${day(1)}-alpha-label.json`), [
+    'stopReason is not a known word', 'scopes[0].leftReasons holds a word that is not known', 'scopes[0].leftReasons.ceiling has the wrong type',
+  ]);
+  const odd = report.reports.find((r) => r.scope === 'odd');
+  assert.deepEqual([odd.costUsd, odd.turns, odd.stopReason, odd.repaired, odd.conversation], [null, null, null, null, null]);
+  assert.deepEqual(odd.changes, [{ kind: null, path: 'projects/odd/a.md' }, { kind: 'add', path: null }, { kind: 'change', path: 'projects/odd/b.md' }]);
+  assert.deepEqual(problemsOf(report, `${day(1)}-alpha-extract-odd.json`), [
+    'stopReason has the wrong type', 'costUsd has the wrong type', 'turns has the wrong type', 'repaired has the wrong type',
+    'conversation has the wrong type', 'changes[0] has the wrong type', 'changes[1].kind is not a known word', 'changes[2].path has the wrong type',
+  ]);
+  // A twin without its end is named, and counted by its day.
+  const { endedAt: _gone, ...noEnd } = extractJson('alpha', 1, 'no-end');
+  write(f.repo, `_reports/${day(1)}-alpha-extract-no-end.json`, JSON.stringify(noEnd));
+  const again = libReport(f);
+  assert.deepEqual(problemsOf(again, `${day(1)}-alpha-extract-no-end.json`), ['endedAt has the wrong type']);
+  assert.equal(again.reports.find((r) => r.scope === 'no-end').endedAt, null);
+});
+
+test('a report file over 1 MiB is too large; after 5000 files the rest of the window is not read', (t) => {
+  const f = reportFixture(t);
+  write(f.repo, `_reports/${day(1)}-alpha-extract-huge.json`, `${JSON.stringify(extractJson('alpha', 1, 'huge'))}${' '.repeat(1024 * 1024)}`);
+  let report = libReport(f);
+  assert.deepEqual(problemsOf(report, `${day(1)}-alpha-extract-huge.json`), ['too large']);
+  for (let i = 0; i < 5001; i++) write(f.repo, `_reports/${day(2)}-alpha-extract-many-${String(i).padStart(4, '0')}.json`, JSON.stringify(extractJson('alpha', 2, `many-${i}`)));
+  report = libReport(f);
+  assert.equal(report.reports.length + report.problems.filter((p) => p.file?.startsWith('_reports/')).length, 5000);
+  assert.deepEqual(report.problems.filter((p) => p.file === '_reports'), [{ file: '_reports', problem: 'more than 5000 reports in the window; the rest were not read' }]);
 });
