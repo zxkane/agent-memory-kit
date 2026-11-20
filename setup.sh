@@ -11,6 +11,9 @@
 # The same holds for canary.schedule (the timer of the deployed checks of the memory API).
 # When the config has a bridge block with agentsRepoUrl and its agentsRepoDir does not exist,
 # that repository is cloned there (the URL is never printed).
+# When the config has a consolidate.label block that signs its tokens (no tokenFile), the packages
+# of the label step are installed with npm ci in the kit's folder, unless node_modules holds
+# those of package-lock.json already.
 # --no-hooks does everything else but does not register the Claude Code, Codex and
 #   Kiro hooks (and removes the kit's own entries if present).
 set -euo pipefail
@@ -40,6 +43,7 @@ agents_url=""
 bridge_problem=""
 canary_cal=""
 canary_problem=""
+label_signs=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
@@ -131,7 +135,8 @@ else
         const { loadConfig } = await import(process.argv[1]);
         const c = loadConfig({ HOME: process.env.HOME });
         if (!c) process.exit(3);
-        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? "", c.consolidate?.extract ?? "", c.consolidate?.organize ?? "", c.consolidateProblem ?? "", c.bridge?.agentsRepoDir ?? "", c.bridge?.agentsRepoUrl ?? "", c.bridgeProblem ?? "", c.canary?.schedule ?? "", c.canaryProblem ?? ""]));
+        const label = c.consolidate?.label ?? null;
+        process.stdout.write(JSON.stringify([c.repoDir, c.repoUrl ?? "", c.consolidate?.extract ?? "", c.consolidate?.organize ?? "", c.consolidateProblem ?? "", c.bridge?.agentsRepoDir ?? "", c.bridge?.agentsRepoUrl ?? "", c.bridgeProblem ?? "", c.canary?.schedule ?? "", c.canaryProblem ?? "", label !== null && label.tokenFile === null ? 1 : 0]));
     ' "file://$kit_dir/workstation/lib/config.mjs")" || die "$config_file is not a valid, enabled configuration."
     repo_dir="$(node -p 'JSON.parse(process.argv[1])[0]' "$cfg")"
     repo_url="$(node -p 'JSON.parse(process.argv[1])[1]' "$cfg")"
@@ -143,7 +148,40 @@ else
     bridge_problem="$(node -p 'JSON.parse(process.argv[1])[7]' "$cfg")"
     canary_cal="$(node -p 'JSON.parse(process.argv[1])[8]' "$cfg")"
     canary_problem="$(node -p 'JSON.parse(process.argv[1])[9]' "$cfg")"
+    # A valid label block without a token file signs its tokens with the token generator.
+    label_signs="$(node -p 'JSON.parse(process.argv[1])[10]' "$cfg")"
 fi
+# The packages of the label step (the official AWS token generator), installed with this command
+# in the kit's folder. They need installing when a label block signs its tokens, unless the kit's
+# node_modules holds exactly the packages of package-lock.json, as npm recorded them when it
+# installed them (node_modules/.package-lock.json): a re-run with an unchanged lockfile needs no
+# registry, and never empties a working node_modules.
+label_npm=(npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
+label_packages_match() {
+    node -e '
+        const { readFileSync } = require("node:fs");
+        const read = (path) => JSON.parse(readFileSync(path, "utf8"));
+        const canon = (v) => (Array.isArray(v) ? `[${v.map(canon).join(",")}]`
+            : v !== null && typeof v === "object"
+                ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canon(v[k])}`).join(",")}}`
+                : JSON.stringify(v));
+        try {
+            const { "": root, ...wanted } = read(`${process.argv[1]}/package-lock.json`).packages;
+            const installed = read(`${process.argv[1]}/node_modules/.package-lock.json`).packages;
+            process.exit(canon(wanted) === canon(installed) ? 0 : 1);
+        } catch {
+            process.exit(1);
+        }
+    ' "$kit_dir"
+}
+label_install=0
+label_current=0
+if [[ $label_signs -eq 1 ]]; then
+    if label_packages_match; then label_current=1; else label_install=1; fi
+fi
+label_current_line() {
+    printf 'the packages of the label step in %s/node_modules match package-lock.json; nothing to install\n' "$kit_dir"
+}
 # A consolidate or canary block that is present but invalid leaves its units as they are:
 # reading it as "no schedule" would remove timers that the person did not ask to remove.
 # True when systemd-analyze is on the PATH and rejects the calendar expression $2 of scope $1;
@@ -250,6 +288,10 @@ if [[ $init -eq 1 || $clone_needed -eq 1 ]]; then
     GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$repo_url" main > /dev/null \
         || die "the notes repository does not answer: git ls-remote --exit-code $repo_url main failed."
 fi
+# A label block that signs its tokens needs the packages of the label step, which npm installs.
+if [[ $label_install -eq 1 ]] && ! command -v npm > /dev/null 2>&1; then
+    die "npm is required: the label block in $config_file signs its tokens, and setup installs the AWS token generator for it with ${label_npm[*]}."
+fi
 
 launchd_flags=()
 launchd_init_flags=()
@@ -269,6 +311,11 @@ if [[ $dry_run -eq 1 ]]; then
     if [[ $prepare -eq 1 ]]; then
         printf '%s\n' 'would prepare the note clones and state directory; hooks and schedulers left unchanged'
         exit 0
+    fi
+    if [[ $label_install -eq 1 ]]; then
+        printf 'would run %s in %s (the packages of the label step)\n' "${label_npm[*]}" "$kit_dir"
+    elif [[ $label_current -eq 1 ]]; then
+        label_current_line
     fi
     if [[ $hooks -eq 1 ]]; then
         printf 'would run node %s/workstation/install.mjs (hooks in %s)\n' "$kit_dir" "$settings_file"
@@ -365,6 +412,18 @@ mkdir -p -m 700 "$state_dir"
 if [[ $prepare -eq 1 ]]; then
     printf '%s\n' 'prepared note clones; hooks, launcher and schedulers left unchanged'
     exit 0
+fi
+
+# The packages of the label step, in the kit's node_modules: only for a label block that signs its
+# tokens, so that a machine that does not sign needs no registry, and only when they are not
+# installed already. No package script runs. A failure stops setup before the hooks and the timers.
+if [[ $label_install -eq 1 ]]; then
+    if ! (cd "$kit_dir" && "${label_npm[@]}"); then
+        die "${label_npm[*]} failed in $kit_dir; the label step cannot make its tokens without the AWS token generator. Fix the cause above and run setup.sh again."
+    fi
+    printf 'installed the packages of the label step (%s in %s)\n' "${label_npm[*]}" "$kit_dir"
+elif [[ $label_current -eq 1 ]]; then
+    label_current_line
 fi
 
 # 6. Hooks and the recorded Node.js path.

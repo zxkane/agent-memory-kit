@@ -5,6 +5,7 @@ import { labelAgentScopes } from '../lib/agent-labels.mjs';
 import { SNAPSHOT_KEY, STATE_KEY, listAgentScopes, scopeDigest } from '../lib/agent-scopes.mjs';
 import { AwsError } from '../lib/aws.mjs';
 import { parseDomains } from '../lib/domains.mjs';
+import { labelBatch as clientBatch } from '../lib/label-client.mjs';
 import { createS3 } from '../lib/s3.mjs';
 import { createFakeS3 } from './fake-s3.mjs';
 
@@ -88,8 +89,8 @@ function bucket(scopes = SCOPES) {
 // is in `fails` fails as an unreachable endpoint does.
 function model(labels = {}, { fails = [], onCall = () => {} } = {}) {
   const calls = [];
-  const labelBatch = async ({ notes, persona, label, token }) => {
-    calls.push({ paths: notes.map((n) => n.path), persona, model: label.model, token });
+  const labelBatch = async ({ notes, persona, label, provideToken }) => {
+    calls.push({ paths: notes.map((n) => n.path), persona, model: label.model, token: await provideToken() });
     onCall(calls.length);
     if (fails.includes(calls.length)) {
       return { ok: false, error: 'Mantle Responses HTTP 503', transport: true, usage: { input: 0, output: 0 }, costUsd: 0, requests: 1 };
@@ -105,20 +106,20 @@ const CONFIG = {
 };
 const domainsOf = (extra = {}) => parseDomains(JSON.stringify({ version: 1, defaults: {}, exceptions: {}, ...extra })).value;
 
-// A token maker that counts its calls.
+// A token source that counts the passes that took it.
 function tokens() {
   const made = [];
-  const token = async () => {
+  const tokenSource = async () => {
     made.push(Date.now());
-    return { token: 'example-label-token', tokenAt: Date.now() };
+    return { provideToken: async () => 'example-label-token', tokenAt: Date.now() };
   };
-  return { token, made };
+  return { tokenSource, made };
 }
 
-function pass(b, m, { opts = {}, domains = domainsOf(), token = tokens().token, signal, config = CONFIG, s3For = b.s3 } = {}) {
+function pass(b, m, { opts = {}, domains = domainsOf(), tokenSource = tokens().tokenSource, signal, config = CONFIG, s3For = b.s3 } = {}) {
   return labelAgentScopes({
     config, opts: { agentNames: [], all: false, dryRun: false, ...opts }, s3For, started: STARTED,
-    domains, persona: 'The owner is an example tester.', token, labelBatch: m.labelBatch, signal,
+    domains, persona: 'The owner is an example tester.', tokenSource, labelBatch: m.labelBatch, signal,
   });
 }
 
@@ -137,10 +138,10 @@ test('the first run records labeled notes by ETag', async () => {
   const steps = b.etag('agents/codex-alpha/deploy-steps.md');
   const m = model({ 'agents/codex-alpha/deploys.md': 'work', 'agents/example-agent/family.md': 'personal' });
   const t = tokens();
-  const out = await pass(b, m, { token: t.token });
+  const out = await pass(b, m, { tokenSource: t.tokenSource });
   assert.equal(out.failed, false, out.lines.join('\n'));
   // Every note was read; only the ones without a label go to the model, one batch per scope, with
-  // the run's one token, the persona and the label model.
+  // the pass's one token source, the persona and the label model.
   assert.deepEqual(m.paths(), [['agents/codex-alpha/deploys.md'], ['agents/example-agent/family.md']]);
   assert.equal(t.made.length, 1);
   assert.deepEqual(m.calls.map((c) => [c.token, c.model, c.persona]), Array(2).fill(['example-label-token', 'example-label-model', 'The owner is an example tester.']));
@@ -172,9 +173,9 @@ test('the first run records labeled notes by ETag', async () => {
     'Labels after this run: 0 work, 1 personal, 0 general',
   ]);
   assert.doesNotMatch(out.lines.join('\n'), /MODEL-REASON|example-label-token/);
-  // The next run finds nothing touched: it reads no note, makes no token and asks no model.
+  // The next run finds nothing touched: it reads no note, takes no token source and asks no model.
   const from = b.fake.requests.length;
-  const again = await pass(b, m, { token: t.token });
+  const again = await pass(b, m, { tokenSource: t.tokenSource });
   assert.deepEqual(reads(b, from), []);
   assert.equal(t.made.length, 1);
   assert.equal(m.calls.length, 2);
@@ -457,8 +458,8 @@ test('a token that cannot be made leaves every note to the next run', async () =
   const b = bucket();
   const exceptions = { 'agents/codex-alpha/deploys.md': 'work' };
   const m = model();
-  const token = async () => { throw new Error('the label token file is not a token'); };
-  const out = await pass(b, m, { token, domains: domainsOf({ exceptions }) });
+  const tokenSource = async () => { throw new Error('the label token file is not a token'); };
+  const out = await pass(b, m, { tokenSource, domains: domainsOf({ exceptions }) });
   assert.equal(out.failed, true);
   assert.deepEqual(m.calls, []);
   assert.equal(out.lines[0], 'label: the label token could not be made (the label token file is not a token); no note was sent to the model.');
@@ -467,6 +468,22 @@ test('a token that cannot be made leaves every note to the next run', async () =
   assert.equal(b.text('agents/codex-alpha/deploys.md'), labeled('deploys', ...DEPLOYS, 'work'));
   assert.deepEqual(Object.keys(b.scope('codex-alpha').labels), ['deploy-steps.md', 'deploys.md']);
   assert.deepEqual(b.scope('example-agent').labels, {});
+});
+
+test('a pass whose tokens cannot be made says that no note went to the model', async () => {
+  const b = bucket();
+  const refused = Object.assign(new Error('User: arn:aws:sts::123456789012:assumed-role/example is not authorized'), {
+    name: 'AccessDenied', $metadata: { httpStatusCode: 403 },
+  });
+  const tokenSource = async () => ({ provideToken: async () => { throw refused; }, tokenAt: null });
+  // label-client's own labelBatch: without a token it sends nothing.
+  const out = await pass(b, { labelBatch: clientBatch }, { tokenSource });
+  assert.equal(out.failed, true);
+  const text = out.lines.join('\n');
+  assert.doesNotMatch(text, /sent to the model|request\(s\)/);
+  assert.match(text, /^- agents\/codex-alpha\/deploys\.md: the model call failed \(the label token could not be made: 403 AccessDenied\)$/m);
+  assert.match(text, /^- agents\/example-agent\/family\.md: the model call failed \(the label token could not be made: 403 AccessDenied\)$/m);
+  assert.doesNotMatch(text, /arn:aws|123456789012|authorized/);
 });
 
 test('a signal during the model calls writes nothing', async () => {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AwsError, assumeRole, bedrockToken, environmentCredentials, imdsCredentials, signRequest, ssmGetParameter } from '../lib/aws.mjs';
+import { AwsError, assumeRole, environmentCredentials, imdsCredentials, signRequest, ssmGetParameter } from '../lib/aws.mjs';
 
 const creds = { accessKeyId: 'EXAMPLEKEYID', secretAccessKey: 'example-signing-value' };
 const credsToken = { ...creds, sessionToken: 'example-session-value' };
@@ -470,61 +470,5 @@ test('environmentCredentials reads process.env by default and no request is made
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-  }
-});
-
-// Vector produced by the AWS token generator (createToken, version 1.1.0) at a fixed clock,
-// with AWS's documented example credentials.
-const BEDROCK_KEY_VALUE = 'wJalrXUtnFEMI/' + 'K7MDENG+bPxRfiCY' + 'EXAMPLEKEY';
-const bedrockInput = (over = {}) => ({
-  region: 'us-east-1', now: new Date(Date.UTC(2026, 10, 19, 12, 0, 0)), expiresInSeconds: 43200,
-  credentials: { accessKeyId: 'AKIDEXAMPLE', secretAccessKey: BEDROCK_KEY_VALUE, sessionToken: 'EXAMPLESESSIONTOKEN' },
-  ...over,
-});
-const decodeBedrock = (token) => Buffer.from(token.slice(16), 'base64').toString('utf8');
-
-test('bedrockToken matches the token generator', () => {
-  const token = bedrockToken(bedrockInput());
-  assert.ok(token.startsWith('bedrock-api-key-'));
-  assert.equal(decodeBedrock(token),
-    'bedrock.amazonaws.com/?Action=CallWithBearerToken&X-Amz-Algorithm=AWS4-HMAC-SHA256'
-    + '&X-Amz-Credential=AKIDEXAMPLE%2F20261119%2Fus-east-1%2Fbedrock%2Faws4_request&X-Amz-Date=20261119T120000Z'
-    + '&X-Amz-Expires=43200&X-Amz-Security-Token=EXAMPLESESSIONTOKEN'
-    + '&X-Amz-Signature=0e0cc4700e1173c322b0a0bdbe5ef290e1c255f07f8d9b9f505e269a5b062999'
-    + '&X-Amz-SignedHeaders=host&Version=1');
-});
-
-test('bedrockToken omits the security token without a session token', () => {
-  for (const sessionToken of [undefined, '']) {
-    const decoded = decodeBedrock(bedrockToken(bedrockInput({
-      credentials: { accessKeyId: 'AKIDEXAMPLE', secretAccessKey: BEDROCK_KEY_VALUE, sessionToken },
-    })));
-    assert.ok(!decoded.includes('X-Amz-Security-Token'));
-    assert.match(decoded, /&X-Amz-Signature=[0-9a-f]{64}&X-Amz-SignedHeaders=host&Version=1$/);
-  }
-});
-
-test('bedrockToken defaults to one hour', () => {
-  const { expiresInSeconds, ...rest } = bedrockInput();
-  assert.match(decodeBedrock(bedrockToken(rest)), /&X-Amz-Expires=3600&/);
-});
-
-test('bedrockToken refuses a lifetime outside 1 to 43200 seconds', () => {
-  for (const bad of [0, -1, 43201, 1.5, NaN, Infinity, '3600', null]) {
-    assert.throws(() => bedrockToken(bedrockInput({ expiresInSeconds: bad })), RangeError, String(bad));
-  }
-  for (const ok of [1, 43200]) assert.doesNotThrow(() => bedrockToken(bedrockInput({ expiresInSeconds: ok })));
-});
-
-test('bedrockToken errors never carry a credential', () => {
-  assert.throws(() => bedrockToken(bedrockInput({ expiresInSeconds: 0 })), (err) => {
-    assert.ok(!err.message.includes(BEDROCK_KEY_VALUE) && !err.message.includes('EXAMPLESESSIONTOKEN'));
-    return true;
-  });
-  for (const credentials of [{}, { accessKeyId: 'AKIDEXAMPLE' }, { secretAccessKey: BEDROCK_KEY_VALUE }]) {
-    assert.throws(() => bedrockToken(bedrockInput({ credentials })), (err) => {
-      assert.ok(!err.message.includes(BEDROCK_KEY_VALUE));
-      return true;
-    });
   }
 });

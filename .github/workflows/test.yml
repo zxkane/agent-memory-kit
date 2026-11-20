@@ -15,6 +15,7 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
+      - run: npm ci --ignore-scripts
       - run: npm test
 
   api:
@@ -43,4 +44,5 @@ jobs:
       # The tests run Git with a private home directory, so a safe.directory
       # setting would not reach them; own the files instead.
       - run: chown -R "$(id -u):$(id -g)" .
+      - run: npm ci --ignore-scripts
       - run: npm test

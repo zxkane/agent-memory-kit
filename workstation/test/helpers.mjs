@@ -13,9 +13,14 @@ export function tempDir(t) {
 // Variables through which the machine's own Git configuration would reach a test.
 const GIT_CONFIG_VARS = ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM'];
 
-// Environment for a spawned driver or Git command: a private HOME and no system configuration.
+// What a test process or a test's child gets so that the AWS packages can never reach a real
+// instance metadata service: its endpoint is a closed loopback port (as in test/run.sh).
+export const NO_INSTANCE_METADATA = { AWS_EC2_METADATA_SERVICE_ENDPOINT: 'http://127.0.0.1:9' };
+
+// Environment for a spawned driver or Git command: a private HOME, no system configuration, and no
+// AWS variable but the closed instance metadata endpoint, which nothing can replace.
 export function isolatedEnv(home, extra = {}) {
-  return { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1', ...extra };
+  return { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: '1', ...extra, ...NO_INSTANCE_METADATA };
 }
 
 // Runs every Git command of this test file with a private HOME and without the system

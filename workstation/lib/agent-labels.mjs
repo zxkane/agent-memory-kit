@@ -238,13 +238,14 @@ function headline(s, out, { dryRun, idle, took }) {
 
 // The label pass over the agent scopes of the bucket (every scope, or `opts.agentNames`). `s3For`
 // gives an S3 client (agentScopesS3: reads get `signal`, writes do not, so that once they started they
-// finish), `token()` the run's one token as `{ token, tokenAt }`, asked for only when there is a
-// batch to send, `labelBatch` the model call (label-client's), `domains` and `persona` the label
-// inputs. The ceiling is `maxBudgetUsd`, for this pass's own model cost. `failed`: the bucket
-// could not be read, no token could be made, a batch failed, or a write failed. A signal before
-// the writes stops it with nothing written; one later stops it before the next scope's writes.
-// Returns the lines to print: one per scope, then the report without the model's reasons.
-export async function labelAgentScopes({ config, opts, s3For, started, domains, persona, token, labelBatch = modelBatch, signal }) {
+// finish), `tokenSource()` the pass's one token source as `{ provideToken, tokenAt }` (askLabelModel),
+// taken only when there is a batch to send, `labelBatch` the model call (label-client's), `domains`
+// and `persona` the label inputs. The ceiling is `maxBudgetUsd`, for this pass's own model cost.
+// `failed`: the bucket could not be read, the token source could not be made, a batch failed, or a
+// write failed. A signal before the writes stops it with nothing written; one later stops it before
+// the next scope's writes. Returns the lines to print: one per scope, then the report without the
+// model's reasons.
+export async function labelAgentScopes({ config, opts, s3For, started, domains, persona, tokenSource, labelBatch = modelBatch, signal }) {
   const c = config.consolidate;
   const lines = [];
   const scopes = [];
@@ -295,8 +296,8 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
     domains, batchNotes: c.label.batchNotes,
   });
   const asked = await askLabelModel({
-    batches, token, ceiling: c.maxBudgetUsd, now: () => Date.now(), signal,
-    labelBatch: (notes, runToken) => labelBatch({ notes, persona, label: c.label, token: runToken, signal }),
+    batches, tokenSource, ceiling: c.maxBudgetUsd, now: () => Date.now(), signal,
+    labelBatch: (notes, provideToken) => labelBatch({ notes, persona, label: c.label, provideToken, signal }),
   });
   if (asked.line) lines.push(asked.line);
   // Interrupted: nothing is written, and every note stays as it is.

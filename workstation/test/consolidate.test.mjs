@@ -3011,13 +3011,47 @@ test('two failed batches in a row stop the pass', (t) => {
   assert.doesNotMatch(r.stdout + r.stderr + report, /FAKE-MANTLE-BODY/);
 });
 
-test('the token age stops the pass', (t) => {
+test('a pass whose tokens are signed takes a new one for each request: no age stop', (t) => {
   const f = labelFixture(t);
   f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/b.md': note('b', 'B', 'Beta.') });
-  // Each request moves the driver's clock 30 minutes on: the third batch would start with a token an hour old.
+  // Each request moves the driver's clock 30 minutes on: every batch still goes.
   f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'personal' }, advanceMs: 30 * 60 * 1000 });
   const r = f.label();
   assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md'], ['projects/p/a.md'], ['projects/q/b.md']]);
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md', 'projects/p/a.md', 'projects/q/b.md']);
+});
+
+test('a pass whose tokens cannot be made sends nothing, and its figures say so', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/b.md': note('b', 'B', 'Beta.') });
+  // Environment credentials without a session token: AWS's provider gives them, the kit refuses them.
+  const r = f.runWith({ ...f.labelEnv, AWS_SESSION_TOKEN: '' }, 'label');
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), []);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
+  assert.match(r.stdout, /^label: nothing written, USD 0\.00, 0 request\(s\)$/m);
+  assert.match(r.stdout, /^- global\/g\.md: the model call failed \(the label token could not be made: NoSessionToken\)$/m);
+  assert.match(r.stdout, /^- projects\/q\/b\.md: not sent; 2 batches in a row failed$/m);
+  assert.doesNotMatch(r.stdout + r.stderr, /ASIAEXAMPLE|example-signing/);
+  assert.equal(f.readState().labels.notes['global/g.md'], undefined);
+});
+
+test('the age of a token file stops the pass', (t) => {
+  const f = labelFixture(t);
+  // The token file is written as its token is issued, so its age counts from now.
+  const tokenFile = join(f.tmp, 'label-token');
+  writeFileSync(tokenFile, 'example-label-token-0001\n', { mode: 0o600 });
+  const { credentials, ...rest } = LABEL_BLOCK;
+  f.setConfig({ label: { ...rest, tokenFile } });
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/b.md': note('b', 'B', 'Beta.') });
+  // Each request moves the driver's clock 30 minutes on: the third batch would start with a token an hour old.
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'personal' }, advanceMs: 30 * 60 * 1000 });
+  // No AWS credentials: a token file needs none.
+  const r = f.runWith(f.mantleEnv, 'label');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout + r.stderr, /example-label-token/);
   assert.match(r.stdout, /^label: stopped; the label token of this run is near the end of its hour$/m);
   assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md'], ['projects/p/a.md']]);
   assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
