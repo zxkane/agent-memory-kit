@@ -24,9 +24,11 @@ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
 // The one cut rule: text longer than NOTE_TEXT_CAP is cut there and followed by CUT_MARKER. A cut
 // right after a high surrogate drops it, so no lone surrogate reaches a JSON body. Text that
-// already ends with the marker is returned as it is, so cutting twice is the same as once.
+// is already the result of this cut (at most NOTE_TEXT_CAP plus the marker, ending with it) is
+// returned as it is, so cutting twice is the same as once.
 export function capped(text) {
-  if (text.length <= NOTE_TEXT_CAP || text.endsWith(CUT_MARKER)) return text;
+  if (text.length <= NOTE_TEXT_CAP
+    || (text.length <= NOTE_TEXT_CAP + CUT_MARKER.length && text.endsWith(CUT_MARKER))) return text;
   let end = NOTE_TEXT_CAP;
   const last = text.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;

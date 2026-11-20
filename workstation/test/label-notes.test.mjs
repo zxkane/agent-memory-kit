@@ -49,6 +49,14 @@ test('a cut that lands after a high surrogate drops it', (t) => {
   assert.equal(capped(note.body), note.body);
 });
 
+test('the cut is bounded and idempotent', () => {
+  const once = capped(`${'x'.repeat(9000)}${CUT_MARKER}`);
+  assert.equal(once.length, 6030);
+  assert.equal(once, `${'x'.repeat(6000)}${CUT_MARKER}`);
+  assert.equal(capped(once), once);
+  assert.equal(capped(`${'x'.repeat(1_000_000)}${CUT_MARKER}`).length, 6030);
+});
+
 test('collectScopeNotes names the notes whose frontmatter setDomain cannot edit', (t) => {
   const dir = tempDir(t);
   writeFileSync(join(dir, 'a-plain.md'), 'Just a line.\n');

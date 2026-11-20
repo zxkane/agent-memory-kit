@@ -24,15 +24,28 @@ const defaultSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms);
 
 // A `<` that starts a structural tag of the prompt becomes `&lt;`, so a note cannot close its own
 // block or open another one. Any other `<` stays, because notes hold code.
-const STRUCTURAL_TAG_RE = /<(?=\s*\/?\s*(?:notes?|persona)\b)/gi;
+// Unicode format characters (zero-width, soft hyphen) count as white space here.
+const STRUCTURAL_TAG_RE = /<(?=[\s\p{Cf}]*\/?[\s\p{Cf}]*(?:notes?|persona)\b)/giu;
 const escapeTags = (text) => String(text ?? '').replace(STRUCTURAL_TAG_RE, '&lt;');
+const escapeAttr = (value) => String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+  .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+const NAME_CAP = 200;
+const DESCRIPTION_CAP = 1000;
+
+// The first `max` UTF-16 units of a text, without a lone high surrogate at the end.
+function head(text, max) {
+  const last = text.charCodeAt(max - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? max - 1 : max);
+}
+const cutTo = (text, max) => (text.length > max ? `${head(text, max)}…` : text);
 
 // One note as the model sees it. The body is cut by the rule collectScopeNotes uses.
 export function noteBlock({ id, path, default: label, name, description, body }) {
   return [
-    `<note id="${id}" path="${path}" default="${label}">`,
-    `name: ${escapeTags(name)}`,
-    `description: ${escapeTags(description)}`,
+    `<note id="${escapeAttr(id)}" path="${escapeAttr(path)}" default="${escapeAttr(label)}">`,
+    `name: ${escapeTags(cutTo(String(name ?? ''), NAME_CAP))}`,
+    `description: ${escapeTags(cutTo(String(description ?? ''), DESCRIPTION_CAP))}`,
     '',
     escapeTags(capped(String(body ?? ''))),
     '</note>',
@@ -42,6 +55,10 @@ export function noteBlock({ id, path, default: label, name, description, body })
 export function labelPrompt({ notes, persona }) {
   return renderPrompt('label', { persona, notes: notes.map(noteBlock).join('\n\n') });
 }
+
+const SAFE_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
+// A reason of the model as one line: control characters become spaces, runs of spaces collapse.
+const oneLine = (text) => text.replace(/[\p{Cc}\u2028\u2029]/gu, ' ').replace(/ {2,}/g, ' ').trim();
 
 const stripFence = (text) => /^\s*```[^\n]*\n([\s\S]*?)\n?```\s*$/.exec(text)?.[1] ?? text;
 
@@ -60,9 +77,11 @@ export function parseLabelAnswer(text, ids) {
   const labels = new Map();
   for (const entry of data.labels) {
     const id = entry?.id;
-    if (typeof id !== 'string' || !wanted.has(id) || labels.has(id)) throw new Error(`unknown or duplicate id ${String(id).slice(0, 80)}`);
+    if (typeof id !== 'string' || !wanted.has(id) || labels.has(id)) {
+      throw new Error(typeof id === 'string' && SAFE_ID_RE.test(id) ? `unknown or duplicate id ${id}` : 'unknown or duplicate id');
+    }
     if (!LABELS.includes(entry.label)) throw new Error(`bad label for ${id}`);
-    const reason = typeof entry.reason === 'string' ? entry.reason.trim().slice(0, MAX_REASON_CHARS) : '';
+    const reason = typeof entry.reason === 'string' ? head(oneLine(entry.reason), MAX_REASON_CHARS).trim() : '';
     labels.set(id, { label: entry.label, reason });
   }
   if (labels.size < wanted.size) throw new Error(`${wanted.size - labels.size} ids missing`);
@@ -87,13 +106,14 @@ const count = (n) => (Number.isFinite(n) && n > 0 ? n : 0);
 
 // The text, usage or error of a parsed answer.
 function readResponse(data) {
+  const usage = { input: count(data?.usage?.input_tokens), output: count(data?.usage?.output_tokens) };
   const status = typeof data?.status === 'string' && /^[a-z_]{1,32}$/.test(data.status) ? data.status : 'unknown';
-  if (status !== 'completed') return { ok: false, error: `response status ${status}` };
+  if (status !== 'completed') return { ok: false, error: `response status ${status}`, usage };
   const parts = (Array.isArray(data.output) ? data.output : [])
     .filter((item) => item?.type === 'message' && Array.isArray(item.content)).flatMap((item) => item.content);
-  if (parts.some((part) => part?.type === 'refusal')) return { ok: false, error: 'model refused' };
+  if (parts.some((part) => part?.type === 'refusal')) return { ok: false, error: 'model refused', usage };
   const text = parts.filter((part) => part?.type === 'output_text' && typeof part.text === 'string').map((part) => part.text).join('');
-  return { ok: true, text, usage: { input: count(data.usage?.input_tokens), output: count(data.usage?.output_tokens) } };
+  return { ok: true, text, usage };
 }
 
 // One Responses request, with up to ATTEMPTS attempts for 429, 5xx and network errors (a timeout
