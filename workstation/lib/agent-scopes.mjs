@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AwsError, assumeRole, environmentCredentials, imdsCredentials } from './aws.mjs';
-import { INDEX, parseNote } from './notes.mjs';
+import { AGENT_RE, INDEX, PROJECT_RE, parseNote } from './notes.mjs';
 import { createS3 } from './s3.mjs';
 import { readRegular } from './workdir.mjs';
 
@@ -26,9 +26,8 @@ export const SNAPSHOT_KEY = 'index/agents.json';
 // What the runs remember about each agent scope; in the bucket, so that a run in a GitHub Actions
 // job, which keeps no state of its own, knows what is already organized.
 export const STATE_KEY = 'index/organizer.json';
-export const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+export { AGENT_RE };
 export const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
-const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
 // The memory API's limits (api/src/ops/write.ts and api/src/validate.ts; a test of the API checks
 // that both sides agree).

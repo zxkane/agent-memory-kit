@@ -17,11 +17,15 @@ function ruleSource(text, name) {
 test('the path rules of bridge up are the API rules, character for character', () => {
   const api = read('api/src/validate.ts');
   const up = read('workstation/lib/bridge-up.mjs');
-  for (const name of ['PROJECT_RE', 'FILE_RE']) assert.equal(ruleSource(up, name), ruleSource(api, name), name);
+  const notes = read('workstation/lib/notes.mjs');
+  assert.equal(ruleSource(notes, 'PROJECT_RE'), ruleSource(api, 'PROJECT_RE'), 'PROJECT_RE');
+  assert.equal(ruleSource(up, 'FILE_RE'), ruleSource(api, 'FILE_RE'), 'FILE_RE');
 });
 
 test('the path rules of bridge down are the API rules, character for character', () => {
   const api = read('api/src/validate.ts');
   const down = read('workstation/lib/bridge-down.mjs');
-  for (const name of ['AGENT_RE', 'FILE_RE']) assert.equal(ruleSource(down, name), ruleSource(api, name), name);
+  const notes = read('workstation/lib/notes.mjs');
+  assert.equal(ruleSource(notes, 'AGENT_RE'), ruleSource(api, 'AGENT_RE'), 'AGENT_RE');
+  assert.equal(ruleSource(down, 'FILE_RE'), ruleSource(api, 'FILE_RE'), 'FILE_RE');
 });

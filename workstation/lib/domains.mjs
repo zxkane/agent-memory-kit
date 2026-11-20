@@ -1,9 +1,7 @@
 // Note labels: the `domain` of a note, the private inputs that decide it, and the tags on index lines.
 import { closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { join } from 'node:path';
-import { AGENT_RE } from './agent-scopes.mjs';
-import { PROJECT_RE } from './bridge-up.mjs';
-import { INDEX, NOTE_NAME_RE } from './notes.mjs';
+import { AGENT_RE, INDEX, NOTE_NAME_RE, PROJECT_RE } from './notes.mjs';
 
 export const LABELS = Object.freeze(['work', 'personal', 'general']);
 

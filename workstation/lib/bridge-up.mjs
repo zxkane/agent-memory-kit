@@ -8,11 +8,11 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { join } from 'node:path';
 import { AwsError } from './aws.mjs';
 import { GitError, TIMEOUT_CODE, git } from './git.mjs';
-import { INDEX, parseNote } from './notes.mjs';
+import { INDEX, PROJECT_RE, parseNote } from './notes.mjs';
 import { scanText } from './secret-scan.mjs';
 
 // The API's path rules (api/src/validate.ts), copied character for character; a test compares them.
-export const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+export { PROJECT_RE };
 export const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
 
 const MAX_FILE_BYTES = 1_000_000;
