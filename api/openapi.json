@@ -160,7 +160,7 @@
                     },
                     "index": {
                       "type": "string",
-                      "description": "Markdown text of MEMORY.md, possibly cut."
+                      "description": "Markdown text of MEMORY.md, with the tags of work and personal notes, possibly cut."
                     },
                     "truncated": {
                       "type": "boolean",
