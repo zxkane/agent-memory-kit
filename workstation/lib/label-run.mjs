@@ -108,7 +108,8 @@ const TOKEN_NOT_MADE = 'not sent; the label token could not be made';
 // labels given (path -> { label, reason }), the notes not labeled (path -> why: those of a failed
 // batch that was not split, and those not sent after a stop), `stop` (null when it sent every
 // batch), `failed` (a note was left by a failed request), what it spent and requested (split
-// requests included), and how many notes it sent (each once).
+// requests included), and how many notes it sent (each once; none of a batch whose requests could
+// not be sent for want of a token).
 export async function sendBatches({ batches, labelBatch, ceiling, now, tokenAt, signal }) {
   const out = { labels: new Map(), left: new Map(), stop: null, failed: false, spent: 0, requests: 0, sent: 0 };
   const leave = (list, why) => list.forEach((b) => b.notes.forEach((n) => out.left.set(n.path, why)));
@@ -136,7 +137,8 @@ export async function sendBatches({ batches, labelBatch, ceiling, now, tokenAt, 
     const res = await labelBatch(batch.notes);
     out.spent += res.costUsd;
     out.requests += res.requests;
-    if (!half) out.sent += batch.notes.length;
+    // A batch none of whose requests was sent (no token could be made) sent no note.
+    if (!half && res.requests > 0) out.sent += batch.notes.length;
     if (signal?.aborted) {
       out.stop = 'interrupted';
       leave([batch], NOT_SENT.interrupted);

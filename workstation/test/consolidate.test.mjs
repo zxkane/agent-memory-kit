@@ -3023,6 +3023,21 @@ test('a pass whose tokens are signed takes a new one for each request: no age st
   assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md', 'projects/p/a.md', 'projects/q/b.md']);
 });
 
+test('a pass whose tokens cannot be made sends nothing, and its figures say so', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/b.md': note('b', 'B', 'Beta.') });
+  // Environment credentials without a session token: AWS's provider gives them, the kit refuses them.
+  const r = f.runWith({ ...f.labelEnv, AWS_SESSION_TOKEN: '' }, 'label');
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), []);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
+  assert.match(r.stdout, /^label: nothing written, USD 0\.00, 0 request\(s\)$/m);
+  assert.match(r.stdout, /^- global\/g\.md: the model call failed \(the label token could not be made: NoSessionToken\)$/m);
+  assert.match(r.stdout, /^- projects\/q\/b\.md: not sent; 2 batches in a row failed$/m);
+  assert.doesNotMatch(r.stdout + r.stderr, /ASIAEXAMPLE|example-signing/);
+  assert.equal(f.readState().labels.notes['global/g.md'], undefined);
+});
+
 test('the age of a token file stops the pass', (t) => {
   const f = labelFixture(t);
   // The token file is written as its token is issued, so its age counts from now.

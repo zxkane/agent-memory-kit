@@ -159,13 +159,14 @@ function tokenUntilAborted(provideToken, signal) {
 // of one attempt is a network error). Right before each attempt it awaits a token of
 // `provideToken`, never one of an earlier attempt. A token that cannot be made ends the request at
 // once, with nothing sent and no other source tried, as a request that did not reach the model. An
-// abort of the caller's signal stops it at once. A failure has `transport` true when the request
-// did not reach the model (no token, a network error or a timeout, or HTTP 429, 5xx, 401, 403 or
-// 404), false when the endpoint answered, and `content` true when the answer was about the notes:
-// a refusal or an incomplete answer.
+// abort of the caller's signal stops it at once. `sent` says whether an attempt was sent at all. A
+// failure has `transport` true when the request did not reach the model (no token, a network error
+// or a timeout, or HTTP 429, 5xx, 401, 403 or 404), false when the endpoint answered, and
+// `content` true when the answer was about the notes: a refusal or an incomplete answer.
 export async function requestLabels({ prompt, label, provideToken, fetchImpl = fetch, signal, sleep = defaultSleep }) {
   const started = Date.now();
-  const done = (result) => ({ ...result, ms: Date.now() - started });
+  let sent = false;
+  const done = (result) => ({ ...result, sent, ms: Date.now() - started });
   const aborted = () => done({ ok: false, error: 'request aborted', transport: false, content: false });
   const body = JSON.stringify({
     model: label.model, input: prompt, max_output_tokens: MAX_OUTPUT_TOKENS, store: false, reasoning: { effort: label.reasoningEffort },
@@ -188,6 +189,7 @@ export async function requestLabels({ prompt, label, provideToken, fetchImpl = f
     }
     const limit = AbortSignal.timeout(ATTEMPT_TIMEOUT_MS);
     try {
+      sent = true;
       const res = await fetchImpl(`${label.endpoint}/responses`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
@@ -229,7 +231,8 @@ export function costOf(usage, label) {
 
 // Labels a batch of notes, each request with a token of its own from `provideToken`. An answer that
 // fails parseLabelAnswer is asked once more; an HTTP or network failure (after its own retries), or
-// a token that cannot be made, ends the batch. A failed batch has `transport` true when its request
+// a token that cannot be made, ends the batch. `requests` counts the requests sent, so none for a
+// request whose token could not be made. A failed batch has `transport` true when its request
 // did not reach the model (see requestLabels), and `content` true when its last answer was about
 // the notes: a refusal, an incomplete answer, or (twice) an answer that fails the check. Any other
 // failure (another 4xx, an answer that is not JSON or is too large, a response that did not
@@ -243,8 +246,8 @@ export async function labelBatch({ notes, persona, label, provideToken, fetchImp
   let transport = false;
   let content = false;
   for (let round = 0; round < 2; round += 1) {
-    requests += 1;
     const res = await requestLabels({ prompt, label, provideToken, fetchImpl, signal, sleep });
+    if (res.sent) requests += 1;
     if (res.usage) {
       usage.input += res.usage.input;
       usage.output += res.usage.output;

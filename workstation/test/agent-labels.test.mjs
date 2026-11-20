@@ -5,6 +5,7 @@ import { labelAgentScopes } from '../lib/agent-labels.mjs';
 import { SNAPSHOT_KEY, STATE_KEY, listAgentScopes, scopeDigest } from '../lib/agent-scopes.mjs';
 import { AwsError } from '../lib/aws.mjs';
 import { parseDomains } from '../lib/domains.mjs';
+import { labelBatch as clientBatch } from '../lib/label-client.mjs';
 import { createS3 } from '../lib/s3.mjs';
 import { createFakeS3 } from './fake-s3.mjs';
 
@@ -467,6 +468,22 @@ test('a token that cannot be made leaves every note to the next run', async () =
   assert.equal(b.text('agents/codex-alpha/deploys.md'), labeled('deploys', ...DEPLOYS, 'work'));
   assert.deepEqual(Object.keys(b.scope('codex-alpha').labels), ['deploy-steps.md', 'deploys.md']);
   assert.deepEqual(b.scope('example-agent').labels, {});
+});
+
+test('a pass whose tokens cannot be made says that no note went to the model', async () => {
+  const b = bucket();
+  const refused = Object.assign(new Error('User: arn:aws:sts::123456789012:assumed-role/example is not authorized'), {
+    name: 'AccessDenied', $metadata: { httpStatusCode: 403 },
+  });
+  const tokenSource = async () => ({ provideToken: async () => { throw refused; }, tokenAt: null });
+  // label-client's own labelBatch: without a token it sends nothing.
+  const out = await pass(b, { labelBatch: clientBatch }, { tokenSource });
+  assert.equal(out.failed, true);
+  const text = out.lines.join('\n');
+  assert.doesNotMatch(text, /sent to the model|request\(s\)/);
+  assert.match(text, /^- agents\/codex-alpha\/deploys\.md: the model call failed \(the label token could not be made: 403 AccessDenied\)$/m);
+  assert.match(text, /^- agents\/example-agent\/family\.md: the model call failed \(the label token could not be made: 403 AccessDenied\)$/m);
+  assert.doesNotMatch(text, /arn:aws|123456789012|authorized/);
 });
 
 test('a signal during the model calls writes nothing', async () => {

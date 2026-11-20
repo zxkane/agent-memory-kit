@@ -76,6 +76,7 @@ test('requestLabels sends one Responses request', async () => {
   };
   const out = await requestLabels({ prompt: 'P', label: LABEL, provideToken: fixed('tok'), fetchImpl, sleep: noSleep });
   assert.equal(out.ok, true);
+  assert.equal(out.sent, true);
   assert.equal(out.text, '{"labels":[]}');
   assert.deepEqual(out.usage, { input: 10, output: 2 });
   assert.equal(typeof out.ms, 'number');
@@ -443,9 +444,11 @@ test('a token that cannot be made sends nothing, tries no other source and says 
     return json(answer(labelsText(['n001'])));
   };
   const out = await requestLabels({ prompt: 'P', label: LABEL, provideToken: run.provideToken, fetchImpl, sleep: noSleep });
-  assert.deepEqual({ ok: out.ok, error: out.error, transport: out.transport, content: out.content }, {
-    ok: false, error: 'the label token could not be made: 403 AccessDenied', transport: true, content: false,
+  assert.deepEqual({ ok: out.ok, error: out.error, transport: out.transport, content: out.content, sent: out.sent }, {
+    ok: false, error: 'the label token could not be made: 403 AccessDenied', transport: true, content: false, sent: false,
   });
+  const batch = await labelBatch({ notes: [note('n001')], persona: 'p', label: LABEL, provideToken: run.provideToken, fetchImpl, sleep: noSleep });
+  assert.deepEqual({ ok: batch.ok, requests: batch.requests, costUsd: batch.costUsd }, { ok: false, requests: 0, costUsd: 0 });
   // It counts as a batch that did not reach the model: two in a row stop the pass, and nothing is split.
   const batches = ['global', 'projects/p', 'projects/q'].map((scope) => ({
     scope, notes: [note('n001', { path: `${scope}/n001.md` }), note('n002', { path: `${scope}/n002.md` })],
@@ -454,6 +457,8 @@ test('a token that cannot be made sends nothing, tries no other source and says 
   assert.equal(requests, 0);
   assert.equal(asked.stop, 'failures');
   assert.equal(asked.failed, true);
+  // Nothing went to the model: no note counts as sent, no request as made.
+  assert.deepEqual([asked.sent, asked.requests, asked.spent], [0, 0, 0]);
   const why = 'the model call failed (the label token could not be made: 403 AccessDenied)';
   const stopped = 'not sent; 2 batches in a row failed';
   assert.deepEqual(Object.fromEntries(asked.left), {
@@ -461,7 +466,7 @@ test('a token that cannot be made sends nothing, tries no other source and says 
     'projects/q/n001.md': stopped, 'projects/q/n002.md': stopped,
   });
   // Only the block's source was asked, once for each request; no other source was made.
-  assert.deepEqual(aws.asked, ['instance', 'instance', 'instance']);
+  assert.deepEqual(aws.asked, ['instance', 'instance', 'instance', 'instance']);
   assert.deepEqual(madeNames(aws), ['fromInstanceMetadata']);
   assert.doesNotMatch(JSON.stringify([out, ...asked.left]), /arn:aws|123456789012|FAKE-STS-BODY|authorized/);
   // A failure that is not an AWS error says its name at most.
@@ -493,7 +498,10 @@ test('a token that cannot be made for a retry ends the request at once', async (
     prompt: 'P', label: LABEL, provideToken, sleep: noSleep, fetchImpl: async () => { requests += 1; return new Response('busy', { status: 503 }); },
   });
   assert.deepEqual([tokens, requests], [2, 1]);
-  assert.deepEqual({ error: out.error, transport: out.transport }, { error: 'the label token could not be made: CredentialsProviderError', transport: true });
+  // The first attempt was sent: the request counts as made.
+  assert.deepEqual({ error: out.error, transport: out.transport, sent: out.sent }, {
+    error: 'the label token could not be made: CredentialsProviderError', transport: true, sent: true,
+  });
 });
 
 test('an abort stops the wait for a token at once, and a token in time leaves no listener behind', async () => {

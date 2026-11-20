@@ -140,17 +140,21 @@ const batchesOf = (...scopes) => scopes.map((scope) => ({ scope, notes: [{ ...no
 const leftOf = (out) => Object.fromEntries(out.left);
 
 // A stand-in for the caller's labelBatch call: the calls whose number (from 1) is in `fails` fail
-// as an endpoint out of reach does, those in `rejected` as an HTTP 400 does (an answer, not about
-// the notes), those in `refused` and those holding a note of `bad` as a refusal does (an answer
-// about the notes); the others label every note `work`. An answer costs `cost`, a refusal 0.01,
-// and each call moves `clock` on by `step` ms.
-function fakeModel({ fails = [], rejected = [], refused = [], bad = [], cost = 0.25, clock = null, step = 0, onCall = () => {} } = {}) {
+// as an endpoint out of reach does, those in `noToken` as a call whose token could not be made
+// (nothing sent), those in `rejected` as an HTTP 400 does (an answer, not about the notes), those
+// in `refused` and those holding a note of `bad` as a refusal does (an answer about the notes);
+// the others label every note `work`. An answer costs `cost`, a refusal 0.01, and each call moves
+// `clock` on by `step` ms.
+function fakeModel({ fails = [], noToken = [], rejected = [], refused = [], bad = [], cost = 0.25, clock = null, step = 0, onCall = () => {} } = {}) {
   const calls = [];
   const labelBatch = async (notes) => {
     calls.push(notes.map((n) => n.path));
     if (clock) clock.ms += step;
     onCall(calls.length);
     if (fails.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 500', transport: true, content: false, costUsd: 0, requests: 1 };
+    if (noToken.includes(calls.length)) {
+      return { ok: false, error: 'the label token could not be made: 403 AccessDenied', transport: true, content: false, costUsd: 0, requests: 0 };
+    }
     if (rejected.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 400', transport: false, content: false, costUsd: 0, requests: 1 };
     if (refused.includes(calls.length) || notes.some((n) => bad.includes(n.path))) {
       return { ok: false, error: 'model refused', transport: false, content: true, costUsd: 0.01, requests: 1 };
@@ -193,6 +197,19 @@ test('sendBatches stops after two failed batches in a row', async () => {
     'projects/r/n.md': 'not sent; 2 batches in a row failed',
     'projects/s/n.md': 'not sent; 2 batches in a row failed',
   });
+});
+
+test('a batch whose token could not be made counts as neither sent nor requested, and toward the failure stop', async () => {
+  const model = fakeModel({ noToken: [1] });
+  const out = await run(batchesOf('global', 'projects/p', 'projects/q'), model);
+  assert.equal(out.stop, null);
+  assert.equal(out.failed, true);
+  assert.deepEqual([out.sent, out.requests], [2, 2]);
+  assert.deepEqual(leftOf(out), { 'global/n.md': 'the model call failed (the label token could not be made: 403 AccessDenied)' });
+  // Two in a row stop the pass, with nothing sent.
+  const none = await run(batchesOf('global', 'projects/p', 'projects/q'), fakeModel({ noToken: [1, 2] }));
+  assert.equal(none.stop, 'failures');
+  assert.deepEqual([none.sent, none.requests, none.spent], [0, 0, 0]);
 });
 
 test('sendBatches counts only the failures that did not reach the model toward the stop', async () => {
