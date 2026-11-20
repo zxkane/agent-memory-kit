@@ -49,7 +49,7 @@ const extractJson = (host, daysAgo, scope, extra = {}) => ({
   schemaVersion: 1, host, kind: 'extract', scope, date: day(daysAgo), endedAt: at(daysAgo), model: 'example-model', stopReason: 'completed', costUsd: 0.25, turns: 4,
   denials: 0, repaired: 0, conversation: { truncated: false, bytes: 900, sessionsLeftOut: 0 }, folders: [],
   retention: { termsKept: 1, termsBefore: 1, share: 1 }, counts: { added: 1, changed: 1, retired: 0, notApplied: 0 },
-  changes: [{ kind: 'add', path: 'n.md' }, { kind: 'change', path: 'MEMORY.md' }], ...extra,
+  changes: [{ kind: 'add', path: `projects/${scope}/n.md` }, { kind: 'change', path: `projects/${scope}/MEMORY.md` }], ...extra,
 });
 
 // A clone, a state folder and a configuration as a consolidation machine has them, with reports
@@ -150,7 +150,7 @@ test('consolidate report gathers the reports of every machine, this machine\'s r
   const twin = `${day(1)}-alpha-extract-example-project.json`;
   assert.deepEqual(report.reports[2], { file: `_reports/${twin}`, source: 'json', ...JSON.parse(readFileSync(join(f.repo, '_reports', twin), 'utf8')) });
   assert.deepEqual([report.reports[0].counts, report.reports[0].costUsd, report.reports[0].changes], [
-    { added: 0, changed: 0, retired: 1, notApplied: 0 }, 0.5, [{ kind: 'retire', path: 'old.md', target: 'n0.md' }],
+    { added: 0, changed: 0, retired: 1, notApplied: 0 }, 0.5, [{ kind: 'retire', path: 'projects/big/old.md', target: 'projects/big/n0.md' }],
   ]);
   // Runs: this machine's, of the window, in the order they ended.
   assert.deepEqual(report.runs.map((r) => r.runId), ['run-2', 'run-1', 'run-0.5']);

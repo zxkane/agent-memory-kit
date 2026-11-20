@@ -224,12 +224,13 @@ test('reportData gives the figures of the report as JSON, without a description 
     ],
     retention: { termsKept: 37, termsBefore: 40, share: 0.925 },
     counts: { added: 1, changed: 3, retired: 1, notApplied: 2 },
+    // Paths relative to the clone.
     changes: [
       { kind: 'add', path: 'global/new.md' },
-      { kind: 'change', path: 'MEMORY.md' },
-      { kind: 'change', path: 'a.md' },
+      { kind: 'change', path: 'projects/example-project/MEMORY.md' },
+      { kind: 'change', path: 'projects/example-project/a.md' },
       { kind: 'change', path: 'global/MEMORY.md' },
-      { kind: 'retire', path: 'b.md', target: 'a.md' },
+      { kind: 'retire', path: 'projects/example-project/b.md', target: 'projects/example-project/a.md' },
     ],
   });
   assert.doesNotMatch(JSON.stringify(data), /A new global note/);
@@ -238,21 +239,52 @@ test('reportData gives the figures of the report as JSON, without a description 
   assert.deepEqual(extract.conversation, { truncated: true, bytes: 10000, sessionsLeftOut: 3 });
   assert.deepEqual([extract.costUsd, extract.turns, extract.denials, extract.scope], [null, null, null, 'p q']);
   assert.deepEqual(extract.counts, { added: 1, changed: 1, retired: 0, notApplied: 3 });
+  assert.deepEqual(extract.changes, [{ kind: 'add', path: 'projects/p q/port.md' }, { kind: 'change', path: 'projects/p q/MEMORY.md' }]);
   assert.deepEqual(reportData(CASES.nothing).folders.map((f) => [f.folder, f.changed]), [['projects/p', false], ['global', false]]);
   assert.deepEqual(reportData(CASES.globalWithheld).folders.map((f) => f.folder), ['global']);
-  // A name that looks like a credential is withheld as in the report.
+  // A name that looks like a credential is withheld as in the report: no path, its folder, and a mark.
   const withheld = reportData(CASES.globalWithheld);
-  assert.deepEqual(withheld.changes.filter((c) => c.kind === 'retire'), [{ kind: 'retire', path: '(file name withheld)', target: 'keys.md' }]);
-  assert.ok(!JSON.stringify(withheld).includes(`"${KEY}.md"`));
+  assert.deepEqual(withheld.changes, [
+    { kind: 'add', path: 'global/keys.md' },
+    { kind: 'add', path: `global/x${KEY}.md` },
+    { kind: 'retire', path: null, folder: 'global', withheld: true, target: 'global/keys.md' },
+  ]);
+  assert.ok(!JSON.stringify(withheld).includes(`/${KEY}.md`));
+  // The same for the note a retirement goes to.
+  const into = reportData(WITHHELD_TARGET);
+  assert.deepEqual(into.changes, [
+    { kind: 'retire', path: null, folder: 'projects/p', withheld: true, target: null, targetFolder: 'projects/p', targetWithheld: true },
+    { kind: 'retire', path: 'projects/p/a.md', target: null, targetFolder: 'global', targetWithheld: true },
+  ]);
+  assert.ok(!JSON.stringify(into).includes(KEY) && !JSON.stringify(into).includes(KEY2));
 });
 
-// What the Markdown of a report holds of its JSON: the cost in cents, no size of a complete
-// conversation, and the folders it shows (its own, and global/ when the run changed it), with
-// note sizes only for a folder the run changed.
+// A project run whose retirements name withheld notes, as targets and as retired notes.
+const KEY2 = ['ASIA', 'Q3JZ7XK2M4N8P6R2'].join('');
+const WITHHELD_TARGET = {
+  ...CASES.onlyGlobal, scope: 'p',
+  snap: { notes: { 'a.md': 'h1', [`${KEY}.md`]: 'h2' }, global: {} },
+  ev: {
+    ...CASES.onlyGlobal.ev, ignored: [], ignoredEntries: {},
+    changes: [
+      { label: 'notes', file: 'a.md', kind: 'retire', target: { label: 'global', file: `${KEY}.md` } },
+      { label: 'notes', file: `${KEY}.md`, kind: 'retire', target: { label: 'notes', file: `${KEY2}.md` } },
+    ],
+  },
+};
+
+// What the Markdown of a report holds of its JSON: the cost in cents, no time, no size of a
+// complete conversation, the folders it shows (its own, and global/ when the run changed it) with
+// note sizes only for a folder the run changed, and of a withheld name the folder only when the run
+// has one folder.
 function markdownView(data) {
   const own = data.folders[0].folder;
+  const single = data.kind === 'extract' || data.scope === 'global';
   return {
     ...data,
+    changes: data.changes.map((c) => ({
+      ...c, ...(c.withheld ? { folder: single ? c.folder : null } : {}), ...(c.targetWithheld ? { targetFolder: single ? c.targetFolder : null } : {}),
+    })),
     endedAt: null,
     costUsd: data.costUsd === null ? null : Number(data.costUsd.toFixed(2)),
     conversation: data.conversation && { ...data.conversation, bytes: data.conversation.truncated ? data.conversation.bytes : null },
@@ -262,7 +294,7 @@ function markdownView(data) {
 }
 
 test('parseReport reads back from the Markdown what buildReport wrote', () => {
-  for (const [name, c] of Object.entries(CASES)) assert.deepEqual(parseReport(buildReport(c)), markdownView(reportData(c)), name);
+  for (const [name, c] of Object.entries({ ...CASES, WITHHELD_TARGET })) assert.deepEqual(parseReport(buildReport(c)), markdownView(reportData(c)), name);
   // A long cost and every share of terms survive as the report shows them.
   const c = { ...CASES.onlyGlobal, costUsd: 0.123456, ev: { ...CASES.onlyGlobal.ev, stats: { ...CASES.onlyGlobal.ev.stats, retention: { termsBefore: 7, termsKept: 2, share: 2 / 7 } } } };
   const back = parseReport(buildReport(c));

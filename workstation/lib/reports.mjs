@@ -21,9 +21,12 @@ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 // An amount in USD as every line of the kit shows it: two decimals, or `unknown`.
 export const usd = (value) => `USD ${value === null || value === undefined ? 'unknown' : value.toFixed(2)}`;
 
+// What output and reports show instead of a name that looks like a credential.
+export const WITHHELD = '(file name withheld)';
+
 // A name shown in output or in a report; one that looks like a credential is not shown.
 export function shown(text) {
-  return scanText(String(text)).length > 0 ? '(file name withheld)' : String(text);
+  return scanText(String(text)).length > 0 ? WITHHELD : String(text);
 }
 
 // `<label>/<file>` (as evaluate names it) shown relative to the scope: global/ keeps its prefix.
@@ -112,20 +115,28 @@ export function labelReportHead({ date, host, model, requests, costUsd, touched,
 const folderOf = (scope, label) => (label === GLOBAL ? GLOBAL : scopeFolder(scope));
 
 // The JSON twin of buildReport's report, from the same figures, and `endedAt`, when the scope's run
-// ended (the apply step's time; `date` is its day). A change is `{ kind, path }`, a
-// retirement also with `target`; kinds are `add`, `change` and `retire`, in the report's order. A
-// path is as the report shows it: relative to the scope's folder, `global/<note>` for a note of
-// global/ in a project run, `(file name withheld)` for a name that looks like a credential. Every
-// folder of the run is listed, also one it did not change (`changed: false`). No description and
-// no text of a note.
+// ended (the apply step's time; `date` is its day). A change is `{ kind, path }`, a retirement also
+// with `target`; kinds are `add`, `change` and `retire`, in the report's order. A path is relative
+// to the clone (`global/<note>`, `projects/<name>/<note>`). A name that the report withholds (it
+// looks like a credential) has no path: `{ kind, path: null, folder, withheld: true }`, and a
+// withheld target is `target: null` with `targetFolder` and `targetWithheld: true`. Every folder of
+// the run is listed, also one it did not change (`changed: false`). No description and no text of a
+// note.
 export function reportData({ config, kind, scope, date, endedAt, model, stopReason, costUsd, turns, denials, pairs, ev, conversation, repaired = 0 }) {
   const labels = pairs.map((p) => p.label);
   const order = (c) => `${labels.indexOf(c.label)}\u0000${c.file}`;
   const sorted = [...ev.changes].sort((x, y) => byName(order(x), order(y)));
-  const where = (label, file) => shown(display(label, file));
-  const changes = ['add', 'change', 'retire'].flatMap((k) => sorted.filter((c) => c.kind === k)).map((c) => (c.kind === 'retire'
-    ? { kind: c.kind, path: where(c.label, c.file), target: where(c.target.label, c.target.file) }
-    : { kind: c.kind, path: where(c.label, c.file) }));
+  // The report's decision, so that the twin withholds exactly the names the report does.
+  const where = (label, file) => {
+    const text = display(label, file);
+    return shown(text) === text ? { path: `${folderOf(scope, label)}/${file}` } : { path: null, folder: folderOf(scope, label), withheld: true };
+  };
+  const changes = ['add', 'change', 'retire'].flatMap((k) => sorted.filter((c) => c.kind === k)).map((c) => {
+    const entry = { kind: c.kind, ...where(c.label, c.file) };
+    if (c.kind !== 'retire') return entry;
+    const t = where(c.target.label, c.target.file);
+    return { ...entry, ...(t.withheld ? { target: null, targetFolder: t.folder, targetWithheld: true } : { target: t.path }) };
+  });
   const ofKind = (k) => changes.filter((c) => c.kind === k).length;
   const notNotes = labels.reduce((n, l) => n + (ev.ignoredEntries?.[l] > 0 ? ev.ignoredEntries[l] : 0), 0);
   const r = ev.stats.retention;
@@ -249,8 +260,9 @@ const known = (text) => (text === 'unknown' ? null : Number(text));
 // The fields of a report's JSON twin, read from its Markdown: of an Extract or Organize report its
 // head and its lists, of a label report its head. What the Markdown does not hold is null: the cost
 // beyond cents, the size of a complete conversation, the note sizes of a folder the run did not
-// change, when the run ended, and of a label report its stop and what label-apply did; a folder
-// the report does not show is not listed. Null when the text is not such a report.
+// change, when the run ended, the folder of a withheld name in a run with two folders, and of a
+// label report its stop and what label-apply did; a folder the report does not show is not listed.
+// Null when the text is not such a report.
 export function parseReport(text) {
   const lines = String(text).split('\n');
   if (lines.at(-1) === '') lines.pop();
@@ -342,5 +354,19 @@ function parseScopeReport(lines, [, title, scope, date, host]) {
     }
   }
   for (const c of report.changes) report.counts[{ add: 'added', change: 'changed', retire: 'retired' }[c.kind]] += 1;
+  // The report's notation, relative to the scope's folder, as the twin's, relative to the clone. A
+  // withheld name keeps its folder only when the run had one folder: Extract, or Organize of global/.
+  const own = folderOf(scope, 'notes');
+  const single = report.kind === 'extract' || scope === GLOBAL;
+  const where = (text) => {
+    if (text === WITHHELD) return { path: null, folder: single ? own : null, withheld: true };
+    return { path: text.startsWith(`${GLOBAL}/`) ? text : `${own}/${text}` };
+  };
+  report.changes = report.changes.map((c) => {
+    const entry = { kind: c.kind, ...where(c.path) };
+    if (c.kind !== 'retire') return entry;
+    const t = where(c.target);
+    return { ...entry, ...(t.withheld ? { target: null, targetFolder: t.folder, targetWithheld: true } : { target: t.path }) };
+  });
   return report;
 }

@@ -222,7 +222,10 @@ test('organize merges a duplicate, commits it with a report and records the stat
     schemaVersion: 1, host: 'alpha', kind: 'organize', scope: 'p', date: today(), endedAt: json.endedAt, model: 'test-model', stopReason: 'completed',
     costUsd: 0.25, turns: 4, denials: 0, repaired: 0, conversation: null, folders: undefined, retention: undefined,
     counts: { added: 0, changed: 2, retired: 1, notApplied: 0 },
-    changes: [{ kind: 'change', path: 'MEMORY.md' }, { kind: 'change', path: 'a.md' }, { kind: 'retire', path: 'b.md', target: 'a.md' }],
+    changes: [
+      { kind: 'change', path: 'projects/p/MEMORY.md' }, { kind: 'change', path: 'projects/p/a.md' },
+      { kind: 'retire', path: 'projects/p/b.md', target: 'projects/p/a.md' },
+    ],
   });
   assert.deepEqual(json.folders.map((x) => [x.folder, x.changed, x.indexBefore.lines, x.indexAfter.lines]), [['projects/p', true, 2, 1], ['global', false, 0, 0]]);
   assert.equal(json.retention.share, 1);
@@ -841,7 +844,7 @@ test('extract feeds the digest to the model, applies an added note and never sto
   assert.match(text, /^## Not applied\n- a\.md: .+$/m);
   const json = f.reportJson(`${today()}-alpha-extract-p.json`);
   assert.deepEqual([json.kind, json.counts, json.changes], ['extract', { added: 1, changed: 1, retired: 0, notApplied: 1 },
-    [{ kind: 'add', path: 'port.md' }, { kind: 'change', path: 'MEMORY.md' }]]);
+    [{ kind: 'add', path: 'projects/p/port.md' }, { kind: 'change', path: 'projects/p/MEMORY.md' }]]);
   assert.doesNotMatch(JSON.stringify(json), /Staging port/);
 
   const phrase = new RegExp(SESSION_PHRASE);
