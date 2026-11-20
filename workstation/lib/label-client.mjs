@@ -311,11 +311,13 @@ const temporaryOnly = (provider) => async (...args) => {
 };
 
 // The credentials that sign the label tokens, as the official providers give them: the instance
-// metadata service, or the environment's temporary credentials, exchanged for the role's (a
-// session as long as a token lasts, in the block's region) when the block names one. One source,
-// never another one after it.
+// metadata service (IMDSv2 only, as the kit's own client: never a fallback to IMDSv1), or the
+// environment's temporary credentials, exchanged for the role's (a session as long as a token
+// lasts, in the block's region) when the block names one. One source, never another one after it.
 function labelCredentials(label, aws) {
-  const base = label.credentials === 'environment' ? temporaryOnly(aws.fromEnv()) : aws.fromInstanceMetadata();
+  const base = label.credentials === 'environment'
+    ? temporaryOnly(aws.fromEnv())
+    : aws.fromInstanceMetadata({ ec2MetadataV1Disabled: true });
   if (!label.roleArn) return base;
   return aws.fromTemporaryCredentials({
     params: { RoleArn: label.roleArn, RoleSessionName: 'agent-memory-label', DurationSeconds: TOKEN_LIFETIME_SECONDS },

@@ -312,7 +312,7 @@ test('a label block that signs gets one provider of the official token generator
   let run = await tokenForRun({ ...LABEL, credentials: 'instance' }, { deps: aws.deps });
   assert.equal(run.tokenAt, null);
   assert.deepEqual(madeNames(aws), ['fromInstanceMetadata', 'getTokenProvider']);
-  assert.deepEqual(aws.made[0][1], []);
+  assert.deepEqual(aws.made[0][1], { ec2MetadataV1Disabled: true });
   let config = generatorConfig(aws);
   assert.deepEqual(Object.keys(config).sort(), ['credentials', 'expiresInSeconds', 'region']);
   assert.deepEqual([config.region, config.expiresInSeconds, config.credentials], ['us-east-1', 3600, aws.made[0][2]]);
@@ -346,6 +346,19 @@ test('a label block that signs gets one provider of the official token generator
     assert.deepEqual(aws.asked, [credentials]);
     config = generatorConfig(aws);
     assert.deepEqual([config.region, config.expiresInSeconds, config.credentials], ['us-east-1', 3600, roleCredentials]);
+  }
+});
+
+test('the instance metadata service is asked through IMDSv2 only, also for a role\'s master', async () => {
+  // As the kit's own client was: no fallback to IMDSv1 when the session token cannot be had.
+  for (const roleArn of [null, ROLE]) {
+    const aws = fakeAws();
+    await tokenForRun({ ...LABEL, credentials: 'instance', roleArn }, { deps: aws.deps });
+    const [name, options, instanceCredentials] = aws.made[0];
+    assert.equal(name, 'fromInstanceMetadata', String(roleArn));
+    assert.deepEqual(options, { ec2MetadataV1Disabled: true }, String(roleArn));
+    const signing = roleArn === null ? generatorConfig(aws).credentials : aws.made[1][1].masterCredentials;
+    assert.equal(signing, instanceCredentials, String(roleArn));
   }
 });
 
