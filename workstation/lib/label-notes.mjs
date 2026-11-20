@@ -1,6 +1,7 @@
-// The label step in the notes clone: the notes of a scope folder as the step lists them, and
-// writing their labels. File-system logic only; no Git and no model. A note file that is a link is
-// never read, and labels are written only into real folders, never through a link.
+// The label step in the notes clone: the notes of a scope folder as the step lists them, writing
+// their labels, and the folder digests around those writes. File-system logic only; no Git and no
+// model. A note file that is a link is never read, and labels are written only into real folders,
+// never through a link.
 
 import { createHash } from 'node:crypto';
 import { lstatSync } from 'node:fs';
@@ -53,6 +54,33 @@ export function labelEntryProblem(entry) {
   if (!LABELS.includes(entry.label)) return 'the label is not work, personal or general';
   if (typeof entry.sha256 !== 'string' || !HASH_RE.test(entry.sha256)) return 'sha256 is not 64 hexadecimal characters';
   return null;
+}
+
+// The SHA-256 of each regular note file of a folder (name to digest), sorted by name: the inputs of
+// folderDigest in consolidate.mjs.
+export function fileDigests(dir) {
+  return new Map([...noteFiles(dir)].map(([name, buf]) => [name, sha256(buf)]));
+}
+
+// A folder's digest from its file digests, as folderDigest computes it from the folder: SHA-256 over
+// the `name:hash` lines, sorted by name.
+export function digestOfFiles(files) {
+  return sha256([...files.keys()].sort().map((name) => `${name}:${files.get(name)}`).join('\n'));
+}
+
+// A scope folder's digest after label-apply wrote into it: `before` (its file digests right before
+// the writes) with each written note going from the digest it was written over (`from`) to the one
+// written (`to`), when `actual` (its folderDigest now) is exactly that; null otherwise. Sessions
+// write notes without the sync lock: a change of theirs meanwhile, also to a written note before
+// its write, is not a label, and the scope must stay due for Organize.
+export function digestAfterLabels(before, writes, actual) {
+  const expected = new Map(before);
+  for (const { file, from, to } of writes) {
+    if (expected.get(file) !== from) return null;
+    expected.set(file, to);
+  }
+  const digest = digestOfFiles(expected);
+  return digest === actual ? digest : null;
 }
 
 // `<repoDir>/<folders...>` when each of those folders is a real folder (never a link); null otherwise.

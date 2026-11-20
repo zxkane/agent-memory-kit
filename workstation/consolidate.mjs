@@ -19,7 +19,9 @@ import {
 } from './lib/agent-scopes.mjs';
 import { AwsError } from './lib/aws.mjs';
 import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
-import { applyLabelEntries, collectScopeNotes, labelEntryProblem } from './lib/label-notes.mjs';
+import {
+  applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, labelEntryProblem,
+} from './lib/label-notes.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
@@ -563,7 +565,9 @@ function labelReportText(report, skipped) {
 // report }`, whose SHA-256 the driver gives) and commits them with the report. The plan is checked
 // whole before anything else: one that is not well formed is rejected and nothing is written.
 // `digests` holds, for each scope the entries name, its digest after the first sync (`before`, right
-// before writing) and right after writing (`after`). `sync` is the last sync the step ran.
+// before writing) and right after writing (`after`); `after` is null when anything but this step's
+// writes changed in the folder in between, so that the scope stays due for Organize. `sync` is the
+// last sync the step ran.
 function stepLabelApply(config, rest) {
   const a = parseStepArgs(rest, ['--work', '--plan-sha256']);
   const work = checkWork(config, a['--work']);
@@ -594,8 +598,8 @@ function stepLabelApply(config, rest) {
     return;
   }
   const scopes = [...new Set(plan.entries.map((e) => scopeOfPath(e.path)))]
-    .map((name) => ({ name, dir: liveFolder(config, name) })).filter((s) => s.dir);
-  const before = scopes.map((s) => folderDigest(s.dir));
+    .map((name) => ({ name, dir: liveFolder(config, name) })).filter((s) => s.dir)
+    .map((s) => ({ ...s, before: fileDigests(s.dir) }));
   let applied;
   try {
     applied = applyLabelEntries(config.repoDir, plan.entries);
@@ -606,7 +610,13 @@ function stepLabelApply(config, rest) {
     out({ outcome: 'apply-interrupted', reason: firstLine(err), ...none, ...err.result, sync: preSync });
     return;
   }
-  const digests = Object.fromEntries(scopes.map((s, i) => [s.name, { before: before[i], after: folderDigest(s.dir) }]));
+  // Each written note goes from the digest it was read with (the entry's) to the one written.
+  const readAs = new Map(plan.entries.map((e) => [e.path, e.sha256]));
+  const writesIn = (name) => applied.written.filter((w) => scopeOfPath(w.path) === name)
+    .map((w) => ({ file: w.path.slice(w.path.lastIndexOf('/') + 1), from: readAs.get(w.path), to: w.sha256 }));
+  const digests = Object.fromEntries(scopes.map((s) => [s.name, {
+    before: digestOfFiles(s.before), after: digestAfterLabels(s.before, writesIn(s.name), folderDigest(s.dir)),
+  }]));
   const { written, unchanged, skipped } = applied;
   if (written.length === 0) {
     out({ outcome: 'no-change', ...none, unchanged, skipped, digests, sync: preSync });
