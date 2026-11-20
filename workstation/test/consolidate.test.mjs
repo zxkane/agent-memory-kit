@@ -2413,6 +2413,20 @@ test('a run that crashes adds its line too, with a fixed word for the failure', 
   assert.doesNotMatch(JSON.stringify(line), /EEXIST|ENOTDIR|not a folder/);
 });
 
+test('the JSON twin is written before its report: when the twin cannot be written, the report is not either', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  // A folder where today's twin would go: the twin cannot be written there.
+  f.seed({ [`_reports/${today()}-alpha-organize-p.json/x`]: 'not a twin\n' });
+  f.instruct(mergeInstruction());
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied, 3 change\(s\)/m);
+  assert.match(r.stdout, new RegExp(`^ {2}- the report could not be written: _reports/${today()}-alpha-organize-p\\.json is not a regular file$`, 'm'));
+  // No report without its twin, so that no twin of an earlier run of the day is paired with a new report.
+  assert.equal(existsSync(join(f.repo, `_reports/${today()}-alpha-organize-p.md`)), false);
+});
+
 test('a run log that cannot be written leaves the run and its exit code as they were, and says so', (t) => {
   const f = fixture(t);
   duplicateProject(f);
@@ -2621,6 +2635,18 @@ test('label-apply names a note it cannot edit', (t) => {
   const json = f.reportJson(`${today()}-alpha-label.json`);
   assert.deepEqual([json.written, json.notWritten, json.scopes[0].left, json.scopes[0].leftReasons], [1, 1, 1, { frontmatter: 1 }]);
   assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (3 file(s))');
+});
+
+test('label-apply writes the twin before the report: when the twin cannot be written, the report is not either', (t) => {
+  const f = fixture(t);
+  f.seed({ [`_reports/${today()}-alpha-label.json/x`]: 'not a twin\n', 'projects/p/b.md': note('b', 'B', 'Beta.') });
+  const { work, notes } = labelRead(f);
+  const r = labelApply(f, work, writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.result.outcome, 'applied');
+  assert.equal(r.result.reportError, `_reports/${today()}-alpha-label.json is not a regular file`);
+  assert.equal(existsSync(join(f.repo, `_reports/${today()}-alpha-label.md`)), false);
+  assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
 });
 
 test('label-apply commits the labels when the report cannot be written', (t) => {

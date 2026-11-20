@@ -362,9 +362,11 @@ function stepApply(config, rest) {
   const digest = folderDigest(pairs[0].liveDir);
   let reportError = null;
   try {
+    // The twin first: when it cannot be written, neither is the report, so that no twin of an
+    // earlier run of the day stays paired with a new report.
     const name = `${date}-${config.host}-${kind}-${scope}`;
-    writeReport(config, `${name}.md`, report());
     writeReport(config, `${name}.json`, jsonText(reportData(reportArgs)));
+    writeReport(config, `${name}.md`, report());
     if (kind === 'organize') pruneReports(config, now);
   } catch (err) {
     reportError = errorText(err);
@@ -496,10 +498,11 @@ function stepLabelApply(config, rest) {
   }
   let reportError = null;
   try {
+    // The twin first, as in the apply step.
     const date = new Date().toISOString().slice(0, 10);
-    writeReport(config, `${date}-${config.host}-label.md`, labelReportText(plan.report, skipped));
     const twin = labelReportData({ host: config.host, date, data: plan.data, written, unchanged, skipped });
     writeReport(config, `${date}-${config.host}-label.json`, jsonText(twin));
+    writeReport(config, `${date}-${config.host}-label.md`, labelReportText(plan.report, skipped));
   } catch (err) {
     reportError = errorText(err);
   }
