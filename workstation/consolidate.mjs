@@ -15,6 +15,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { labelAgentScopes } from './lib/agent-labels.mjs';
 import {
   AGENT_RE, AgentScopeError, agentScopeProblems, agentScopesS3, applyAgentScope, copyAgentScope, listAgentScopes,
   noteCount, readOrganizerState, recordOrganizerState, repairAgentEntries, scopeDigest,
@@ -53,7 +54,7 @@ const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
-const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>]';
+const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run]';
 const CONFLICT_RE = /\.conflict-[^/]*\.md$/;
 const REPORT_RE = /^(\d{4}-\d\d-\d\d)-.+\.md$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -718,8 +719,10 @@ function parseDriverArgs(argv) {
   // --all (a full relabel) belongs to label, --min-retention to Extract and Organize.
   if (opts.all && kind !== 'label') return null;
   if (kind === 'label' && opts.minRetention !== undefined) return null;
-  // The agent scopes are organized only, and never together with the clone's scopes.
-  if (opts.agents && (kind !== 'organize' || opts.projects.length > 0)) return null;
+  // The agent scopes are organized and labeled, never together with the clone's scopes. Their
+  // label pass keeps no work folder and labels with the label block's model.
+  if (opts.agents && (kind === 'extract' || opts.projects.length > 0)) return null;
+  if (opts.agents && kind === 'label' && (opts.keep || opts.model !== undefined)) return null;
   return opts;
 }
 
@@ -1270,12 +1273,7 @@ async function agentsMain({ config, opts, model, started }) {
     process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${awsText(err)})\n`);
     return 1;
   }
-  for (const name of opts.agentNames) {
-    if (!scopes.has(name)) {
-      process.stderr.write(`agent-memory consolidate: ${JSON.stringify(name)} is not an agent scope of the bucket.\n${USAGE}\n`);
-      return 2;
-    }
-  }
+  if (unknownAgent(scopes, opts)) return 2;
   const list = agentScopesDue(scopes, state, opts);
   const limit = opts.agentNames.length > 0 ? Infinity : c.maxProjects;
   const ceiling = (opts.agentNames.length > 0 ? opts.agentNames.length : c.maxProjects) * c.maxBudgetUsd;
@@ -1330,12 +1328,82 @@ async function agentsMain({ config, opts, model, started }) {
   } finally {
     if (runDir && !opts.keep) removeTree(runDir);
   }
+  // Every run that was not interrupted ends with the label pass over the agent scopes (the named
+  // ones, or every one), whatever Organize did. A failed pass fails the run.
+  if (!(await signalsHandled())) {
+    if (list.length === 0) process.stdout.write('organize: nothing to do\n');
+    if (c.label && (await agentLabelPass({ config, opts, s3For, started })).failed) failed = true;
+  }
   if (await signalsHandled()) {
     process.stdout.write(`organize: interrupted by ${interrupted}; nothing more was applied\n`);
     return SIGNAL_CODES[interrupted];
   }
-  if (list.length === 0) process.stdout.write('organize: nothing to do\n');
   return failed ? 1 : 0;
+}
+
+// An agent named with --agent that has no scope in the bucket: a usage error, said so.
+function unknownAgent(scopes, opts) {
+  const name = opts.agentNames.find((agent) => !scopes.has(agent));
+  if (name === undefined) return false;
+  process.stderr.write(`agent-memory consolidate: ${JSON.stringify(name)} is not an agent scope of the bucket.\n${USAGE}\n`);
+  return true;
+}
+
+// The label pass over the agent scopes, with the S3 clients of the agent-scope organizer (`s3For`)
+// and the label block's model and token, which only the label requests get: never the model
+// client of Organize. Without a notes clone (a GitHub Actions job) the label block must name both
+// input files. Prints the pass's lines; `failed` as labelAgentScopes says, or for missing inputs.
+async function agentLabelPass({ config, opts, s3For, started }) {
+  const label = config.consolidate.label;
+  let inputs;
+  if (cloneProblem(config) !== null && (label.domainsFile === null || label.personaFile === null)) {
+    inputs = { problem: label.domainsFile === null ? 'label.domainsFile' : 'label.personaFile' };
+  } else {
+    inputs = labelInputs(config);
+  }
+  if (inputs.problem) {
+    process.stdout.write(`label: the label inputs are missing or invalid (${inputs.problem}); no label was written.\n`);
+    return { failed: true };
+  }
+  const pass = await labelAgentScopes({
+    config, opts, s3: s3For, started, domains: inputs.domains, persona: inputs.persona,
+    token: () => tokenForRun(label), labelBatch, signal: abort.signal,
+  });
+  if (pass.lines.length > 0) process.stdout.write(`${pass.lines.join('\n')}\n`);
+  return pass;
+}
+
+// `run.sh consolidate label --agents`: the label pass over the agent scopes on its own.
+async function labelAgentsMain({ config, opts, started }) {
+  const c = config.consolidate;
+  if (!c.label) {
+    process.stdout.write(`agent-memory: labeling needs "label" in the consolidate block of ${configPath()}; nothing was run.\n`);
+    return 1;
+  }
+  if (!c.agents) {
+    process.stdout.write(`agent-memory: labeling the agent scopes needs "agents" in the consolidate block of ${configPath()}; nothing was run.\n`);
+    return 1;
+  }
+  const s3For = agentScopesS3(c.agents);
+  let pass = { failed: false };
+  if (opts.agentNames.length > 0) {
+    let scopes = null;
+    try {
+      scopes = await listAgentScopes(await s3For({ signal: abort.signal }));
+    } catch (err) {
+      if (!(await signalsHandled())) {
+        process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${awsText(err)})\n`);
+        return 1;
+      }
+    }
+    if (scopes !== null && unknownAgent(scopes, opts)) return 2;
+  }
+  if (!(await signalsHandled())) pass = await agentLabelPass({ config, opts, s3For, started });
+  if (await signalsHandled()) {
+    process.stdout.write(`label: interrupted by ${interrupted}; nothing more was applied\n`);
+    return SIGNAL_CODES[interrupted];
+  }
+  return pass.failed ? 1 : 0;
 }
 
 // The figures of a first run and its repair run together: costs, turns and denials summed (unknown
@@ -1478,6 +1546,16 @@ function labelRecordOf(state) {
 
 const notesFolderOf = (path) => path.slice(0, path.lastIndexOf('/'));
 
+// The two label inputs, read and checked: the files the label block names, else those under
+// .agent-memory/ in the notes clone.
+function labelInputs(config) {
+  const label = config.consolidate.label;
+  return readLabelInputs({
+    domainsFile: label.domainsFile ?? join(config.repoDir, '.agent-memory', 'domains.json'),
+    personaFile: label.personaFile ?? join(config.repoDir, '.agent-memory', 'persona.md'),
+  });
+}
+
 // The label pass over the clone's scopes: `scopes` names some (`global` or project folders), none
 // means every scope. It reads the notes (label-read), sends the touched ones to the label model in
 // batches until it has sent them all or must stop (askLabelModel: the cost ceiling maxBudgetUsd,
@@ -1491,10 +1569,7 @@ async function labelPass({ config, opts, state, scopes, runFolder }) {
   // In an Organize run --model names the Organize model; in a label run, the label model.
   const label = { ...c.label, model: opts.kind === 'label' ? opts.model ?? c.label.model : c.label.model };
   const say = (line) => process.stdout.write(`${line}\n`);
-  const inputs = readLabelInputs({
-    domainsFile: c.label.domainsFile ?? join(config.repoDir, '.agent-memory', 'domains.json'),
-    personaFile: c.label.personaFile ?? join(config.repoDir, '.agent-memory', 'persona.md'),
-  });
+  const inputs = labelInputs(config);
   if (inputs.problem) {
     say(`label: the label inputs are missing or invalid (${inputs.problem}); no label was written.`);
     return { failed: true };
@@ -1706,6 +1781,7 @@ async function driverMain(argv) {
   const started = new Date();
   const now = started.getTime();
   removeStaleRuns(config, now);
+  if (opts.agents && opts.kind === 'label') return labelAgentsMain({ config, opts, started });
   if (opts.agents) return agentsMain({ config, opts, model, started });
   if (opts.kind === 'label') return labelMain({ config, opts, started });
   if (opts.kind === 'extract' && config.codexDir === null) {

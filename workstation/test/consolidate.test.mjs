@@ -3149,13 +3149,13 @@ test('a signal during the label model call writes nothing', async (t) => {
 test('label: usage errors, and a named project without a folder', (t) => {
   const f = labelFixture(t);
   const cases = [
-    ['organize', '--all'], ['extract', '--all'], ['label', '--min-retention', '0.5'], ['label', '--agents'],
-    ['label', '--agent', 'example-agent'], ['label', '--project'], ['label', '--project', '../p'], ['label', '--model', '-x'],
+    ['organize', '--all'], ['extract', '--all'], ['label', '--min-retention', '0.5'], ['label', '--agents', '--project', 'p'],
+    ['label', '--agent', 'example-agent', '--keep'], ['label', '--project'], ['label', '--project', '../p'], ['label', '--model', '-x'],
   ];
   for (const args of cases) {
     const r = f.runWith(f.labelEnv, ...args);
     assert.equal(r.status, 2, args.join(' '));
-    assert.match(r.stderr, /^usage: .*\| label \[--project <name>\]\.\.\. \[--all\] \[--dry-run\] \[--keep\] \[--model <id>\]$/m, args.join(' '));
+    assert.match(r.stderr, /^usage: .*\| label \[--project <name>\]\.\.\. \[--all\] \[--dry-run\] \[--keep\] \[--model <id>\] \| label --agents \[--agent <name>\]\.\.\. \[--all\] \[--dry-run\]$/m, args.join(' '));
   }
   const r = f.label('--project', 'gone');
   assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -3181,4 +3181,209 @@ test('failed answers do not stop the pass', (t) => {
   assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/q/b.md', 'projects/r/c.md']);
   assert.match(r.stdout, /^- global\/g\.md: the model call failed \(Mantle Responses HTTP 400\)$/m);
   assert.doesNotMatch(r.stdout + r.stderr, /FAKE-MANTLE-BODY/);
+});
+
+// ---- The label pass over the agent scopes: label --agents, and the end of every organize --agents run ----
+
+// The agent scopes' bucket (fake-s3-preload.mjs) and a label block, with the fake Mantle
+// (fake-mantle-preload.mjs) in front of the same run's fetch. The label inputs are in the clone;
+// `writeConfig` can name them in the label block instead, and leave the run without a clone, as in
+// a GitHub Actions job.
+function agentLabelFixture(t, { label = LABEL_BLOCK, domains = NO_EXCEPTIONS, block = AGENTS_BLOCK } = {}) {
+  const f = agentsFixture(t, { block, consolidate: label === null ? {} : { label } });
+  const mantleFile = join(f.tmp, 'mantle.json');
+  const mantleLog = join(f.tmp, 'mantle.jsonl');
+  writeFileSync(mantleFile, JSON.stringify({ labels: {} }));
+  f.seed({ '.agent-memory/domains.json': `${JSON.stringify(domains)}\n`, '.agent-memory/persona.md': PERSONA });
+  const env = {
+    ...f.awsEnv,
+    NODE_OPTIONS: `--import ${join(PKG, 'test', 'fake-s3-preload.mjs')} --import ${join(PKG, 'test', 'fake-mantle-preload.mjs')}`,
+    FAKE_MANTLE_FILE: mantleFile, FAKE_MANTLE_LOG: mantleLog,
+  };
+  const clientEnv = { FAKE_INSTRUCTIONS: join(f.tmp, 'instructions.json'), FAKE_CALLS: join(f.tmp, 'calls.jsonl'), FAKE_SUMMARY: SUMMARY, FAKE_S3_FILE: f.bucketFile };
+  return {
+    ...f,
+    mantle: (spec) => writeFileSync(mantleFile, JSON.stringify(spec)),
+    requests: () => (existsSync(mantleLog) ? readFileSync(mantleLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []),
+    organizeAgents: (...args) => f.runWith(env, 'organize', '--agents', ...args),
+    labelAgents: (...args) => f.runWith(env, 'label', '--agents', ...args),
+    state: (agent) => JSON.parse(f.bucket()['index/organizer.json']).scopes[agent],
+    entry: (path) => JSON.parse(f.bucket()['index/agents.json']).notes.find((n) => n.path === path),
+    writeConfig({ label: block = label, clone = true } = {}) {
+      f.setConfig({ env: clientEnv, label: block });
+      if (!clone) {
+        const config = JSON.parse(readFileSync(f.configFile, 'utf8'));
+        writeFileSync(f.configFile, JSON.stringify({ ...config, repoDir: join(f.tmp, 'no-notes-clone') }));
+      }
+    },
+    // An agent's write through the memory API: the search entry first, then the note.
+    agentWrites(name, description, content) {
+      const objects = JSON.parse(readFileSync(f.bucketFile, 'utf8'));
+      const path = `agents/codex-alpha/${name}.md`;
+      const doc = JSON.parse(Buffer.from(objects['index/agents.json'].body, 'base64').toString('utf8'));
+      doc.notes = [...doc.notes.filter((n) => n.path !== path), { path, name, description, type: 'reference', body: content }]
+        .sort((x, y) => (x.path < y.path ? -1 : 1));
+      for (const [key, text] of [['index/agents.json', JSON.stringify(doc)], [path, apiNote(name, description, content)]]) {
+        objects[key] = { body: Buffer.from(text).toString('base64'), etag: md5(text) };
+      }
+      writeFileSync(f.bucketFile, JSON.stringify(objects));
+    },
+  };
+}
+
+const agentLabeled = (text, label) => text.replace('  type: reference\n', `  type: reference\n  domain: ${label}\n`);
+
+test('organize --agents ends with the label pass', (t) => {
+  const f = agentLabelFixture(t);
+  // Organize merges the two notes into one; the label pass that follows sends the note it left.
+  f.instruct(agentMerge());
+  f.mantle({ labels: { 'agents/codex-alpha/deploys.md': 'work' } });
+  const r = f.organizeAgents('--model', 'other-model');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const [call] = f.calls();
+  assert.equal(f.calls().length, 1);
+  assert.equal(call.args[call.args.indexOf('--model') + 1], 'other-model');
+  assert.deepEqual(f.requests(), [{ paths: ['agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.match(r.stdout, /^organize agents\/codex-alpha: applied, 3 change\(s\)/m);
+  assert.ok(r.stdout.indexOf('organize agents/codex-alpha: applied') < r.stdout.indexOf('label agents/codex-alpha:'), r.stdout);
+  assert.match(r.stdout, /^label: 1 note\(s\) sent to the model, USD 0\.00, 1 request\(s\)\nlabel agents\/codex-alpha: applied, 1 label\(s\) written, 0 unchanged$/m);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploys\.md: unlabeled → work$/m);
+  // The label is in the note and in its search entry, and the scope's record holds what the pass saw.
+  const b = f.bucket();
+  assert.equal(b['agents/codex-alpha/deploys.md'], agentLabeled(MERGED_DEPLOYS, 'work'));
+  assert.equal(f.entry('agents/codex-alpha/deploys.md').domain, 'work');
+  const state = f.state('codex-alpha');
+  assert.deepEqual(state.labels, { 'deploys.md': md5(agentLabeled(MERGED_DEPLOYS, 'work')) });
+  assert.match(state.lastLabel, /^\d{4}-\d\d-\d\dT/);
+  assert.equal(state.lastOutcome.outcome, 'applied');
+  // Labels never make the scope due: the next run has nothing to organize and nothing to label.
+  const again = f.organizeAgents();
+  assert.equal(again.status, 0, again.stdout + again.stderr);
+  assert.match(again.stdout, /^organize: nothing to do\nlabel agents\/codex-alpha: nothing to do$/m);
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.requests().length, 1);
+  // Every write was conditional and within what the organizer role may write; the label model's
+  // reasons and the token reach no output, and the model client never saw the token or the job's
+  // credentials.
+  for (const w of writes(f.log())) {
+    assert.ok(w.ifMatch !== null || w.ifNoneMatch === '*', `${w.method} ${w.key}`);
+    assert.match(w.key, /^(?:agents\/[^/]+\/[^/]+\.md|index\/agents\.json|index\/organizer\.json)$/);
+  }
+  assert.doesNotMatch(r.stdout + r.stderr, /fake reason|bedrock-api-key|ASIAEXAMPLE|example-signing/);
+  assert.doesNotMatch(JSON.stringify(f.calls()), /bedrock-api-key|ASIAEXAMPLE|example-signing/);
+  // A dry run of organize --agents ends with a dry run of the pass: the model is asked, nothing is written.
+  f.agentWrites('deploys', 'How deploys go now', 'Deploys now go through a canary first.');
+  f.instruct({});
+  const logged = writes(f.log()).length;
+  const dry = f.organizeAgents('--dry-run');
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /^label agents\/codex-alpha: dry-run, 1 label\(s\) to set or change$/m);
+  assert.equal(f.requests().length, 2);
+  assert.equal(writes(f.log()).length, logged);
+});
+
+test('label --agents --all sends every agent note', (t) => {
+  const exceptions = { 'agents/codex-alpha/deploy-steps.md': 'personal' };
+  const f = agentLabelFixture(t, { domains: { ...NO_EXCEPTIONS, exceptions } });
+  f.mantle({ labels: { 'agents/codex-alpha/deploys.md': 'work' } });
+  // A first run: the note with an exception is labeled by code, the other by the model.
+  let r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.match(r.stdout, /^label agents\/codex-alpha: applied, 2 label\(s\) written, 0 unchanged$/m);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploy-steps\.md: unlabeled → personal \(exception\)$/m);
+  assert.equal(f.calls().length, 0, 'label --agents runs no Organize');
+  // A plain run sends nothing.
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(f.requests().length, 1);
+  assert.match(r.stdout, /^label agents\/codex-alpha: no-change, 0 label\(s\) written, 1 unchanged$/m);
+  // --all sends every note but the exception's, whatever the record says; labels that hold are not written.
+  const notes = () => Object.entries(f.bucket()).filter(([key]) => key.startsWith('agents/'));
+  const before = notes();
+  r = f.labelAgents('--all');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests().slice(1), [{ paths: ['agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.match(r.stdout, /^label agents\/codex-alpha: no-change, 0 label\(s\) written, 2 unchanged$/m);
+  assert.deepEqual(notes(), before);
+  // --all with --dry-run asks the model again and writes nothing.
+  const logged = writes(f.log()).length;
+  f.mantle({ labels: { 'agents/codex-alpha/deploys.md': 'personal' } });
+  r = f.labelAgents('--all', '--dry-run', '--agent', 'codex-alpha');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(f.requests().length, 3);
+  assert.match(r.stdout, /^label agents\/codex-alpha: dry-run, 1 label\(s\) to set or change$/m);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploys\.md: work → personal$/m);
+  assert.equal(writes(f.log()).length, logged);
+  assert.deepEqual(notes(), before);
+});
+
+test('label --agents without a notes clone needs both input files', (t) => {
+  const f = agentLabelFixture(t);
+  // As in a GitHub Actions job: no notes clone, and the label token in a file the job wrote.
+  const tokenFile = join(f.tmp, 'label-token');
+  writeFileSync(tokenFile, 'example-label-token-0001\n', { mode: 0o600 });
+  const { credentials, ...rest } = LABEL_BLOCK;
+  const block = { ...rest, tokenFile };
+  f.writeConfig({ label: block, clone: false });
+  const missing = (what) => `label: the label inputs are missing or invalid (${what}); no label was written.\n`;
+  let r = f.labelAgents();
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, missing('label.domainsFile'));
+  const domainsFile = join(f.tmp, 'domains.json');
+  const personaFile = join(f.tmp, 'persona.md');
+  writeFileSync(domainsFile, JSON.stringify(NO_EXCEPTIONS));
+  writeFileSync(personaFile, PERSONA);
+  f.writeConfig({ label: { ...block, domainsFile }, clone: false });
+  r = f.labelAgents();
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, missing('label.personaFile'));
+  // An organize --agents run fails the same way, after Organize.
+  f.instruct({});
+  r = f.organizeAgents();
+  assert.equal(r.status, 1);
+  assert.ok(r.stdout.endsWith(missing('label.personaFile')), r.stdout);
+  assert.deepEqual(f.requests(), []);
+  assert.deepEqual(writes(f.log()).filter((w) => w.key !== 'index/organizer.json'), []);
+  // With both files named, the run labels the notes with the token of the file.
+  f.writeConfig({ label: { ...block, domainsFile, personaFile }, clone: false });
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests(), [{ paths: ['agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md'], auth: true }]);
+  assert.doesNotMatch(r.stdout + r.stderr, /example-label-token/);
+  // The token's age counts from when the job wrote the file: 55 minutes later no batch starts.
+  const issued = new Date(Date.now() - 55 * 60 * 1000);
+  utimesSync(tokenFile, issued, issued);
+  f.agentWrites('deploys', 'How deploys go now', 'Deploys now go through a canary first.');
+  r = f.labelAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: stopped; the label token of this run is near the end of its hour$/m);
+  assert.equal(f.requests().length, 1);
+  assert.match(r.stdout, /^- agents\/codex-alpha\/deploys\.md: not sent; the label token of this run was near the end of its hour$/m);
+});
+
+test('label --agents: usage errors, missing blocks and an unknown agent', (t) => {
+  const f = agentLabelFixture(t);
+  for (const args of [['--keep'], ['--model', 'other-label-model'], ['--project', 'p'], ['--min-retention', '0.5'], ['--agent', 'Bad_Name']]) {
+    const r = f.labelAgents(...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /^usage: /m);
+  }
+  const unknown = f.labelAgents('--agent', 'nobody');
+  assert.equal(unknown.status, 2);
+  assert.match(unknown.stderr, /"nobody" is not an agent scope of the bucket\./);
+  const noAgents = agentLabelFixture(t, { block: null });
+  let r = noAgents.labelAgents();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^agent-memory: labeling the agent scopes needs "agents" in the consolidate block of \S+; nothing was run\.$/m);
+  const noLabel = agentLabelFixture(t, { label: null });
+  r = noLabel.labelAgents();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^agent-memory: labeling needs "label" in the consolidate block of \S+; nothing was run\.$/m);
+  // organize --agents without a label block ends without a label pass.
+  noLabel.instruct({});
+  r = noLabel.organizeAgents();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /^label/m);
+  assert.deepEqual([...f.requests(), ...noAgents.requests(), ...noLabel.requests()], []);
 });

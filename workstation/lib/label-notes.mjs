@@ -35,24 +35,30 @@ export function capped(text) {
   return `${text.slice(0, end)}${CUT_MARKER}`;
 }
 
-// The notes of a scope folder that the label step takes, sorted by file name: its regular note
-// files except the index, a retired note (a `MOVED TO` stub) and a conflict copy. `scope` is
-// `global` or `projects/<name>`. `skip` is why the note cannot be labeled (null when it can): its
-// bytes are not UTF-8 text, which setDomain would not write back as they are (labelNote), or
-// setDomain cannot edit its frontmatter.
+// Whether a file of a scope folder can be a note the label step takes, by its name alone: not the
+// index and not a conflict copy.
+export const isLabelNoteName = (file) => file !== INDEX && !CONFLICT_RE.test(file);
+
+// The note the label step takes from the file `file` (its bytes `buf`) of the scope folder `scope`
+// (`global`, `projects/<name>` or `agents/<agent>`), or null when the file is not one: the index,
+// a conflict copy or a retired note (a `MOVED TO` stub). `skip` is why the note cannot be labeled
+// (null when it can): its bytes are not UTF-8 text, which setDomain would not write back as they
+// are (labelNote), or setDomain cannot edit its frontmatter.
+export function labelNoteOf(scope, file, buf) {
+  if (!isLabelNoteName(file)) return null;
+  const text = buf.toString('utf8');
+  if (stubTarget(text) !== null) return null;
+  const { name, description } = parseNote(text);
+  const skip = Buffer.from(text, 'utf8').equals(buf) ? setDomain(text, 'general').skip ?? null : 'not UTF-8 text';
+  return {
+    path: `${scope}/${file}`, scope, file, sha256: sha256(buf), domain: readDomain(text), name, description,
+    body: capped(bodyOf(text)), skip,
+  };
+}
+
+// The notes of a scope folder that the label step takes (labelNoteOf), sorted by file name.
 export function collectScopeNotes(dir, scope) {
-  const notes = [];
-  for (const [file, buf] of noteFiles(dir)) {
-    const text = buf.toString('utf8');
-    if (file === INDEX || CONFLICT_RE.test(file) || stubTarget(text) !== null) continue;
-    const { name, description } = parseNote(text);
-    const skip = Buffer.from(text, 'utf8').equals(buf) ? setDomain(text, 'general').skip ?? null : 'not UTF-8 text';
-    notes.push({
-      path: `${scope}/${file}`, scope, file, sha256: sha256(buf), domain: readDomain(text), name, description,
-      body: capped(bodyOf(text)), skip,
-    });
-  }
-  return notes;
+  return [...noteFiles(dir)].map(([file, buf]) => labelNoteOf(scope, file, buf)).filter((n) => n !== null);
 }
 
 // Why an entry of a label plan cannot be applied, or null. Its path is `global/<note>` or
