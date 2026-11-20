@@ -12,6 +12,11 @@ import { scanText } from './secret-scan.mjs';
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const scopeOf = (path) => path.slice(0, path.lastIndexOf('/'));
 
+// What an error may print, never a response body: the first line of its message, or `failed`. An
+// AwsError or AgentScopeError message is one fixed line (an operation, a status and a code, or a
+// fixed text), so it is printed whole.
+export const errorText = (err) => String(err?.message ?? err).split('\n')[0] || 'failed';
+
 // The notes to send to the model. With `all`, every note. Without a record (the first run), the
 // notes without a label; those with one are `confirmed`, recorded as they are. Otherwise the notes
 // whose digest is not the one recorded for them, which includes those never recorded.
@@ -170,7 +175,7 @@ export async function askLabelModel({ batches, token, labelBatch, ceiling, now, 
   try {
     run = await token();
   } catch (err) {
-    const reason = String(err?.message ?? err).split('\n')[0] || 'failed';
+    const reason = errorText(err);
     const left = new Map(batches.flatMap((b) => b.notes.map((n) => [n.path, TOKEN_NOT_MADE])));
     return { ...none, left, failed: true, line: `label: the label token could not be made (${reason}); no note was sent to the model.` };
   }

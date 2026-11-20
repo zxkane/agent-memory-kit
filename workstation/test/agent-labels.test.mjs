@@ -104,7 +104,7 @@ function tokens() {
 
 function pass(b, m, { opts = {}, domains = domainsOf(), token = tokens().token, signal, config = CONFIG } = {}) {
   return labelAgentScopes({
-    config, opts: { agentNames: [], all: false, dryRun: false, ...opts }, s3: b.s3, started: STARTED,
+    config, opts: { agentNames: [], all: false, dryRun: false, ...opts }, s3For: b.s3, started: STARTED,
     domains, persona: 'The owner is an example tester.', token, labelBatch: m.labelBatch, signal,
   });
 }

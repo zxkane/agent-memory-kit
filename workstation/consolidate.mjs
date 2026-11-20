@@ -20,7 +20,6 @@ import {
   AGENT_RE, AgentScopeError, agentScopeProblems, agentScopesS3, applyAgentScope, copyAgentScope, listAgentScopes,
   noteCount, readOrganizerState, recordOrganizerState, repairAgentEntries, scopeDigest,
 } from './lib/agent-scopes.mjs';
-import { AwsError } from './lib/aws.mjs';
 import { MODEL_RE, configPath, loadConfig } from './lib/config.mjs';
 import { readLabelInputs } from './lib/domains.mjs';
 import { labelBatch, tokenForRun } from './lib/label-client.mjs';
@@ -28,7 +27,7 @@ import {
   applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, labelEntryProblem,
 } from './lib/label-notes.mjs';
 import {
-  askLabelModel, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, unreadScopeResults,
+  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, unreadScopeResults,
 } from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
@@ -66,7 +65,6 @@ const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 const isMissing = (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
-const firstLine = (err) => String(err?.message ?? err).split('\n')[0] || 'failed';
 const usd = (value) => `USD ${value === null || value === undefined ? 'unknown' : value.toFixed(2)}`;
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const out = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -499,7 +497,7 @@ function stepApply(config, rest) {
   } catch (err) {
     // Before the first write nothing was applied: something moved since evaluate. After it, part
     // of the result is live and uncommitted (the next sync commits it); say so, never "nothing".
-    out({ ...result, outcome: err.partial ? 'apply-interrupted' : 'changed-meanwhile', reason: firstLine(err) });
+    out({ ...result, outcome: err.partial ? 'apply-interrupted' : 'changed-meanwhile', reason: errorText(err) });
     return;
   }
   const digest = folderDigest(pairs[0].liveDir);
@@ -508,7 +506,7 @@ function stepApply(config, rest) {
     writeReport(config, `${date}-${config.host}-${kind}-${scope}.md`, report());
     if (kind === 'organize') pruneReports(config, now);
   } catch (err) {
-    reportError = firstLine(err);
+    reportError = errorText(err);
   }
   const where = scope === GLOBAL ? GLOBAL : `projects/${scope}`;
   const sync = syncInfo(writeStatus(config, runSync(config, { message: `consolidate(${config.host}): ${kind} ${where}` })));
@@ -620,7 +618,7 @@ function stepLabelApply(config, rest) {
     // Before the first write nothing was written: a plain error. After it, some labels are live and
     // uncommitted (the next sync commits them); say so, never "nothing".
     if (!err.partial) throw err;
-    out({ outcome: 'apply-interrupted', reason: firstLine(err), ...none, ...err.result, sync: preSync });
+    out({ outcome: 'apply-interrupted', reason: errorText(err), ...none, ...err.result, sync: preSync });
     return;
   }
   // Each written note goes from the digest it was read with (the entry's) to the one written.
@@ -639,7 +637,7 @@ function stepLabelApply(config, rest) {
   try {
     writeReport(config, `${new Date().toISOString().slice(0, 10)}-${config.host}-label.md`, labelReportText(plan.report, skipped));
   } catch (err) {
-    reportError = firstLine(err);
+    reportError = errorText(err);
   }
   const sync = syncInfo(writeStatus(config, runSync(config, { message: `consolidate(${config.host}): label ${written.length} note(s)` })));
   out({ outcome: 'applied', written, unchanged, skipped, digests, reportError, sync });
@@ -670,8 +668,8 @@ function stepMain(args) {
     else throw new Error('usage: run.sh consolidate-step scan | snapshot ... | apply ... | label-read ... | label-apply ...');
     return 0;
   } catch (err) {
-    process.stderr.write(`agent-memory consolidate-step ${String(name).slice(0, 20)}: ${firstLine(err)}\n`);
-    out({ outcome: 'error', error: firstLine(err) });
+    process.stderr.write(`agent-memory consolidate-step ${String(name).slice(0, 20)}: ${errorText(err)}\n`);
+    out({ outcome: 'error', error: errorText(err) });
     return 1;
   }
 }
@@ -910,7 +908,7 @@ function removeTree(dir) {
   try {
     rmSync(dir, { recursive: true, force: true });
   } catch (err) {
-    process.stderr.write(`agent-memory consolidate: could not remove ${dir}: ${firstLine(err)}\n`);
+    process.stderr.write(`agent-memory consolidate: could not remove ${dir}: ${errorText(err)}\n`);
   }
 }
 
@@ -1120,9 +1118,6 @@ async function runScope({ config, opts, model, runDir, scope, digest, folder = s
 
 // ---- Agent scopes: agents/<agent>/ in the memory API's bucket (organize --agents) ----
 
-// What an AWS or agent-scope error may print: its own fixed message; anything else is one line.
-const awsText = (err) => (err instanceof AwsError || err instanceof AgentScopeError ? err.message : firstLine(err));
-
 // For a repair run: a reference copy of the scope's notes as they were taken, in original/ of the
 // work folder. Whatever the model left there is removed first, without following a link.
 function copyOriginal(work, liveDir) {
@@ -1147,7 +1142,7 @@ function agentSteps({ config, opts, model, agent, s3For, runDir }) {
       } catch (err) {
         if (await signalsHandled()) return { done: { outcome: 'aborted' } };
         if (err instanceof AgentScopeError && err.skip) return { done: { outcome: 'skipped', reason: err.message } };
-        return { done: { outcome: 'error', step: 'snapshot', error: awsText(err) } };
+        return { done: { outcome: 'error', step: 'snapshot', error: errorText(err) } };
       }
       if (await signalsHandled()) return { done: { outcome: 'aborted' } };
       pairs = [{ label: 'notes', liveDir, workDir: join(work, 'notes') }];
@@ -1194,7 +1189,7 @@ function agentSteps({ config, opts, model, agent, s3For, runDir }) {
       try {
         res = await applyAgentScope({ s3: await s3For(), agent, plan, changes: ev.changes, liveDir, workDir });
       } catch (err) {
-        return err.partial ? { ...result, outcome: 'apply-interrupted', reason: awsText(err) } : { ...result, outcome: 'error', error: awsText(err) };
+        return err.partial ? { ...result, outcome: 'apply-interrupted', reason: errorText(err) } : { ...result, outcome: 'error', error: errorText(err) };
       }
       if (res.outcome === 'changed-meanwhile') return { ...result, outcome: res.outcome, liveChanged: res.liveChanged.map(shown) };
       if (res.outcome === 'rejected') return { ...result, outcome: res.outcome, errors: res.errors };
@@ -1274,7 +1269,7 @@ async function agentsMain({ config, opts, model, started }) {
       process.stdout.write(`organize: interrupted by ${interrupted}; nothing was applied\n`);
       return SIGNAL_CODES[interrupted];
     }
-    process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${awsText(err)})\n`);
+    process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${errorText(err)})\n`);
     return 1;
   }
   if (unknownAgent(scopes, opts)) return 2;
@@ -1302,7 +1297,7 @@ async function agentsMain({ config, opts, model, started }) {
         try {
           if (await steps.repairEntries()) res.entriesRepaired = true;
         } catch (err) {
-          res.reason = `the search entries of the scope could not be rewritten: ${awsText(err)}`;
+          res.reason = `the search entries of the scope could not be rewritten: ${errorText(err)}`;
           failed = true;
         }
       }
@@ -1310,7 +1305,7 @@ async function agentsMain({ config, opts, model, started }) {
         try {
           await recordAgent(s3For, item.agent, res, started, item.digest);
         } catch (err) {
-          res.recordError = awsText(err);
+          res.recordError = errorText(err);
           failed = true;
         }
       }
@@ -1370,7 +1365,7 @@ async function agentLabelPass({ config, opts, s3For, started }) {
     return { failed: true };
   }
   const pass = await labelAgentScopes({
-    config, opts, s3: s3For, started, domains: inputs.domains, persona: inputs.persona,
+    config, opts, s3For, started, domains: inputs.domains, persona: inputs.persona,
     token: () => tokenForRun(label), labelBatch, signal: abort.signal,
   });
   if (pass.lines.length > 0) process.stdout.write(`${pass.lines.join('\n')}\n`);
@@ -1396,7 +1391,7 @@ async function labelAgentsMain({ config, opts, started }) {
       scopes = await listAgentScopes(await s3For({ signal: abort.signal }));
     } catch (err) {
       if (!(await signalsHandled())) {
-        process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${awsText(err)})\n`);
+        process.stderr.write(`agent-memory consolidate: the agent scopes could not be read (${errorText(err)})\n`);
         return 1;
       }
     }
@@ -1912,7 +1907,7 @@ if (argv[0] === '--step') {
   driverMain(argv).then((code) => {
     process.exitCode = code;
   }, (err) => {
-    process.stderr.write(`agent-memory consolidate failed: ${firstLine(err)}\n`);
+    process.stderr.write(`agent-memory consolidate failed: ${errorText(err)}\n`);
     process.exitCode = 1;
   });
 }

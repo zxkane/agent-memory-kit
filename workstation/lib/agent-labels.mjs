@@ -11,19 +11,18 @@
 // fixed reasons: never a note's text, the model's reasons, a response body or the token.
 
 import {
-  API_LIMITS, AgentScopeError, FILE_RE, MARKDOWN, MAX_OBJECT_BYTES, listAgentScopes, noteEntry, readOrganizerState,
+  API_LIMITS, FILE_RE, MARKDOWN, MAX_OBJECT_BYTES, listAgentScopes, noteEntry, readOrganizerState,
   readSearchEntries, recordOrganizerState, scopeDigest, setNoteEntries,
 } from './agent-scopes.mjs';
 import { AwsError } from './aws.mjs';
 import { readDomain, setDomain } from './domains.mjs';
 import { labelBatch as modelBatch } from './label-client.mjs';
 import { isLabelNoteName, labelNoteOf } from './label-notes.mjs';
-import { askLabelModel, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched } from './label-run.mjs';
+import {
+  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched,
+} from './label-run.mjs';
 
 const bytes = (text) => Buffer.byteLength(text, 'utf8');
-// What an error may print: an AWS or agent-scope error's own fixed message, anything else one line.
-const errorText = (err) => (err instanceof AwsError || err instanceof AgentScopeError
-  ? err.message : String(err?.message ?? err).split('\n')[0] || 'failed');
 
 // Why a note the pass took was not labeled; it stays touched.
 const LEFT = {
@@ -90,7 +89,7 @@ async function getNote(s3, key) {
 // API accepts, then the written notes' search entries, then the scope's record, where Organize's
 // record moves to the listing the pass read with its own writes, if it was that listing. `entries`:
 // the search entries as read before the writes. In a dry run, only what would be written.
-async function writeScope({ s3, s, planned, entries, started, dryRun }) {
+async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
   const out = { written: [], unchanged: [], left: new Map(), notWritten: 0, details: [], failed: false };
   // The scope's entries as the memory API counts them against its limit (api/src/ops/write.ts).
   const scopeEntries = new Map(entries.filter((e) => e.path.startsWith(`${s.scope}/`)).map((e) => [e.path, e]));
@@ -130,7 +129,7 @@ async function writeScope({ s3, s, planned, entries, started, dryRun }) {
     }
     let put = null;
     try {
-      client ??= await s3();
+      client ??= await s3For();
       put = await client.put(n.path, text, { ifMatch: n.digest, contentType: MARKDOWN });
     } catch (err) {
       broken = errorText(err);
@@ -150,7 +149,7 @@ async function writeScope({ s3, s, planned, entries, started, dryRun }) {
     out.details.push(`  - a write to the bucket failed (${broken}); the scope's other labels are left for the next run`);
   }
   try {
-    client ??= await s3();
+    client ??= await s3For();
     let entriesWritten = true;
     if (out.written.length > 0) {
       try {
@@ -197,28 +196,28 @@ function headline(s, out, { dryRun, idle, took }) {
   return `${scope}: ${written > 0 ? 'applied' : 'no-change'}, ${written} label(s) written, ${out.unchanged.length} unchanged${notWritten}`;
 }
 
-// The label pass over the agent scopes of the bucket (every scope, or `opts.agentNames`). `s3` gives
-// the S3 client (agentScopesS3: reads get `signal`, writes do not, so that once they started they
+// The label pass over the agent scopes of the bucket (every scope, or `opts.agentNames`). `s3For`
+// gives an S3 client (agentScopesS3: reads get `signal`, writes do not, so that once they started they
 // finish), `token()` the run's one token as `{ token, tokenAt }`, asked for only when there is a
 // batch to send, `labelBatch` the model call (label-client's), `domains` and `persona` the label
 // inputs. The ceiling is `maxBudgetUsd`, for this pass's own model cost. `failed`: the bucket
 // could not be read, no token could be made, a batch failed, or a write failed. A signal before
 // the writes stops it with nothing written; one later stops it before the next scope's writes.
 // Returns the lines to print: one per scope, then the report without the model's reasons.
-export async function labelAgentScopes({ config, opts, s3, started, domains, persona, token, labelBatch = modelBatch, signal }) {
+export async function labelAgentScopes({ config, opts, s3For, started, domains, persona, token, labelBatch = modelBatch, signal }) {
   const c = config.consolidate;
   const lines = [];
   const scopes = [];
   try {
-    const client = await s3({ signal });
-    const listing = await listAgentScopes(client);
-    const state = await readOrganizerState(client);
+    const s3 = await s3For({ signal });
+    const listing = await listAgentScopes(s3);
+    const state = await readOrganizerState(s3);
     const agents = (opts.agentNames.length > 0 ? opts.agentNames : [...listing.keys()]).filter((agent) => listing.has(agent));
     for (const agent of agents) {
       const scope = `agents/${agent}`;
       const files = listing.get(agent);
       const record = recordOf(scope, state.scopes[agent]);
-      scopes.push({ agent, scope, files, record, ...(await readScope({ s3: client, scope, files, record, all: opts.all, domains })) });
+      scopes.push({ agent, scope, files, record, ...(await readScope({ s3, scope, files, record, all: opts.all, domains })) });
     }
   } catch (err) {
     if (signal?.aborted) return { failed: false, lines };
@@ -250,7 +249,7 @@ export async function labelAgentScopes({ config, opts, s3, started, domains, per
 
   let entries;
   try {
-    entries = await readSearchEntries(await s3({ signal }));
+    entries = await readSearchEntries(await s3For({ signal }));
   } catch (err) {
     if (signal?.aborted) return { failed, lines };
     lines.push(`label: the search entries of the agent scopes could not be read (${errorText(err)}); no label was written.`);
@@ -260,7 +259,7 @@ export async function labelAgentScopes({ config, opts, s3, started, domains, per
   const results = [];
   for (const s of scopes) {
     if (signal?.aborted) break;
-    const out = await writeScope({ s3, s, planned, entries, started, dryRun: opts.dryRun });
+    const out = await writeScope({ s3For, s, planned, entries, started, dryRun: opts.dryRun });
     failed ||= out.failed;
     const mine = (path) => path.startsWith(`${s.scope}/`);
     const took = [...planned.keys()].some(mine);
