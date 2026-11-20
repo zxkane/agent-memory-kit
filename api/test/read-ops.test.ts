@@ -4,6 +4,7 @@ import { ApiError } from '../src/errors.ts';
 import { memoryIndex } from '../src/ops/index.ts';
 import { memoryRead } from '../src/ops/read.ts';
 import { memoryScopes } from '../src/ops/scopes.ts';
+import { memoryWrite } from '../src/ops/write.ts';
 import { createSnapshots } from '../src/snapshot.ts';
 import { cutToBytes, foldCase } from '../src/text.ts';
 import { fakeStore } from './fake-store.ts';
@@ -46,19 +47,19 @@ test('index reads the right key for each scope kind', async () => {
     'mem/projects/x/MEMORY.md': 'P',
     'agents/a/MEMORY.md': 'A',
   });
-  assert.deepEqual(await memoryIndex({ store }, { scope: 'global' }), { scope: 'global', index: 'G', truncated: false });
-  assert.deepEqual(await memoryIndex({ store }, { scope: 'projects/x' }), {
+  assert.deepEqual(await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' }), { scope: 'global', index: 'G', truncated: false });
+  assert.deepEqual(await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'projects/x' }), {
     scope: 'projects/x',
     index: 'P',
     truncated: false,
   });
-  assert.deepEqual(await memoryIndex({ store }, { scope: 'agents/a' }), {
+  assert.deepEqual(await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/a' }), {
     scope: 'agents/a',
     index: 'A',
     truncated: false,
   });
   assert.deepEqual(
-    store.gets.map((g) => g.key),
+    store.gets.map((g) => g.key).filter((k) => k.endsWith('/MEMORY.md')),
     ['mem/global/MEMORY.md', 'mem/projects/x/MEMORY.md', 'agents/a/MEMORY.md'],
   );
 });
@@ -66,21 +67,21 @@ test('index reads the right key for each scope kind', async () => {
 test('index over 25000 bytes is cut at a line boundary', async () => {
   const line = `${'x'.repeat(99)}\n`;
   const store = fakeStore({ 'mem/global/MEMORY.md': line.repeat(400) });
-  const result = await memoryIndex({ store }, { scope: 'global' });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
   assert.equal(result.truncated, true);
   assert.ok(Buffer.byteLength(result.index) <= 25_000);
   assert.equal(result.index, line.repeat(249) + 'x'.repeat(99));
 });
 
 test('missing index is not_found', async () => {
-  await assert.rejects(memoryIndex({ store: fakeStore() }, { scope: 'global' }), rejects(404, 'not_found'));
+  await assert.rejects(memoryIndex({ store: fakeStore(), snapshots: createSnapshots(fakeStore()) }, { scope: 'global' }), rejects(404, 'not_found'));
 });
 
 test('index rejects unknown parameters and bad scopes before any store call', async () => {
   const store = fakeStore();
-  await assert.rejects(memoryIndex({ store }, { scope: 'global', extra: '1' }), rejects(400, 'invalid_request'));
-  await assert.rejects(memoryIndex({ store }, { scope: 'agents/../x' }), rejects(400, 'invalid_request'));
-  await assert.rejects(memoryIndex({ store }, {}), rejects(400, 'invalid_request'));
+  await assert.rejects(memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global', extra: '1' }), rejects(400, 'invalid_request'));
+  await assert.rejects(memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/../x' }), rejects(400, 'invalid_request'));
+  await assert.rejects(memoryIndex({ store, snapshots: createSnapshots(store) }, {}), rejects(400, 'invalid_request'));
   assert.equal(store.gets.length, 0);
 });
 
@@ -158,4 +159,129 @@ test('foldCase preserves length and keeps characters whose lower case differs in
   assert.equal(foldCase('ABC'), 'abc');
   assert.equal(foldCase('İ'), 'İ');
   assert.equal(foldCase('İSTANBUL'), 'İstanbul');
+});
+
+test('memory_index tags work and personal lines', async () => {
+  const entry = (path: string, domain?: string) => ({ ...note(path), ...(domain ? { domain } : {}) });
+  const store = fakeStore({
+    'mem/global/MEMORY.md': [
+      '# Heading',
+      '- [A](a.md) — about a',
+      '- [B](b.md) — about b',
+      '- [G](g.md) — about g',
+      '- [U](u.md) — about u',
+      '- [N](n.md) about n',
+      '- [X](../x/a.md) — about x',
+      '- [T](t.md) — [work] already tagged',
+      '',
+    ].join('\n'),
+    'index/mem.json': JSON.stringify({
+      version: 1,
+      notes: [
+        entry('global/a.md', 'work'),
+        entry('global/b.md', 'personal'),
+        entry('global/g.md', 'general'),
+        entry('global/u.md'),
+        entry('global/n.md', 'work'),
+        entry('global/t.md', 'work'),
+        entry('projects/p/a.md', 'personal'),
+      ],
+    }),
+  });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
+  assert.equal(
+    result.index,
+    [
+      '# Heading',
+      '- [A](a.md) — [work] about a',
+      '- [B](b.md) — [personal] about b',
+      '- [G](g.md) — about g',
+      '- [U](u.md) — about u',
+      '- [N](n.md) about n',
+      '- [X](../x/a.md) — about x',
+      '- [T](t.md) — [work] already tagged',
+      '',
+    ].join('\n'),
+  );
+});
+
+test('memory_index tags an agent scope from index/agents.json', async () => {
+  const entry = (path: string, domain?: string) => ({ ...note(path), ...(domain ? { domain } : {}) });
+  const store = fakeStore({
+    'agents/example-agent/MEMORY.md': '- [W](w.md) — about w\n- [P](p.md) — about p\n- [G](g.md) — [work] about g\n',
+    'index/agents.json': JSON.stringify({
+      version: 1,
+      notes: [
+        entry('agents/example-agent/w.md', 'work'),
+        entry('agents/example-agent/p.md', 'personal'),
+        entry('agents/example-agent/g.md', 'general'),
+        // The same file name in another agent's scope labels nothing here.
+        entry('agents/other-agent/g.md', 'work'),
+      ],
+    }),
+    'index/mem.json': JSON.stringify({ version: 1, notes: [entry('global/g.md', 'personal')] }),
+  });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/example-agent' });
+  assert.deepEqual(result, {
+    scope: 'agents/example-agent',
+    index: '- [W](w.md) — [work] about w\n- [P](p.md) — [personal] about p\n- [G](g.md) — about g\n',
+    truncated: false,
+  });
+});
+
+test('memory_index tags before it cuts to 25000 bytes', async () => {
+  const lines = Array.from({ length: 400 }, (_, i) => `- [N${i}](n${i}.md) — ${'x'.repeat(80)}`);
+  const store = fakeStore({
+    'mem/global/MEMORY.md': lines.join('\n'),
+    'index/mem.json': JSON.stringify({
+      version: 1,
+      notes: lines.map((_, i) => ({ ...note(`global/n${i}.md`), domain: 'work' })),
+    }),
+  });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'global' });
+  assert.equal(result.truncated, true);
+  assert.ok(Buffer.byteLength(result.index) <= 25_000);
+  assert.ok(result.index.split('\n').every((l) => l.includes(' — [work] ')));
+});
+
+test('memory_index still answers untagged when the snapshots cannot be loaded', async () => {
+  const store = fakeStore({ 'mem/global/MEMORY.md': '- [A](a.md) — about a', 'index/mem.json': 'not json' });
+  const lines: object[] = [];
+  const result = await memoryIndex(
+    { store, snapshots: createSnapshots(store), log: (line) => lines.push(line) },
+    { scope: 'global' },
+  );
+  assert.equal(result.index, '- [A](a.md) — about a');
+  assert.deepEqual(lines, [{ op: 'memory_index', untagged: true, error: 'internal' }]);
+});
+
+test('memory_index logs the name of a raw error and never its message', async () => {
+  const store = fakeStore({ 'mem/global/MEMORY.md': '- [A](a.md) — about a' });
+  const boom = new Error('AccessDenied on arn:aws:s3:::secret-bucket/key');
+  boom.name = 'AccessDenied';
+  const lines: object[] = [];
+  const result = await memoryIndex(
+    { store, snapshots: { load: async () => { throw boom; } }, log: (line) => lines.push(line) },
+    { scope: 'global' },
+  );
+  assert.equal(result.index, '- [A](a.md) — about a');
+  assert.deepEqual(lines, [{ op: 'memory_index', untagged: true, error: 'AccessDenied' }]);
+  assert.equal(JSON.stringify(lines).includes('arn:'), false);
+});
+
+test('memory_index logs nothing when the snapshots load', async () => {
+  const store = fakeStore({ 'mem/global/MEMORY.md': '- [A](a.md) — about a' });
+  const lines: object[] = [];
+  await memoryIndex({ store, snapshots: createSnapshots(store), log: (line) => lines.push(line) }, { scope: 'global' });
+  assert.deepEqual(lines, []);
+});
+
+test('memory_index strips an author tag that memory_write stored after a Hangul filler', async () => {
+  const store = fakeStore();
+  const description = '\u3164[work] after a Hangul filler';
+  await memoryWrite({ store }, { agent: 'example-agent', name: 'filler', description, content: 'Hello' });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/example-agent' });
+  // The note is unlabeled, so its line gets no tag, and the author's run goes.
+  assert.equal(result.index, '- [filler](filler.md) — after a Hangul filler\n');
+  assert.equal(store.objects.get('agents/example-agent/MEMORY.md')!.body, `- [filler](filler.md) — ${description}\n`);
 });

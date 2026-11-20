@@ -84,3 +84,11 @@ test('every tool and every property has a description', () => {
     }
   }
 });
+
+test('memory_search and memory_index describe the domain label', () => {
+  const by = (name: string) => tools.find((t) => t.name === name).description as string;
+  const text = "the owner's classification of the note: work, personal or general; absent when not yet classified";
+  assert.ok(by('memory_search').includes(text));
+  assert.ok(by('memory_index').includes(text));
+  assert.ok(by('memory_index').includes('[work]') && by('memory_index').includes('[personal]'));
+});

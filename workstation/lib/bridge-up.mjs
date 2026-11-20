@@ -8,11 +8,13 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { join } from 'node:path';
 import { AwsError } from './aws.mjs';
 import { GitError, TIMEOUT_CODE, git } from './git.mjs';
+import { readDomain } from './domains.mjs';
 import { INDEX, PROJECT_RE, parseNote } from './notes.mjs';
 import { scanText } from './secret-scan.mjs';
 
-// The API's path rules (api/src/validate.ts), copied character for character; a test compares them.
+// The API's project-name rule lives in notes.mjs; it is re-exported here for existing importers.
 export { PROJECT_RE };
+// The API's file-name rule (api/src/validate.ts), copied character for character; a test compares them.
 export const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,196}\.md$/;
 
 const MAX_FILE_BYTES = 1_000_000;
@@ -113,7 +115,9 @@ function fitSnapshot(commit, contents, maxBytes = SNAPSHOT_MAX_BYTES) {
     const text = contents.get(path).toString('utf8');
     const meta = parseNote(text);
     const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.md$/, '');
-    return { path, name: meta.name || stem, description: meta.description ?? '', type: meta.type ?? '', body: bodyOf(text) };
+    const domain = readDomain(text);
+    const entry = { path, name: meta.name || stem, description: meta.description ?? '', type: meta.type ?? '', body: bodyOf(text) };
+    return domain ? { ...entry, domain } : entry;
   });
   for (let bodyLimit = MAX_BODY_BYTES; ; bodyLimit = Math.max(MIN_BODY_BYTES, Math.floor((bodyLimit * 3) / 4))) {
     const notes = entries.map((e) => ({ ...e, body: cutUtf8(e.body, bodyLimit) }));

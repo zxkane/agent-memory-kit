@@ -86,6 +86,50 @@ test('load: malformed entries and bad paths are skipped', async () => {
   assert.deepEqual((await createSnapshots(s).load()).map((n) => n.path), ['global/ok.md']);
 });
 
+test('parseSnapshot keeps a valid domain and drops an invalid one', async () => {
+  const s = fakeStore({
+    'index/mem.json': doc([
+      note('global/w.md', { domain: 'work' }),
+      note('global/p.md', { domain: 'personal' }),
+      note('global/g.md', { domain: 'general' }),
+      note('global/none.md'),
+      { ...note('global/bad.md'), domain: 'secret' },
+      { ...note('global/num.md'), domain: 5 },
+    ]),
+  });
+  const loaded = await createSnapshots(s).load();
+  const byPath = Object.fromEntries(loaded.map((n) => [n.path, n]));
+  assert.equal(loaded.length, 6);
+  assert.equal(byPath['global/w.md']?.domain, 'work');
+  assert.equal(byPath['global/p.md']?.domain, 'personal');
+  assert.equal(byPath['global/g.md']?.domain, 'general');
+  for (const p of ['global/none.md', 'global/bad.md', 'global/num.md']) {
+    assert.equal('domain' in byPath[p]!, false, p);
+  }
+});
+
+test("upsertNote keeps other entries' domain", () => {
+  const before = doc([note('agents/bot/a.md', { domain: 'work' })]);
+  const out = JSON.parse(upsertNote(before, note('agents/bot/b.md'))) as { notes: Note[] };
+  assert.equal(out.notes[0]?.path, 'agents/bot/a.md');
+  assert.equal(out.notes[0]?.domain, 'work');
+  assert.equal(out.notes[1]?.path, 'agents/bot/b.md');
+  assert.equal('domain' in out.notes[1]!, false);
+});
+
+test('upsertNote: the rewritten note loses its domain and the other entries keep theirs', () => {
+  const before = doc([
+    note('agents/bot/a.md', { domain: 'work' }),
+    note('agents/bot/b.md', { domain: 'personal' }),
+  ]);
+  const out = JSON.parse(upsertNote(before, note('agents/bot/a.md', { body: 'new' }))) as { notes: Note[] };
+  assert.equal(out.notes.length, 2);
+  assert.equal(out.notes[0]?.path, 'agents/bot/a.md');
+  assert.equal(out.notes[0]?.body, 'new');
+  assert.equal('domain' in out.notes[0]!, false);
+  assert.equal(out.notes[1]?.domain, 'personal');
+});
+
 test('upsertNote: starts a new snapshot from null', () => {
   const out = JSON.parse(upsertNote(null, note('global/a.md')));
   assert.deepEqual(out, { version: 1, notes: [note('global/a.md')] });

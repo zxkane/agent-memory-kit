@@ -36,7 +36,7 @@ function parseBody(event: APIGatewayProxyEventV2WithJWTAuthorizer): unknown {
 
 export function createHandler(deps: { store: Store; log?: (line: object) => void; direct?: boolean }): Handler {
   const log = deps.log ?? ((line: object) => console.log(JSON.stringify(line)));
-  const ops = { store: deps.store, snapshots: createSnapshots(deps.store) };
+  const ops = { store: deps.store, snapshots: createSnapshots(deps.store), log };
 
   const http: HttpHandler = async (event) => {
     const started = Date.now();

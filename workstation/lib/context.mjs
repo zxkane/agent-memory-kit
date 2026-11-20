@@ -4,6 +4,7 @@ import {
   ALL_STATUS_WORDS, AWS_ERROR_RE, BRIDGE_DOWN_REASONS, FIELD_RE, NOT_USABLE, OWN_ERROR_TEXTS, realIsoTime,
 } from './bridge-text.mjs';
 import { canaryReason } from './canary-text.mjs';
+import { tagIndexLines } from './domains.mjs';
 
 export { BRIDGE_DOWN_REASONS };
 
@@ -219,7 +220,9 @@ export function buildSessionContext({
   lines.push('Global index:');
   const header = `${lines.join('\n')}\n`;
 
-  const index = readGlobalIndex(repoDir).trimEnd();
+  const rawIndex = readGlobalIndex(repoDir).trimEnd();
+  // Tags are added to the text, never to MEMORY.md; the cap below applies to the tagged lines.
+  const index = rawIndex === '' ? '' : tagIndexLines(rawIndex.split('\n'), join(repoDir, 'global')).join('\n');
   if (index === '') return capped(`${header}(empty)\n`, cap);
   if (header.length + index.length + 1 <= cap) return `${header}${index}\n`;
 
@@ -324,9 +327,13 @@ export function buildToolContext({
   if (project !== null && localShare !== null) head.push(localShareLine(localShare));
   head.push(...statusLines(config, status, now));
 
+  // Each index line is tagged from the note in its own folder; MEMORY.md itself is not changed.
   const sections = [];
-  if (project !== null) sections.push({ title: `Project index (${projectPath}):`, path: projectPath, lines: readLines(projectPath) });
-  sections.push({ title: `Global index (${globalPath}):`, path: globalPath, lines: readLines(globalPath) });
+  if (project !== null) {
+    const projectDir = `${repoDir}/projects/${project}`;
+    sections.push({ title: `Project index (${projectPath}):`, path: projectPath, lines: tagIndexLines(readLines(projectPath), projectDir) });
+  }
+  sections.push({ title: `Global index (${globalPath}):`, path: globalPath, lines: tagIndexLines(readLines(globalPath), `${repoDir}/global`) });
 
   // Fixed text: everything except index lines (an empty index shows its placeholder).
   const fixedParts = [`${head.join('\n')}\n`];

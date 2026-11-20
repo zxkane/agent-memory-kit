@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { parseNote } from '../lib/notes.mjs';
 import {
-  LABELS, readDomain, setDomain, parseDomains, scopeDefault, readLabelInputs, tagLine, tagIndexLines,
+  LABELS, readDomain, setDomain, parseDomains, scopeDefault, readLabelInputs, linkedFile, tagLine, tagIndexLines,
 } from '../lib/domains.mjs';
 
 const NOTE = '---\nname: a\ndescription: d\nmetadata:\n  type: project\n  originSessionId: x\n---\n\nbody\n';
@@ -170,6 +170,14 @@ test('readLabelInputs refuses symlinks, directories and large files', t => {
   assert.deepEqual(readLabelInputs({ domainsFile: d + '2', personaFile: dir }), { problem: 'personaFile' });
 });
 
+test('linkedFile gives the file an index line links, or null', () => {
+  assert.equal(linkedFile('- [A](a.md) — about a'), 'a.md');
+  assert.equal(linkedFile('- [A](a.md)\u0085—[work] x'), 'a.md');
+  for (const line of ['- [A](a.md) about a', '- [A](../x/a.md) — about a', '* [A](a.md) — about a', '# Heading', '']) {
+    assert.equal(linkedFile(line), null, line);
+  }
+});
+
 test('tagLine tags work and personal only', () => {
   assert.equal(tagLine('- [A](a.md) — about a', 'work'), '- [A](a.md) — [work] about a');
   assert.equal(tagLine('- [A](a.md) — about a', 'personal'), '- [A](a.md) — [personal] about a');
@@ -230,6 +238,18 @@ test('tagLine strips a leading tag run whatever its spacing, letter case or hidd
   }
 });
 
+test('tagLine takes the Kelvin sign and the long s for k and s, and no other lookalike', () => {
+  // The case folding matches these two; they look like the letters they fold to.
+  for (const hook of ['[wor\u212a] about', '[per\u017fonal] about']) {
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'general'), '- [A](a.md) — about', hook);
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'work'), '- [A](a.md) — [work] about', hook);
+  }
+  // Other lookalikes, such as a Cyrillic o or full-width brackets, are not tags.
+  for (const hook of ['[w\u043erk] about', '\uff3bwork\uff3d about']) {
+    assert.equal(tagLine(`- [A](a.md) — ${hook}`, 'general'), `- [A](a.md) — ${hook}`, hook);
+  }
+});
+
 test('tagLine keeps the rest of the hook exactly', () => {
   // Text that only looks like a tag, and format characters later in the hook, stay as they are.
   const family = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
@@ -244,6 +264,120 @@ test('tagLine keeps the rest of the hook exactly', () => {
   assert.equal(tagLine(spaces, 'general'), spaces);
 });
 
+test('tagLine drops the gap at the start of a hook it tags, so tagging again gives the same line', () => {
+  // Spaces, a tab or a format character before the hook, without a tag.
+  for (const gap of ['  ', '\t', '\u200b']) {
+    const line = `- [A](a.md) — ${gap}about`;
+    for (const label of ['work', 'personal']) {
+      const once = tagLine(line, label);
+      assert.equal(once, `- [A](a.md) — [${label}] about`, JSON.stringify(gap));
+      assert.equal(tagLine(once, label), once, JSON.stringify(gap));
+    }
+    // A general or unlabeled line without a tag run stays exactly as it is.
+    assert.equal(tagLine(line, 'general'), line, JSON.stringify(gap));
+    assert.equal(tagLine(line, null), line, JSON.stringify(gap));
+  }
+});
+
+test('tagLine takes any gap after the dash, and a line it changes gets " — "', () => {
+  // No gap, a no-break space, a tab.
+  for (const line of ['- [A](a.md) —[work] about', '- [A](a.md) —\u00a0[work] about', '- [A](a.md) —\t[work] about']) {
+    assert.equal(tagLine(line, 'general'), '- [A](a.md) — about', line);
+    assert.equal(tagLine(line, null), '- [A](a.md) — about', line);
+    assert.equal(tagLine(line, 'work'), '- [A](a.md) — [work] about', line);
+    assert.equal(tagLine(line, 'personal'), '- [A](a.md) — [personal] about', line);
+  }
+  // Without a run, a general or unlabeled line stays byte for byte as it is.
+  for (const line of ['- [A](a.md) —about', '- [A](a.md) —\u00a0about', '- [A](a.md) —\tabout', '- [A](a.md) —\u200b\u00a0about']) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, null), line, line);
+    assert.equal(tagLine(line, 'personal'), '- [A](a.md) — [personal] about', line);
+  }
+  // A line without the em dash after the link, or with a link into another folder, is not an index line.
+  for (const line of [
+    '- [A](a.md) [work] about', '- [A](a.md) -[work] about', '- [A](a.md) \u2013[work] about',
+    '- [A](../x/a.md) —[work] about', '- [A](../x/a.md) —\t[work] about',
+  ]) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, 'personal'), line, line);
+  }
+});
+
+test('tagLine takes any gap between the link and the dash, and a line it changes gets ") — "', () => {
+  // No gap, a no-break space, two spaces, tabs, a format character.
+  for (const sep of ['—', '\u00a0— ', '  — ', '\t—\t', '\u200b— ']) {
+    const line = `- [A](a.md)${sep}[work] x`;
+    assert.equal(tagLine(line, 'general'), '- [A](a.md) — x', line);
+    assert.equal(tagLine(line, null), '- [A](a.md) — x', line);
+    assert.equal(tagLine(line, 'work'), '- [A](a.md) — [work] x', line);
+    assert.equal(tagLine(line, 'personal'), '- [A](a.md) — [personal] x', line);
+    // Without a run, a general or unlabeled line stays byte for byte as it is.
+    const bare = `- [A](a.md)${sep}x`;
+    assert.equal(tagLine(bare, 'general'), bare, bare);
+    assert.equal(tagLine(bare, null), bare, bare);
+    for (const input of [line, bare]) {
+      for (const label of ['work', 'personal', 'general', null]) {
+        const once = tagLine(input, label);
+        assert.equal(tagLine(once, label), once, input);
+      }
+    }
+  }
+  // The bullet stays exact: another bullet, an indent or a gap without the em dash is not an index line.
+  for (const line of ['* [A](a.md) — [work] x', '+ [A](a.md) — [work] x', '  - [A](a.md) — [work] x', '- [A](a.md)\t[work] x']) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, 'personal'), line, line);
+  }
+});
+
+test('tagLine takes control and default-ignorable characters as gaps', () => {
+  // A BEL, a C1 control and a Hangul filler before the run, a variation selector inside the brackets, a
+  // combining grapheme joiner and a Mongolian variation selector between the letters, NEL before the dash.
+  const probes = [
+    '- [A](a.md) — \u0007[work] about', '- [A](a.md) — \u0090[work] about', '- [A](a.md) — \u3164[work] about',
+    '- [A](a.md) — [\ufe0fwork] about', '- [A](a.md) — [w\u034fork] about', '- [A](a.md) — [w\u180bork] about',
+    '- [A](a.md)\u0085— [work] about',
+  ];
+  // The same kinds of character in lines without a run.
+  const bare = ['- [A](a.md) — \u0007about', '- [A](a.md) — \u3164about', '- [A](a.md)\u0085— about', '- [A](a.md) —\ufe0f about'];
+  for (const line of probes) {
+    // A line end stays.
+    for (const end of ['', '\r']) {
+      const input = `${line}${end}`;
+      assert.equal(tagLine(input, 'general'), `- [A](a.md) — about${end}`, input);
+      assert.equal(tagLine(input, null), `- [A](a.md) — about${end}`, input);
+      assert.equal(tagLine(input, 'work'), `- [A](a.md) — [work] about${end}`, input);
+      assert.equal(tagLine(input, 'personal'), `- [A](a.md) — [personal] about${end}`, input);
+    }
+  }
+  assert.equal(tagLine('- [A](a.md) — [work]\u0090\r', 'general'), '- [A](a.md) — \r');
+  // Without a run, a general or unlabeled line stays byte for byte as it is.
+  for (const line of bare) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, null), line, line);
+  }
+  for (const line of [...probes, ...bare]) {
+    for (const label of ['work', 'personal', 'general', null]) {
+      const once = tagLine(line, label);
+      assert.equal(tagLine(once, label), once, line);
+    }
+  }
+  // U+2800 BRAILLE PATTERN BLANK only renders blank; it is not a gap.
+  assert.equal(tagLine('- [A](a.md) — \u2800[work] about', 'general'), '- [A](a.md) — \u2800[work] about');
+});
+
+test('tagIndexLines reads the note of a line with any gap around the dash', t => {
+  const dir = tmp(t);
+  writeFileSync(join(dir, 'g.md'), NOTE.replace('  originSessionId: x', '  domain: general'));
+  writeFileSync(join(dir, 'w.md'), NOTE.replace('  originSessionId: x', '  domain: work'));
+  writeFileSync(join(dir, 'p.md'), NOTE.replace('  originSessionId: x', '  domain: personal'));
+  for (const sep of [' —', ' —\u00a0', ' —\t', '—', '\u00a0— ', '  — ', '\t—\t', '\u200b— ', '\u0085— ']) {
+    const lines = [`- [G](g.md)${sep}[work] g`, `- [W](w.md)${sep}[personal] w`, `- [P](p.md)${sep}[work] p`, `- [G](g.md)${sep}g`];
+    assert.deepEqual(tagIndexLines(lines, dir), [
+      '- [G](g.md) — g', '- [W](w.md) — [work] w', '- [P](p.md) — [personal] p', `- [G](g.md)${sep}g`,
+    ], JSON.stringify(sep));
+  }
+});
+
 test('tagIndexLines reads each linked note of the folder', t => {
   const dir = tmp(t);
   writeFileSync(join(dir, 'a.md'), NOTE.replace('  originSessionId: x', '  domain: work'));
@@ -255,17 +389,23 @@ test('tagIndexLines reads each linked note of the folder', t => {
   ]);
 });
 
-test('tagIndexLines leaves the line of a note it may not read as it was', t => {
+test('tagIndexLines takes a note it may not read as unlabeled', t => {
   const dir = tmp(t);
   const labeled = NOTE.replace('  originSessionId: x', '  domain: work');
   writeFileSync(join(dir, 'real.md'), labeled);
   symlinkSync(join(dir, 'real.md'), join(dir, 'link.md'));
   // Over the size limit, even with its label in the first lines.
   writeFileSync(join(dir, 'big.md'), labeled + 'x'.repeat(1024 * 1024));
-  writeFileSync(join(dir, 'MEMORY.md'), '- [L](link.md) — [personal] about l\n- [B](big.md) — about b\n- [R](real.md) — about r\n');
+  mkdirSync(join(dir, 'dir.md'));
+  // A link, a file over the limit, a folder and a missing note get no tag, and the author's run goes.
+  writeFileSync(join(dir, 'MEMORY.md'), [
+    '- [L](link.md) — [personal] about l', '- [B](big.md) — [work] about b', '- [D](dir.md) — [personal] about d',
+    '- [M](gone.md) — [work] about m', '- [R](real.md) — about r', '',
+  ].join('\n'));
   const index = readFileSync(join(dir, 'MEMORY.md'), 'utf8');
   assert.deepEqual(tagIndexLines(index.split('\n'), dir), [
-    '- [L](link.md) — [personal] about l', '- [B](big.md) — about b', '- [R](real.md) — [work] about r', '',
+    '- [L](link.md) — about l', '- [B](big.md) — about b', '- [D](dir.md) — about d', '- [M](gone.md) — about m',
+    '- [R](real.md) — [work] about r', '',
   ]);
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), index, 'MEMORY.md itself is never written');
 });
@@ -276,9 +416,10 @@ test('tagIndexLines refuses a FIFO in place of a note without waiting for a writ
   // In a child process with a time limit: a read that waited on the FIFO would hang the test run.
   const url = new URL('../lib/domains.mjs', import.meta.url).href;
   const code = `import { tagIndexLines } from ${JSON.stringify(url)};\n`
-    + `process.stdout.write(JSON.stringify(tagIndexLines(['- [F](f.md) — about f'], ${JSON.stringify(dir)})));`;
+    + `process.stdout.write(JSON.stringify(tagIndexLines(['- [F](f.md) — [work] about f'], ${JSON.stringify(dir)})));`;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 10_000 });
   assert.equal(r.signal, null, 'the read did not wait');
   assert.equal(r.status, 0, r.stderr);
+  // The FIFO counts as an unlabeled note: no tag, and the author's run goes.
   assert.deepEqual(JSON.parse(r.stdout), ['- [F](f.md) — about f']);
 });

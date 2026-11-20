@@ -426,6 +426,20 @@ test('19. a frontmatter block that is not closed is part of the body', async (t)
   ]);
 });
 
+test("snapshot entries carry the note's domain", async (t) => {
+  const f = fixture(t);
+  const head = commit(f.a, {
+    'global/labeled.md': '---\nname: labeled\nmetadata:\n  domain: personal\n---\nbody\n',
+    'global/plain.md': '---\nname: plain\n---\nbody\n',
+    'global/bad.md': '---\nname: bad\nmetadata:\n  domain: example-label\n---\nbody\n',
+  });
+  const byPath = Object.fromEntries(JSON.parse(buildSnapshot(f.a, head)).notes.map((n) => [n.path, n]));
+  assert.equal(byPath['global/labeled.md'].domain, 'personal');
+  assert.deepEqual(Object.keys(byPath['global/labeled.md']), ['path', 'name', 'description', 'type', 'body', 'domain']);
+  assert.equal('domain' in byPath['global/plain.md'], false);
+  assert.equal('domain' in byPath['global/bad.md'], false);
+});
+
 test('20. a Git failure throws and records nothing', async (t) => {
   const f = fixture(t);
   commit(f.a, { 'global/one.md': 'one\n' });

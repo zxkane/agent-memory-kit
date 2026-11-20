@@ -1,4 +1,4 @@
-import type { Note } from '../snapshot.ts';
+import type { Domain, Note } from '../snapshot.ts';
 import { foldCase } from '../text.ts';
 import { onlyParams, parseLimit, parseQuery, parseScope, scopeName } from '../validate.ts';
 
@@ -9,6 +9,7 @@ export type SearchResult = {
   description: string;
   snippet: string;
   score: number;
+  domain?: Domain;
 };
 
 const NAME_WEIGHT = 8;
@@ -111,6 +112,7 @@ export async function memorySearch(
       description: c.note.description,
       snippet: makeSnippet(c.note, c.low, terms),
       score: c.score,
+      ...(c.note.domain ? { domain: c.note.domain } : {}),
     })),
     total: candidates.length,
   };

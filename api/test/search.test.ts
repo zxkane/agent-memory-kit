@@ -12,6 +12,16 @@ function search(notes: Note[], query: Record<string, string | undefined>) {
   return memorySearch({ snapshots: { load: async () => notes } }, query);
 }
 
+test('search results carry the domain', async () => {
+  const out = await search(
+    [n('global/a.md', { name: 'kiwi', domain: 'work' }), n('global/b.md', { name: 'kiwi' })],
+    { q: 'kiwi' },
+  );
+  const byPath = Object.fromEntries(out.results.map((r) => [r.path, r]));
+  assert.equal(byPath['global/a.md']?.domain, 'work');
+  assert.equal('domain' in byPath['global/b.md']!, false);
+});
+
 function rejects400(err: unknown) {
   return err instanceof ApiError && err.status === 400 && err.code === 'invalid_request';
 }

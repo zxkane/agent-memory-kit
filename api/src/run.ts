@@ -28,7 +28,7 @@ export type Line = {
   gateway?: string | null;
   target?: string | null;
 };
-export type Operations = { store: Store; snapshots: ReturnType<typeof createSnapshots> };
+export type Operations = { store: Store; snapshots: ReturnType<typeof createSnapshots>; log?: (line: object) => void };
 export type ErrorAnswer = { error: { code: string; message: string } };
 
 export function errorBody(code: string, message: string): ErrorAnswer {
@@ -47,7 +47,7 @@ export async function runOperation(
       onlyParams(query, []);
       return memoryScopes({ snapshots: ops.snapshots });
     case 'memory_index':
-      return memoryIndex({ store: ops.store }, query);
+      return memoryIndex({ store: ops.store, snapshots: ops.snapshots, log: ops.log }, query);
     case 'memory_search':
       return memorySearch({ snapshots: ops.snapshots }, query);
     case 'memory_read':

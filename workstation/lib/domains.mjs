@@ -10,15 +10,24 @@ export const LABELS = Object.freeze(['work', 'personal', 'general']);
 const MAX_DOMAINS_BYTES = 1024 * 1024;
 const MAX_PERSONA_CHARS = 20000;
 const MAX_NOTE_BYTES = 1024 * 1024;
-const TAG_LINE_RE = /^- \[[^\]]*\]\(([A-Za-z0-9][A-Za-z0-9._-]*\.md)\) — /;
-// What may stand around and inside an author-written tag without showing: white space other than a
-// line end, and Unicode format characters (zero-width characters, the soft hyphen, joiners). One
-// character class, so that a long run of them is matched once, not in every way it could split.
-const GAP = '[[\\s\\p{Cf}]--[\\r\\n]]*';
+// What may stand around the dash of an index line, and around and inside an author-written tag, without
+// showing: white space other than CR and LF, control characters, format characters (zero-width
+// characters, the soft hyphen, joiners) and the other default-ignorable characters (variation selectors,
+// Hangul fillers, the combining grapheme joiner). One character class, so that a long run of them is
+// matched once, not in every way it could split. U+2800 BRAILLE PATTERN BLANK only renders blank; it is
+// not in the class.
+const GAP = '[[\\s\\p{Cf}\\p{Cc}\\p{Default_Ignorable_Code_Point}]--[\\r\\n]]*';
+// An index line that links a note of its folder, up to the em dash after the link: `- ` and the link
+// (`link`, with the file name as `file`), then a gap (also none) and the dash. Everything after the dash
+// is the hook, with whatever gap stands at its start (also none).
+const TAG_LINE_RE = new RegExp(`^(?<link>- \\[[^\\]]*\\]\\((?<file>[A-Za-z0-9][A-Za-z0-9._\\-]*\\.md)\\))${GAP}—`, 'v');
 const spaced = (word) => [...word].join(GAP);
-// A leading run of `[work]` / `[personal]` tags in any letter case, with the gaps before, between,
-// inside and after them. Homoglyphs and full-width brackets are not tags.
-const TAG_RUN_RE = new RegExp(`^${GAP}(?:\\[${GAP}(?:${spaced('work')}|${spaced('personal')})${GAP}\\]${GAP})+`, 'iv');
+// The start of a hook: the gap after the dash, then a run of `[work]` / `[personal]` tags (the group,
+// empty when there is none) in any letter case, with the gaps between, inside and after them. The case
+// folding also takes the Kelvin sign (U+212A) for `k` and the long s (U+017F) for `s`, which look like
+// them; no other character folds to these letters, and other lookalikes (letters of other scripts,
+// full-width brackets) are not tags.
+const HOOK_START_RE = new RegExp(`^${GAP}((?:\\[${GAP}(?:${spaced('work')}|${spaced('personal')})${GAP}\\]${GAP})*)`, 'iv');
 const SCOPE_RE = /^(?:global|projects\/([^/]+)|agents\/([^/]+))$/;
 
 const bare = line => line.replace(/\r$/, '');
@@ -156,25 +165,35 @@ export function readLabelInputs({ domainsFile, personaFile }) {
   return { domains: parsed.value, persona };
 }
 
+// The file name that an index line links (TAG_LINE_RE), or null when the line is not an index line.
+export function linkedFile(line) {
+  return TAG_LINE_RE.exec(line)?.groups.file ?? null;
+}
+
 // The tag of an index line comes only from the note it links. In a line that links a note of its folder, a run
-// of tags right after the dash (TAG_RUN_RE) is removed with the white space or format characters right after it,
-// then the note's own tag is inserted: work and personal get one, general and unlabeled notes none. The rest
-// of the line keeps its text exactly. Tagging a tagged line gives the same line.
+// of tags at the start of the hook (HOOK_START_RE) is removed with the white space or format characters around
+// it, then the note's own tag is inserted: work and personal get one, general and unlabeled notes none. A hook
+// that gets a tag also loses the white space or format characters it starts with, and a line that gets a tag or
+// loses a run has ` — ` between the link and the hook, so tagging a tagged line gives the same line. The rest of
+// the line keeps its text exactly; a general or unlabeled line without a run is returned as it is.
 export function tagLine(line, label) {
   const m = TAG_LINE_RE.exec(line);
   if (!m) return line;
-  const rest = line.slice(m[0].length).replace(TAG_RUN_RE, '');
+  const hook = line.slice(m[0].length);
+  const [start, run] = HOOK_START_RE.exec(hook);
   const tag = label === 'work' || label === 'personal' ? `[${label}] ` : '';
-  return `${line.slice(0, m[0].length)}${tag}${rest}`;
+  if (!tag && !run) return line;
+  return `${m.groups.link} — ${tag}${hook.slice(start.length)}`;
 }
 
-// Tags every index line by the label of the note it links in `dir`. A note that cannot be read (also a link, a
-// FIFO or a file over MAX_NOTE_BYTES) leaves its line as it was.
+// Tags every index line by the label of the note it links in `dir`. A note that cannot be read (missing, a link,
+// not a regular file such as a FIFO, or over MAX_NOTE_BYTES) counts as unlabeled, as a note without a label does
+// in the memory API: its line gets no tag, and a run of tags written there is removed.
 export function tagIndexLines(lines, dir) {
   return lines.map(line => {
-    const m = TAG_LINE_RE.exec(line);
-    if (!m) return line;
-    const note = readText(join(dir, m[1]), MAX_NOTE_BYTES);
-    return note === null ? line : tagLine(line, readDomain(note));
+    const file = linkedFile(line);
+    if (file === null) return line;
+    const note = readText(join(dir, file), MAX_NOTE_BYTES);
+    return tagLine(line, note === null ? null : readDomain(note));
   });
 }

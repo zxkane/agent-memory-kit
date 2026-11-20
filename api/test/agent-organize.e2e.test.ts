@@ -132,13 +132,13 @@ test('notes written through the API are merged by organize --agents; the API and
   load();
 
   // 4. The API serves the merged note only.
-  const index = await memoryIndex({ store }, { scope: 'agents/codex-alpha' });
+  const index = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/codex-alpha' });
   assert.equal(index.index, '- [deploys](deploys.md) — How deploys go, with the steps\n');
   const search = await memorySearch({ snapshots: createSnapshots(store) }, { q: 'staging promote' });
   assert.deepEqual(search.results.map((x) => x.path), ['agents/codex-alpha/deploys.md']);
   await assert.rejects(memoryRead({ store }, { path: 'agents/codex-alpha/deploy-steps.md' }), (err: unknown) => err instanceof ApiError && err.status === 404);
   assert.match((await memoryRead({ store }, { path: 'agents/codex-alpha/deploys.md' })).content, /Steps: build/);
-  assert.deepEqual((await memoryIndex({ store }, { scope: 'agents/claude-beta' })).index, '- [other](other.md) — Another agent\n');
+  assert.deepEqual((await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/claude-beta' })).index, '- [other](other.md) — Another agent\n');
   // The API can still write to the scope afterwards: the merged note's entry is a valid one.
   await memoryWrite({ store }, { agent: 'codex-alpha', name: 'later', description: 'A later note', content: 'Written after the run.' });
   assert.equal((await memorySearch({ snapshots: createSnapshots(store) }, { q: 'staging promote' })).total, 1);
