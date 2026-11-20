@@ -43,6 +43,15 @@ export function canonicalQuery(query) {
     .join('&');
 }
 
+const amzDateOf = (now) => now.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+
+// The SigV4 signing key for one day, region and service.
+function signingKey(secretAccessKey, day, region, service) {
+  let key = hmac(`AWS4${secretAccessKey}`, day);
+  for (const part of [region, service, 'aws4_request']) key = hmac(key, part);
+  return key;
+}
+
 function checkPath(path) {
   const ok = typeof path === 'string' && PATH_RE.test(path) && !path.includes('//')
     && !path.split('/').some((seg) => seg === '.' || seg === '..');
@@ -53,7 +62,7 @@ function checkPath(path) {
 // used as given (S3 does not encode twice), so callers pass only the characters PATH_RE allows.
 export function signRequest({ method, host, path, query = {}, headers = {}, body = '', service, region, credentials, now }) {
   checkPath(path);
-  const amzDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const amzDate = amzDateOf(now);
   const day = amzDate.slice(0, 8);
   const payloadHash = sha256Hex(body);
 
@@ -77,13 +86,48 @@ export function signRequest({ method, host, path, query = {}, headers = {}, body
 
   const scope = `${day}/${region}/${service}/aws4_request`;
   const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256Hex(canonical)].join('\n');
-  let key = hmac(`AWS4${credentials.secretAccessKey}`, day);
-  for (const part of [region, service, 'aws4_request']) key = hmac(key, part);
-  const signature = createHmac('sha256', key).update(toSign).digest('hex');
+  const signature = createHmac('sha256', signingKey(credentials.secretAccessKey, day, region, service)).update(toSign).digest('hex');
 
   all.authorization = `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${scope}, `
     + `SignedHeaders=${signedHeaders}, Signature=${signature}`;
   return all;
+}
+
+const BEDROCK_HOST = 'bedrock.amazonaws.com';
+const BEDROCK_TOKEN_PREFIX = 'bedrock-api-key-';
+const MAX_TOKEN_SECONDS = 43200;
+
+// A short-term Bedrock API key: a SigV4 presigned POST to bedrock.amazonaws.com
+// (Action=CallWithBearerToken), base64-encoded behind a prefix. Same output as the AWS token
+// generator. Nothing is logged and no error message carries a credential.
+export function bedrockToken({ region, credentials, now, expiresInSeconds = 3600 }) {
+  if (!Number.isInteger(expiresInSeconds) || expiresInSeconds < 1 || expiresInSeconds > MAX_TOKEN_SECONDS) {
+    throw new RangeError(`expiresInSeconds must be an integer from 1 to ${MAX_TOKEN_SECONDS}`);
+  }
+  if (!REGION_RE.test(region ?? '')) throw new AwsError('bedrockToken', 0, 'InvalidRegion');
+  const { accessKeyId, secretAccessKey, sessionToken } = credentials ?? {};
+  if (typeof accessKeyId !== 'string' || !accessKeyId || typeof secretAccessKey !== 'string' || !secretAccessKey) {
+    throw new AwsError('bedrockToken', 0, 'InvalidCredentials');
+  }
+  const amzDate = amzDateOf(now);
+  const day = amzDate.slice(0, 8);
+  const scope = `${day}/${region}/bedrock/aws4_request`;
+  const query = {
+    Action: 'CallWithBearerToken',
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `${accessKeyId}/${scope}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': String(expiresInSeconds),
+    'X-Amz-SignedHeaders': 'host',
+  };
+  if (typeof sessionToken === 'string' && sessionToken) query['X-Amz-Security-Token'] = sessionToken;
+
+  const canonical = ['POST', '/', canonicalQuery(query), `host:${BEDROCK_HOST}\n`, 'host', sha256Hex('')].join('\n');
+  const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256Hex(canonical)].join('\n');
+  query['X-Amz-Signature'] = createHmac('sha256', signingKey(secretAccessKey, day, region, 'bedrock')).update(toSign).digest('hex');
+
+  const presigned = `${BEDROCK_HOST}/?${canonicalQuery(query)}&Version=1`;
+  return `${BEDROCK_TOKEN_PREFIX}${Buffer.from(presigned, 'utf8').toString('base64')}`;
 }
 
 const IMDS = 'http://169.254.169.254';
