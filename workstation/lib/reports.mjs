@@ -170,8 +170,8 @@ function countBy(words) {
 
 // What the JSON twin of the label report takes from the driver, which writes it into
 // label-plan.json beside the report's text: the model's figures (askLabelModel's `asked`), the
-// counts of the head, and for each scope of the report (labelResults) the labels it gives with
-// the label each note had then, the exceptions left out of the plan because their notes hold their
+// counts of the head, and for each scope of the report (labelResults) the labels it gives (`to`)
+// with the label each note had then (`from`), the exceptions left out of the plan because their notes hold their
 // labels (`held`: paths), why notes were left (as leftCategory words), the notes Organize must
 // repair first, the exceptions that name no note, and the counts of the labels after the run. No
 // text of a note, reason of the model or text of an error.
@@ -181,7 +181,7 @@ export function labelPlanData({ model, asked, touched, exceptions, confirmed, re
     touched, exceptions, confirmed,
     scopes: results.map((r) => ({
       scope: r.scope,
-      labels: r.labels.map((l) => ({ path: l.path, from: l.from })),
+      labels: r.labels.map((l) => ({ path: l.path, from: l.from, to: l.to })),
       held: held.filter((path) => dirname(path) === r.scope).length,
       leftReasons: countBy(r.left.map((l) => leftCategory(l.why))),
       needsRepair: r.repair.length,
@@ -204,8 +204,9 @@ const LABEL_COUNTS = ['work', 'personal', 'general', 'unlabeled'];
 // from another label, the notes whose label was the one given already (with the exceptions that
 // held), the notes left for the next run with why (`leftReasons`, leftCategory words; with those
 // label-apply did not write), the notes Organize must repair first, the exceptions that name no
-// note, and the counts of the labels after the run as the report gives them (null for a scope the
-// run did not read).
+// note, and the counts of the labels in the notes after the run (null for a scope the run did not
+// read): the report's counts, in which a note that label-apply did not write counts with the label
+// it had (or as unlabeled), not with the one planned.
 export function labelReportData({ host, date, endedAt, data, written, unchanged, skipped }) {
   const d = isObject(data) ? data : {};
   const planned = new Map((Array.isArray(d.scopes) ? d.scopes : [])
@@ -215,15 +216,22 @@ export function labelReportData({ host, date, endedAt, data, written, unchanged,
   const scopes = names.map((scope) => {
     const p = planned.get(scope) ?? null;
     const mine = (list) => list.filter((x) => dirname(x.path) === scope);
-    const from = p && Array.isArray(p.labels) ? new Map(p.labels.filter(isObject).map((l) => [l.path, l.from])) : null;
+    const plan = p && Array.isArray(p.labels) ? new Map(p.labels.filter(isObject).map((l) => [l.path, l])) : null;
     const writes = mine(written);
-    const set = from === null ? null : writes.filter((w) => from.get(w.path) === null).length;
+    const set = plan === null ? null : writes.filter((w) => plan.get(w.path)?.from === null).length;
     const leftReasons = {};
     const add = (reason, n) => { leftReasons[reason] = (leftReasons[reason] ?? 0) + n; };
     for (const [reason, n] of Object.entries(isObject(p?.leftReasons) ? p.leftReasons : {})) if (count(n) !== null) add(reason, n);
     for (const s of mine(skipped)) add(leftCategory(s.reason), 1);
     const after = isObject(p?.labelsAfter) && LABEL_COUNTS.every((k) => count(p.labelsAfter[k]) !== null)
       ? Object.fromEntries(LABEL_COUNTS.map((k) => [k, p.labelsAfter[k]])) : null;
+    for (const s of after === null ? [] : mine(skipped)) {
+      const l = plan?.get(s.path);
+      const back = LABEL_COUNTS.includes(l?.from) ? l.from : 'unlabeled';
+      if (!LABEL_COUNTS.includes(l?.to) || l.to === back || after[l.to] === 0) continue;
+      after[l.to] -= 1;
+      after[back] += 1;
+    }
     return {
       scope, set, changed: set === null ? null : writes.length - set, unchanged: mine(unchanged).length + (count(p?.held) ?? 0),
       left: Object.values(leftReasons).reduce((a, b) => a + b, 0), leftReasons: Object.fromEntries(Object.entries(leftReasons).sort(([a], [b]) => byName(a, b))),

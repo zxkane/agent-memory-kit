@@ -323,6 +323,7 @@ function labelRun() {
   const notes = [
     note('global/a.md'), note('global/b.md', 'general'), note('global/c.md', 'work'), note('global/d.md', null, 'no frontmatter'),
     note('global/e.md', 'personal'), note('global/h.md', 'work'), note('projects/p/f.md', 'work'), note('projects/p/g.md'),
+    note('projects/p/k.md'),
   ];
   const planned = new Map([
     ['global/a.md', { label: 'work', reason: 'MODEL-REASON about the job', exception: false }],
@@ -330,6 +331,7 @@ function labelRun() {
     ['global/e.md', { label: 'personal', reason: 'MODEL-REASON the same', exception: false }],
     ['global/h.md', { label: 'work', reason: null, exception: true }],
     ['projects/p/f.md', { label: 'general', reason: 'MODEL-REASON a public tool', exception: false }],
+    ['projects/p/k.md', { label: 'personal', reason: 'MODEL-REASON the family', exception: false }],
   ]);
   const left = new Map([
     ['global/c.md', 'the model call failed (Mantle Responses HTTP 500)'],
@@ -345,7 +347,7 @@ function labelRun() {
   const applied = {
     written: [{ path: 'global/a.md', sha256: '1'.repeat(64) }, { path: 'global/b.md', sha256: '2'.repeat(64) }],
     unchanged: [{ path: 'global/e.md', sha256: '3'.repeat(64) }],
-    skipped: [{ path: 'projects/p/f.md', reason: 'changed since it was read' }],
+    skipped: [{ path: 'projects/p/f.md', reason: 'changed since it was read' }, { path: 'projects/p/k.md', reason: 'gone' }],
   };
   return { results, asked, data, applied };
 }
@@ -358,29 +360,33 @@ test('the JSON of the label report counts what label-apply did in each scope, wi
     schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', model: 'example-label-model', stopReason: 'ceiling',
     costUsd: 0.0028, turns: null, denials: null, repaired: null, requests: 2, sent: 3,
     notes: { touched: 4, exceptions: 1, recordedAsTheyWere: 2 },
-    written: 2, unchanged: 2, notWritten: 1,
+    written: 2, unchanged: 2, notWritten: 2,
     scopes: [
       {
         scope: 'global', set: 1, changed: 1, unchanged: 2, left: 1, leftReasons: { 'model-call-failed': 1 }, needsRepair: 1,
         unmatchedExceptions: 1, labelsAfter: { work: 3, personal: 2, general: 0, unlabeled: 1 },
       },
+      // The labels after the run count what is in the notes: the two that label-apply did not write
+      // keep the label they had (work, and none), not the one planned (general, personal).
       {
-        scope: 'projects/p', set: 0, changed: 0, unchanged: 0, left: 2, leftReasons: { ceiling: 1, 'changed-since-read': 1 }, needsRepair: 0,
-        unmatchedExceptions: 0, labelsAfter: { work: 0, personal: 0, general: 1, unlabeled: 1 },
+        scope: 'projects/p', set: 0, changed: 0, unchanged: 0, left: 3, leftReasons: { ceiling: 1, 'changed-since-read': 1, gone: 1 }, needsRepair: 0,
+        unmatchedExceptions: 0, labelsAfter: { work: 1, personal: 0, general: 0, unlabeled: 2 },
       },
     ],
   });
+  // As the report counted them, before label-apply.
+  assert.deepEqual(data.scopes[1].labelsAfter, { work: 0, personal: 1, general: 1, unlabeled: 1 });
   assert.equal(labelReportData({ host: 'alpha', date: '2026-11-20', data: { ...data, stop: null }, ...applied }).stopReason, 'completed');
   // Without the plan's figures (a plan that has none), only what label-apply knows.
   assert.deepEqual(labelReportData({ host: 'alpha', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', data: undefined, ...applied }), {
     schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', model: null, stopReason: null,
     costUsd: null, turns: null, denials: null, repaired: null, requests: null, sent: null,
     notes: { touched: null, exceptions: null, recordedAsTheyWere: null },
-    written: 2, unchanged: 1, notWritten: 1,
+    written: 2, unchanged: 1, notWritten: 2,
     scopes: [
       { scope: 'global', set: null, changed: null, unchanged: 1, left: 0, leftReasons: {}, needsRepair: null, unmatchedExceptions: null, labelsAfter: null },
       {
-        scope: 'projects/p', set: null, changed: null, unchanged: 0, left: 1, leftReasons: { 'changed-since-read': 1 }, needsRepair: null,
+        scope: 'projects/p', set: null, changed: null, unchanged: 0, left: 2, leftReasons: { 'changed-since-read': 1, gone: 1 }, needsRepair: null,
         unmatchedExceptions: null, labelsAfter: null,
       },
     ],
