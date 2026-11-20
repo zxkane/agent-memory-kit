@@ -449,20 +449,34 @@ check 'failing reload after a removal exits 0' test "$status" -eq 0
 check 'failing reload still removed the organize files' test ! -e "$udir/agent-memory-organize.timer" -a ! -e "$udir/agent-memory-organize.service"
 check 'failing reload is reported' has_text "$out" 'could not reload systemd'
 
-# The packages of the label step: npm ci in the kit only when a label block signs its tokens.
+# The packages of the label step: npm ci in the kit only when a label block signs its tokens and
+# its node_modules does not hold the packages of package-lock.json already.
 npm_log="$tmp/npm.log"
-printf '%s\n' '#!/bin/bash' "printf '%s|%s\\n' \"\$PWD\" \"\$*\" >> \"$npm_log\"" > "$bin/npm"
+# As npm ci does: the call is logged, and the packages it installed are recorded in
+# node_modules/.package-lock.json.
+cat > "$bin/npm" << NPM
+#!/bin/bash
+printf '%s|%s\n' "\$PWD" "\$*" >> "$npm_log"
+mkdir -p node_modules
+node -e '
+    const fs = require("node:fs");
+    const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+    const { "": root, ...packages } = lock.packages;
+    fs.writeFileSync("node_modules/.package-lock.json", JSON.stringify({ name: lock.name, lockfileVersion: lock.lockfileVersion, requires: true, packages }));
+'
+NPM
 chmod +x "$bin/npm"
-npm_call="$kit|ci --omit=dev --ignore-scripts"
-would_npm="would run npm ci --omit=dev --ignore-scripts in $kit (the packages of the label step)"
-installed="installed the packages of the label step (npm ci --omit=dev --ignore-scripts in $kit)"
+npm_call="$kit|ci --omit=dev --ignore-scripts --no-audit --no-fund"
+would_npm="would run npm ci --omit=dev --ignore-scripts --no-audit --no-fund in $kit (the packages of the label step)"
+installed="installed the packages of the label step (npm ci --omit=dev --ignore-scripts --no-audit --no-fund in $kit)"
+current="the packages of the label step in $kit/node_modules match package-lock.json; nothing to install"
 label_of() { # label_of <json of the label part>: a valid consolidate block with that label part
     printf '{"command":"/path/to/claude","model":"model-id","label":%s}' "$1"
 }
 prices='"inputUsdPerMillion":1,"outputUsdPerMillion":1'
 fresh_home
 run_setup --init alpha --repo-url "$remote" --no-enable
-rm -f "$npm_log"
+rm -rf "$npm_log" "$kit/node_modules"
 # No consolidate block, a block without a label part, a label part with a token file, an invalid
 # block: nothing to install, and nothing is said about it.
 for block in none '{"command":"/path/to/claude","model":"model-id"}' \
@@ -471,7 +485,7 @@ for block in none '{"command":"/path/to/claude","model":"model-id"}' \
     set_consolidate "$block"
     run_setup --dry-run
     check "no signing label block: dry run exits 0 ($block)" test "$status" -eq 0
-    check "no signing label block: dry run says nothing of npm ($block)" bash -c '! grep -q "npm ci" <<< "$1"' _ "$out"
+    check "no signing label block: dry run says nothing of the packages ($block)" bash -c '! grep -q "packages of the label step" <<< "$1"' _ "$out"
     run_setup --no-enable
     check "no signing label block: run exits 0 ($block)" test "$status" -eq 0
     check "no signing label block: no npm ($block)" test ! -e "$npm_log"
@@ -480,7 +494,9 @@ done
 for label in "{\"model\":\"label-model-id\",\"region\":\"us-east-1\",$prices}" \
     "{\"model\":\"label-model-id\",\"region\":\"us-east-1\",\"credentials\":\"environment\",\"roleArn\":\"arn:aws:iam::123456789012:role/example-label\",$prices}"; do
     set_consolidate "$(label_of "$label")"
-    rm -f "$npm_log"
+    rm -rf "$npm_log" "$kit/node_modules"
+    # Without node_modules: a dry run names the install and runs nothing, --prepare installs
+    # nothing, and a run installs once.
     run_setup --dry-run
     check "signing label block: dry run exits 0 ($label)" test "$status" -eq 0
     check "signing label block: dry run names the install ($label)" has_text "$out" "$would_npm"
@@ -491,19 +507,47 @@ for label in "{\"model\":\"label-model-id\",\"region\":\"us-east-1\",$prices}" \
     check "signing label block: run exits 0 ($label)" test "$status" -eq 0
     check "signing label block: npm ci in the kit, once ($label)" test "$(cat "$npm_log" 2> /dev/null)" = "$npm_call"
     check "signing label block: run says so ($label)" has_text "$out" "$installed"
+    # The packages of the lockfile are installed: nothing to install and no registry, in a dry run
+    # and in a run, and a working node_modules is never emptied.
+    rm -f "$npm_log"
+    run_setup --dry-run
+    check "installed packages: dry run says they match ($label)" has_text "$out" "$current"
+    check "installed packages: dry run would install nothing ($label)" bash -c '! grep -q "would run npm" <<< "$1"' _ "$out"
+    run_setup --no-enable
+    check "installed packages: run exits 0 ($label)" test "$status" -eq 0
+    check "installed packages: run says they match ($label)" has_text "$out" "$current"
+    check "installed packages: no npm ($label)" test ! -e "$npm_log"
 done
+# A kit update that changes the lockfile: the packages are installed again.
+cp "$kit/package-lock.json" "$tmp/package-lock.json.saved"
+node -e '
+    const fs = require("node:fs");
+    const lock = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    lock.packages[Object.keys(lock.packages).find((key) => key !== "")].version += "-changed";
+    fs.writeFileSync(process.argv[1], JSON.stringify(lock, null, 2));
+' "$kit/package-lock.json"
+rm -f "$npm_log"
+run_setup --dry-run
+check 'a changed lockfile: dry run names the install' has_text "$out" "$would_npm"
+check 'a changed lockfile: dry run runs no npm' test ! -e "$npm_log"
+run_setup --no-enable
+check 'a changed lockfile: run exits 0' test "$status" -eq 0
+check 'a changed lockfile: installed again' test "$(cat "$npm_log" 2> /dev/null)" = "$npm_call"
+check 'a changed lockfile: run says so' has_text "$out" "$installed"
+cp "$tmp/package-lock.json.saved" "$kit/package-lock.json"
 # A failed npm ci fails setup with one line, before the hooks and the units are written.
 npm_fail="$tmp/npm-fail"
 mkdir -p "$npm_fail"
 printf '%s\n' '#!/bin/bash' 'echo "npm error code ECONNREFUSED" >&2' 'exit 1' > "$npm_fail/npm"
 chmod +x "$npm_fail/npm"
-rm -rf "$udir" "$calls"
+rm -rf "$udir" "$calls" "$kit/node_modules"
 setup_path="$npm_fail:$bin:$PATH" run_setup
 check 'failed npm ci exits 1' test "$status" -eq 1
-check 'failed npm ci says so' has_text "$out" "setup.sh: npm ci --omit=dev --ignore-scripts failed in $kit; the label step cannot make its tokens without the AWS token generator. Fix the cause above and run setup.sh again."
+check 'failed npm ci says so' has_text "$out" "setup.sh: npm ci --omit=dev --ignore-scripts --no-audit --no-fund failed in $kit; the label step cannot make its tokens without the AWS token generator. Fix the cause above and run setup.sh again."
 check 'failed npm ci writes no unit' test ! -e "$udir"
 check 'failed npm ci enables nothing' no_calls
-# Without npm, setup stops at its checks and writes nothing, in a dry run too.
+# Without npm, setup stops at its checks and writes nothing, in a dry run too, when it has packages
+# to install; with the packages installed it needs no npm.
 no_npm="$tmp/no-npm"
 mkdir -p "$no_npm"
 IFS=: read -ra path_dirs <<< "$bin:$PATH"
@@ -517,11 +561,15 @@ done
 for mode in dry real; do
     if [[ $mode == dry ]]; then setup_path="$no_npm" run_setup --dry-run; else setup_path="$no_npm" run_setup; fi
     check "without npm ($mode) exits 1" test "$status" -eq 1
-    check "without npm ($mode) says why" has_text "$out" "setup.sh: npm is required: the label block in $cfg signs its tokens, and setup installs the AWS token generator for it with npm ci --omit=dev --ignore-scripts."
+    check "without npm ($mode) says why" has_text "$out" "setup.sh: npm is required: the label block in $cfg signs its tokens, and setup installs the AWS token generator for it with npm ci --omit=dev --ignore-scripts --no-audit --no-fund."
     check "without npm ($mode) writes no unit" test ! -e "$udir"
 done
+run_setup --no-enable
+setup_path="$no_npm" run_setup --no-enable
+check 'without npm, the packages installed: exits 0' test "$status" -eq 0
+check 'without npm, the packages installed: says they match' has_text "$out" "$current"
 set_consolidate none
-rm -f "$bin/npm" "$npm_log"
+rm -rf "$bin/npm" "$npm_log" "$kit/node_modules"
 run_setup --no-enable
 
 # Bridge: the second repository is cloned where bridge.agentsRepoDir says, when it is missing.
