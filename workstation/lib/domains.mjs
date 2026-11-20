@@ -11,10 +11,12 @@ const MAX_DOMAINS_BYTES = 1024 * 1024;
 const MAX_PERSONA_CHARS = 20000;
 const MAX_NOTE_BYTES = 1024 * 1024;
 // What may stand around the dash of an index line, and around and inside an author-written tag, without
-// showing: white space other than a line end, and Unicode format characters (zero-width characters, the
-// soft hyphen, joiners). One character class, so that a long run of them is matched once, not in every
-// way it could split.
-const GAP = '[[\\s\\p{Cf}]--[\\r\\n]]*';
+// showing: white space other than CR and LF, control characters, format characters (zero-width
+// characters, the soft hyphen, joiners) and the other default-ignorable characters (variation selectors,
+// Hangul fillers, the combining grapheme joiner). One character class, so that a long run of them is
+// matched once, not in every way it could split. U+2800 BRAILLE PATTERN BLANK only renders blank; it is
+// not in the class.
+const GAP = '[[\\s\\p{Cf}\\p{Cc}\\p{Default_Ignorable_Code_Point}]--[\\r\\n]]*';
 // An index line that links a note of its folder, up to the em dash after the link: `- ` and the link
 // (`link`, with the file name as `file`), then a gap (also none) and the dash. Everything after the dash
 // is the hook, with whatever gap stands at its start (also none).

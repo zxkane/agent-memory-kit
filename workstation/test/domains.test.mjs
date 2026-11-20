@@ -321,12 +321,48 @@ test('tagLine takes any gap between the link and the dash, and a line it changes
   }
 });
 
+test('tagLine takes control and default-ignorable characters as gaps', () => {
+  // A BEL, a C1 control and a Hangul filler before the run, a variation selector inside the brackets, a
+  // combining grapheme joiner and a Mongolian variation selector between the letters, NEL before the dash.
+  const probes = [
+    '- [A](a.md) — \u0007[work] about', '- [A](a.md) — \u0090[work] about', '- [A](a.md) — \u3164[work] about',
+    '- [A](a.md) — [\ufe0fwork] about', '- [A](a.md) — [w\u034fork] about', '- [A](a.md) — [w\u180bork] about',
+    '- [A](a.md)\u0085— [work] about',
+  ];
+  // The same kinds of character in lines without a run.
+  const bare = ['- [A](a.md) — \u0007about', '- [A](a.md) — \u3164about', '- [A](a.md)\u0085— about', '- [A](a.md) —\ufe0f about'];
+  for (const line of probes) {
+    // A line end stays.
+    for (const end of ['', '\r']) {
+      const input = `${line}${end}`;
+      assert.equal(tagLine(input, 'general'), `- [A](a.md) — about${end}`, input);
+      assert.equal(tagLine(input, null), `- [A](a.md) — about${end}`, input);
+      assert.equal(tagLine(input, 'work'), `- [A](a.md) — [work] about${end}`, input);
+      assert.equal(tagLine(input, 'personal'), `- [A](a.md) — [personal] about${end}`, input);
+    }
+  }
+  assert.equal(tagLine('- [A](a.md) — [work]\u0090\r', 'general'), '- [A](a.md) — \r');
+  // Without a run, a general or unlabeled line stays byte for byte as it is.
+  for (const line of bare) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, null), line, line);
+  }
+  for (const line of [...probes, ...bare]) {
+    for (const label of ['work', 'personal', 'general', null]) {
+      const once = tagLine(line, label);
+      assert.equal(tagLine(once, label), once, line);
+    }
+  }
+  // U+2800 BRAILLE PATTERN BLANK only renders blank; it is not a gap.
+  assert.equal(tagLine('- [A](a.md) — \u2800[work] about', 'general'), '- [A](a.md) — \u2800[work] about');
+});
+
 test('tagIndexLines reads the note of a line with any gap around the dash', t => {
   const dir = tmp(t);
   writeFileSync(join(dir, 'g.md'), NOTE.replace('  originSessionId: x', '  domain: general'));
   writeFileSync(join(dir, 'w.md'), NOTE.replace('  originSessionId: x', '  domain: work'));
   writeFileSync(join(dir, 'p.md'), NOTE.replace('  originSessionId: x', '  domain: personal'));
-  for (const sep of [' —', ' —\u00a0', ' —\t', '—', '\u00a0— ', '  — ', '\t—\t', '\u200b— ']) {
+  for (const sep of [' —', ' —\u00a0', ' —\t', '—', '\u00a0— ', '  — ', '\t—\t', '\u200b— ', '\u0085— ']) {
     const lines = [`- [G](g.md)${sep}[work] g`, `- [W](w.md)${sep}[personal] w`, `- [P](p.md)${sep}[work] p`, `- [G](g.md)${sep}g`];
     assert.deepEqual(tagIndexLines(lines, dir), [
       '- [G](g.md) — g', '- [W](w.md) — [work] w', '- [P](p.md) — [personal] p', `- [G](g.md)${sep}g`,

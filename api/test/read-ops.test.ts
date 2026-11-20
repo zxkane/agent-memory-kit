@@ -4,6 +4,7 @@ import { ApiError } from '../src/errors.ts';
 import { memoryIndex } from '../src/ops/index.ts';
 import { memoryRead } from '../src/ops/read.ts';
 import { memoryScopes } from '../src/ops/scopes.ts';
+import { memoryWrite } from '../src/ops/write.ts';
 import { createSnapshots } from '../src/snapshot.ts';
 import { cutToBytes, foldCase } from '../src/text.ts';
 import { fakeStore } from './fake-store.ts';
@@ -249,4 +250,14 @@ test('memory_index logs nothing when the snapshots load', async () => {
   const lines: object[] = [];
   await memoryIndex({ store, snapshots: createSnapshots(store), log: (line) => lines.push(line) }, { scope: 'global' });
   assert.deepEqual(lines, []);
+});
+
+test('memory_index strips an author tag that memory_write stored after a Hangul filler', async () => {
+  const store = fakeStore();
+  const description = '\u3164[work] after a Hangul filler';
+  await memoryWrite({ store }, { agent: 'example-agent', name: 'filler', description, content: 'Hello' });
+  const result = await memoryIndex({ store, snapshots: createSnapshots(store) }, { scope: 'agents/example-agent' });
+  // The note is unlabeled, so its line gets no tag, and the author's run goes.
+  assert.equal(result.index, '- [filler](filler.md) — after a Hangul filler\n');
+  assert.equal(store.objects.get('agents/example-agent/MEMORY.md')!.body, `- [filler](filler.md) — ${description}\n`);
 });

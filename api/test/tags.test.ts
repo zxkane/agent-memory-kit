@@ -130,3 +130,40 @@ test('tagIndexText takes any gap between the link and the dash, and a line it ch
     assert.equal(tag(line, 'personal'), line, line);
   }
 });
+
+test('tagIndexText takes control and default-ignorable characters as gaps', () => {
+  // A BEL, a C1 control and a Hangul filler before the run, a variation selector inside the brackets, a
+  // combining grapheme joiner and a Mongolian variation selector between the letters, NEL before the dash.
+  const probes = [
+    '- [A](a.md) — \u0007[work] about', '- [A](a.md) — \u0090[work] about', '- [A](a.md) — \u3164[work] about',
+    '- [A](a.md) — [\ufe0fwork] about', '- [A](a.md) — [w\u034fork] about', '- [A](a.md) — [w\u180bork] about',
+    '- [A](a.md)\u0085— [work] about',
+  ];
+  // The same kinds of character in lines without a run.
+  const bare = ['- [A](a.md) — \u0007about', '- [A](a.md) — \u3164about', '- [A](a.md)\u0085— about', '- [A](a.md) —\ufe0f about'];
+  for (const line of probes) {
+    // A line end stays.
+    for (const end of ['', '\r']) {
+      const input = `${line}${end}`;
+      assert.equal(tag(input, 'general'), `- [A](a.md) — about${end}`, input);
+      assert.equal(tagIndexText(input, new Map()), `- [A](a.md) — about${end}`, input);
+      assert.equal(tag(input, 'work'), `- [A](a.md) — [work] about${end}`, input);
+      assert.equal(tag(input, 'personal'), `- [A](a.md) — [personal] about${end}`, input);
+    }
+  }
+  assert.equal(tag('- [A](a.md) — [work]\u0090\r', 'general'), '- [A](a.md) — \r');
+  // Without a run, a general or unlabeled line stays byte for byte as it is.
+  for (const line of bare) {
+    assert.equal(tag(line, 'general'), line, line);
+    assert.equal(tagIndexText(line, new Map()), line, line);
+  }
+  for (const line of [...probes, ...bare]) {
+    for (const domain of DOMAINS) {
+      const once = tag(line, domain);
+      assert.equal(tag(once, domain), once, line);
+    }
+    assert.equal(tagIndexText(tagIndexText(line, new Map()), new Map()), tagIndexText(line, new Map()), line);
+  }
+  // U+2800 BRAILLE PATTERN BLANK only renders blank; it is not a gap.
+  assert.equal(tag('- [A](a.md) — \u2800[work] about', 'general'), '- [A](a.md) — \u2800[work] about');
+});
