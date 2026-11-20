@@ -13,7 +13,9 @@ import { collectScopeNotes, labelRecordOf } from './label-notes.mjs';
 import { selectTouched } from './label-run.mjs';
 import { REPORT_NAME_RE, REPORT_SCHEMA_VERSION, parseReport, shown, usd } from './reports.mjs';
 import { readRunLog } from './run-log.mjs';
-import { GLOBAL, cloneProblem, listProjects, liveFolder, lstatOrNull, organizeDue, scopeFolder, scopeInfo, timeOf } from './scopes.mjs';
+import {
+  GLOBAL, cloneProblem, listProjects, liveFolder, lstatOrNull, neverOrganized, organizeDue, scopeFolder, scopeInfo,
+} from './scopes.mjs';
 import { readRegular } from './workdir.mjs';
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -180,8 +182,8 @@ function readBacklog(config, scopes, state, now, problems) {
     const entry = state.projects[s.name];
     const due = organizeDue(info, entry, now.getTime());
     list.push({
-      scope: s.name, notes: info.notes, due: due !== null, dueReason: due, neverOrganized: timeOf(entry?.lastOrganize) === null,
-      overLimits: info.overLimit, lastOrganize: timeOf(entry?.lastOrganize) === null ? null : entry.lastOrganize,
+      scope: s.name, notes: info.notes, due: due !== null, dueReason: due, neverOrganized: neverOrganized(entry),
+      overLimits: info.overLimit, lastOrganize: neverOrganized(entry) ? null : entry.lastOrganize,
     });
   }
   const withNotes = list.filter((x) => x.notes > 0);

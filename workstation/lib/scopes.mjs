@@ -102,15 +102,20 @@ export const timeOf = (iso) => {
   return Number.isFinite(t) ? t : null;
 };
 
+// Whether a scope's record in consolidate.json (or none) says it was never organized: it holds no
+// time of a last organize.
+export const neverOrganized = (entry) => timeOf(entry?.lastOrganize) === null;
+
 // Why a scope is due for Organize at `now` (ms), or null when it is not. `info` is what scopeInfo
 // says of it, `entry` its record in consolidate.json (or none). A scope with notes is due when its
-// content changed since it was last organized (`changed`), or it never was (`never-organized`). One
+// content changed since it was last organized (`changed`), or it never was (`never-organized`, as
+// neverOrganized says). One
 // that did not change but is still over the index limits (`over-limits`) or still holds a conflict
 // copy (`conflict`) is due again only after REVISIT_MS: the model could not fix it last time, and
 // taking it every week would crowd out the scopes that changed.
 export function organizeDue(info, entry, now) {
   if (info.notes === 0) return null;
-  if (info.digest !== entry?.organizedDigest) return entry?.organizedDigest === undefined ? 'never-organized' : 'changed';
+  if (info.digest !== entry?.organizedDigest) return neverOrganized(entry) ? 'never-organized' : 'changed';
   if (!info.overLimit && !info.conflict) return null;
   const last = timeOf(entry?.lastOrganize) ?? -Infinity;
   if (now - last <= REVISIT_MS) return null;

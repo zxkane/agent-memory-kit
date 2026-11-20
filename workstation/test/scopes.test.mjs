@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { REVISIT_MS, organizeDue, organizeScopes } from '../lib/scopes.mjs';
+import { REVISIT_MS, neverOrganized, organizeDue, organizeScopes } from '../lib/scopes.mjs';
 
 const NOW = Date.parse('2026-11-20T12:00:00.000Z');
 const DAY_MS = 24 * 3600 * 1000;
@@ -50,4 +50,18 @@ test('organizeScopes takes exactly the scopes organizeDue names', () => {
   assert.deepEqual(new Set(due), new Set(infos.filter((i) => organizeDue(i, state.projects[i.name], NOW) !== null).map((i) => i.name)));
   // Named scopes are all taken, in the order given.
   assert.deepEqual(organizeScopes(scan, state, { projects: ['d', 'global'] }, NOW), [{ scope: 'd' }, { scope: 'global' }]);
+});
+
+test('never organized comes from one field, the time of the last organize, for the due rule and the report alike', () => {
+  // A digest without a time: never organized, by both.
+  const digestOnly = { organizedDigest: 'd0' };
+  assert.equal(neverOrganized(digestOnly), true);
+  assert.equal(organizeDue(info(), digestOnly, NOW), 'never-organized');
+  // A time without a digest: organized once, and changed since.
+  const timeOnly = { lastOrganize: at(NOW - DAY_MS) };
+  assert.equal(neverOrganized(timeOnly), false);
+  assert.equal(organizeDue(info(), timeOnly, NOW), 'changed');
+  assert.equal(neverOrganized(undefined), true);
+  assert.equal(neverOrganized({ lastOrganize: 'not a time', organizedDigest: 'd1' }), true);
+  assert.equal(organizeDue(info({ digest: 'd2' }), { lastOrganize: 'not a time', organizedDigest: 'd1' }, NOW), 'never-organized');
 });
