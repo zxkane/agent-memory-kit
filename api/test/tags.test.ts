@@ -46,3 +46,17 @@ test('tagIndexText takes the tag only from the note', () => {
   const once = tag('- [A](a.md) — about a', 'work');
   assert.equal(tag(once, 'work'), once);
 });
+
+test('tagIndexText also strips a tag token at the end of the line or before a tab', () => {
+  assert.equal(tag('- [A](a.md) — [work]', 'general'), '- [A](a.md) — ');
+  assert.equal(tag('- [A](a.md) — [work]', 'personal'), '- [A](a.md) — [personal] ');
+  assert.equal(tag('- [A](a.md) — [personal]\r', 'general'), '- [A](a.md) — \r');
+  assert.equal(tagIndexText('- [B](b.md) — [personal]\r\n', new Map()), '- [B](b.md) — \r\n');
+  assert.equal(tag('- [A](a.md) — [work]\tabout a', 'general'), '- [A](a.md) — \tabout a');
+  assert.equal(tag('- [A](a.md) — [work]\tabout a', 'personal'), '- [A](a.md) — [personal] \tabout a');
+  assert.equal(tag('- [A](a.md) — about [work]', 'general'), '- [A](a.md) — about [work]');
+  for (const line of ['- [A](a.md) — [work]', '- [A](a.md) — [personal]\r', '- [A](a.md) — [work]\tx']) {
+    const once = tag(line, 'work');
+    assert.equal(tag(once, 'work'), once);
+  }
+});
