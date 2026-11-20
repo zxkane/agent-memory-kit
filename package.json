@@ -8,7 +8,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "test": "node --test workstation/test/*.test.mjs && bash test/setup.test.sh"
+    "test": "bash test/run.sh"
   },
   "dependencies": {
     "@aws-sdk/credential-providers": "3.1173.0",

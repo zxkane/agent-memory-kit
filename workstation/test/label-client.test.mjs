@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { getEventListeners } from 'node:events';
-import { chmodSync, cpSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,7 @@ import {
   tokenForRun,
 } from '../lib/label-client.mjs';
 import { askLabelModel } from '../lib/label-run.mjs';
-import { tempDir } from './helpers.mjs';
+import { NO_INSTANCE_METADATA, isolatedEnv, tempDir } from './helpers.mjs';
 
 const PKG = join(dirname(fileURLToPath(import.meta.url)), '..');
 // The kit's checkout, where the packages of the label step are installed.
@@ -504,6 +504,50 @@ test('an instance metadata service that gives no IMDSv2 answer is named as such'
   assert.deepEqual({ error: out.error, transport: out.transport, sent: out.sent }, { error: NO_IMDSV2, transport: true, sent: false });
 });
 
+test('under the test environment the real instance metadata provider fails fast, reaching nothing beyond loopback', (t) => {
+  // npm test runs every test without any AWS_* variable but this endpoint, a closed loopback port,
+  // and the explicit child environments of the tests carry it too. Checked before anything runs.
+  const LOOPBACK = 'http://127.0.0.1:9';
+  assert.equal(JSON.parse(readFileSync(join(KIT, 'package.json'), 'utf8')).scripts.test, 'bash test/run.sh');
+  const runner = readFileSync(join(KIT, 'test', 'run.sh'), 'utf8');
+  assert.match(runner, /^ {4}if \[\[ \$name == AWS_\* \]\]; then unset "\$name"; fi$/m);
+  assert.match(runner, /^export AWS_EC2_METADATA_SERVICE_ENDPOINT=http:\/\/127\.0\.0\.1:9$/m);
+  const env = isolatedEnv(tempDir(t));
+  assert.equal(env.AWS_EC2_METADATA_SERVICE_ENDPOINT, LOOPBACK);
+  assert.deepEqual(Object.keys(env).filter((name) => name.startsWith('AWS_')), ['AWS_EC2_METADATA_SERVICE_ENDPOINT']);
+  // A child with that environment, whose TCP connections are logged, and refused beyond loopback.
+  const code = `
+    import net from 'node:net';
+    const connects = [];
+    const connect = net.Socket.prototype.connect;
+    net.Socket.prototype.connect = function (...args) {
+      const [first] = args;
+      const options = Array.isArray(first) ? first[0] : typeof first === 'object' ? first : { port: first, host: args[1] };
+      const target = String(options.host ?? 'localhost') + ':' + String(options.port);
+      connects.push(target);
+      if (!target.startsWith('127.0.0.1:')) throw new Error('blocked by the test');
+      return connect.apply(this, args);
+    };
+    const { loadTokenPackages, requestLabels, tokenForRun } = await import(${JSON.stringify(join(PKG, 'lib', 'label-client.mjs'))});
+    const started = Date.now();
+    const { fromInstanceMetadata } = await loadTokenPackages();
+    const name = await fromInstanceMetadata({ ec2MetadataV1Disabled: true })().then(() => 'credentials', (err) => err.name);
+    const run = await tokenForRun(${JSON.stringify({ ...LABEL, credentials: 'instance' })});
+    const out = await requestLabels({
+      prompt: 'P', label: ${JSON.stringify(LABEL)}, provideToken: run.provideToken, fetchImpl: async () => { throw new Error('no request'); },
+    });
+    console.log(JSON.stringify({ name, error: out.error, sent: out.sent, ms: Date.now() - started, connects }));
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { env, encoding: 'utf8', timeout: 30000 });
+  assert.equal(r.status, 0, r.stderr);
+  const got = JSON.parse(r.stdout);
+  assert.equal(got.name, 'InstanceMetadataV1FallbackError');
+  assert.deepEqual([got.error, got.sent], [NO_IMDSV2, false]);
+  assert.ok(got.ms < 5000, `${got.ms} ms`);
+  assert.ok(got.connects.length > 0, 'the provider tried the endpoint');
+  assert.deepEqual([...new Set(got.connects)], ['127.0.0.1:9']);
+});
+
 test('a token that cannot be made for a retry ends the request at once', async () => {
   let tokens = 0;
   const provideToken = async () => {
@@ -559,7 +603,7 @@ test('a pass that signs without the AWS packages fails closed, naming the comman
     `const { tokenForRun } = await import(${JSON.stringify(join(kit, 'workstation', 'lib', 'label-client.mjs'))});`,
     `await tokenForRun(${JSON.stringify({ ...LABEL, credentials: 'instance' })}).then(() => console.log('made'), (err) => console.log(err.message));`,
   ].join('\n');
-  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', env: { PATH: process.env.PATH, ...NO_INSTANCE_METADATA } });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, `the AWS token generator is not installed; run npm ci --omit=dev --ignore-scripts in ${kit}\n`);
 });

@@ -1263,7 +1263,7 @@ npm ci --ignore-scripts
 npm test
 ```
 
-installs the two packages of the label step without running any package script, then runs the unit tests (`node --test`; those of the label step use the token generator offline, with fake credentials) and the setup script test, which uses a temporary home directory and a fake `systemctl`. The tests run Git with a temporary home directory and without the system configuration, so your own Git settings do not change their results. CI also runs them with Git 2.30 in a Debian 11 container.
+installs the two packages of the label step without running any package script, then runs the unit tests (`node --test`; those of the label step use the token generator offline, with fake credentials) and the setup script test, through `test/run.sh`: it removes every `AWS_*` variable and points the instance metadata endpoint of AWS's packages at a closed loopback port (`AWS_EC2_METADATA_SERVICE_ENDPOINT`), as do the tests' own child processes, so that no test can reach a real instance metadata service or real credentials. The setup script test uses a temporary home directory and a fake `systemctl`. The tests run Git with a temporary home directory and without the system configuration, so your own Git settings do not change their results. CI also runs them with Git 2.30 in a Debian 11 container.
 
 ## License
 

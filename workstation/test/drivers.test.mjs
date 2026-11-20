@@ -10,7 +10,7 @@ import { loadConfig } from '../lib/config.mjs';
 import { TOOL_BUDGET, buildToolContext, textCost } from '../lib/context.mjs';
 import { memoryLinkPath } from '../lib/project.mjs';
 import { readStatus } from '../lib/sync-engine.mjs';
-import { isolatedEnv, isolateGit, makeRemoteAndClones, sh, tempDir } from './helpers.mjs';
+import { NO_INSTANCE_METADATA, isolatedEnv, isolateGit, makeRemoteAndClones, sh, tempDir } from './helpers.mjs';
 
 isolateGit();
 
@@ -308,8 +308,9 @@ test('only a label pass that signs loads the AWS packages, when it takes its tok
     const signed = await tokenForRun(label);
     process.stdout.write((await signed.provideToken()).slice(0, 16));
   `;
+  // Fake environment credentials only, and the closed instance metadata endpoint.
   const env = {
-    PATH: process.env.PATH, AM_LOAD_LOG: log,
+    PATH: process.env.PATH, AM_LOAD_LOG: log, ...NO_INSTANCE_METADATA,
     AWS_ACCESS_KEY_ID: 'AKIDEXAMPLE', AWS_SECRET_ACCESS_KEY: 'example-signing-value', AWS_SESSION_TOKEN: 'example-session-value',
   };
   const r = spawnSync(process.execPath, ['--import', hook, '--input-type=module', '-e', code], { env, encoding: 'utf8' });
