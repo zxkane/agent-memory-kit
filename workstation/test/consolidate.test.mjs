@@ -3183,6 +3183,19 @@ test('failed answers do not stop the pass', (t) => {
   assert.doesNotMatch(r.stdout + r.stderr, /FAKE-MANTLE-BODY/);
 });
 
+test('a batch whose answer fails is split, and labels its notes when its halves are answered', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  f.mantle({ labels: { 'projects/p/a.md': 'work', 'projects/p/b.md': 'work', 'projects/p/c.md': 'personal' }, fail: { status: 400, times: 1 } });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md'], ['projects/p/a.md', 'projects/p/b.md'], ['projects/p/c.md']]);
+  assert.match(r.stdout, /^label: applied, 3 label\(s\) written, 0 unchanged, USD 0\.00, 3 request\(s\)$/m);
+  assert.equal(liveText(f, 'projects/p/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md']);
+  assert.match(f.labelReport(), /^- Notes: 3 touched, 3 sent to the model, 0 with an exception, 0 recorded as they were$/m);
+});
+
 // ---- The label pass over the agent scopes: label --agents, and the end of every organize --agents run ----
 
 // The agent scopes' bucket (fake-s3-preload.mjs) and a label block, with the fake Mantle
