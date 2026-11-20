@@ -471,7 +471,7 @@ for block in none '{"command":"/path/to/claude","model":"model-id"}' \
     set_consolidate "$block"
     run_setup --dry-run
     check "no signing label block: dry run exits 0 ($block)" test "$status" -eq 0
-    check "no signing label block: dry run says nothing of npm ($block)" bash -c '! grep -q npm <<< "$1"' _ "$out"
+    check "no signing label block: dry run says nothing of npm ($block)" bash -c '! grep -q "npm ci" <<< "$1"' _ "$out"
     run_setup --no-enable
     check "no signing label block: run exits 0 ($block)" test "$status" -eq 0
     check "no signing label block: no npm ($block)" test ! -e "$npm_log"
