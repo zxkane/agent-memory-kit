@@ -21,7 +21,17 @@ const HASH_RE = /^[0-9a-f]{64}$/;
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 const isMissing = (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDIR');
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const capped = (text) => (text.length > NOTE_TEXT_CAP ? `${text.slice(0, NOTE_TEXT_CAP)}${CUT_MARKER}` : text);
+
+// The one cut rule: text longer than NOTE_TEXT_CAP is cut there and followed by CUT_MARKER. A cut
+// right after a high surrogate drops it, so no lone surrogate reaches a JSON body. Text that
+// already ends with the marker is returned as it is, so cutting twice is the same as once.
+export function capped(text) {
+  if (text.length <= NOTE_TEXT_CAP || text.endsWith(CUT_MARKER)) return text;
+  let end = NOTE_TEXT_CAP;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${text.slice(0, end)}${CUT_MARKER}`;
+}
 
 // The notes of a scope folder that the label step takes, sorted by file name: its regular note
 // files except the index, a retired note (a `MOVED TO` stub) and a conflict copy. `scope` is

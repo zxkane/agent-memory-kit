@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync,
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import {
-  CUT_MARKER, NOTE_TEXT_CAP, applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests,
+  CUT_MARKER, NOTE_TEXT_CAP, applyLabelEntries, capped, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests,
 } from '../lib/label-notes.mjs';
 import { tempDir } from './helpers.mjs';
 
@@ -38,6 +38,15 @@ test('collectScopeNotes cuts a long body and marks the cut', (t) => {
   assert.equal(long.body, `${'x'.repeat(5999)}é${CUT_MARKER}`);
   // The digest is of the whole file, not of the text that was kept.
   assert.equal(long.sha256, sha(readFileSync(join(dir, 'long.md'))));
+});
+
+test('a cut that lands after a high surrogate drops it', (t) => {
+  const dir = tempDir(t);
+  writeFileSync(join(dir, 'emoji.md'), `${HEAD}${'x'.repeat(5999)}\u{1F600}${'y'.repeat(100)}`);
+  const [note] = collectScopeNotes(dir, 'global');
+  assert.equal(note.body, `${'x'.repeat(5999)}${CUT_MARKER}`);
+  assert.equal(note.body.isWellFormed(), true);
+  assert.equal(capped(note.body), note.body);
 });
 
 test('collectScopeNotes names the notes whose frontmatter setDomain cannot edit', (t) => {
