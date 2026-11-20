@@ -155,6 +155,8 @@ function fixture(t, { consolidate = {}, block = true } = {}) {
     remoteFiles: () => sh(remote, 'git', ['ls-tree', '-r', '--name-only', 'main']).trim().split('\n'),
     reports: () => (existsSync(join(a, '_reports')) ? readdirSync(join(a, '_reports')).sort() : []),
     reportJson: (name) => JSON.parse(readFileSync(join(a, '_reports', name), 'utf8')),
+    runLog: () => (existsSync(join(state, 'runs.jsonl'))
+      ? readFileSync(join(state, 'runs.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []),
     workRoot: () => join(state, 'consolidate'),
   };
   f.setConfig();
@@ -356,6 +358,9 @@ test('SIGTERM during the model run stops the model and removes the work folder, 
   assert.equal(f.head(), head);
   assert.match(stdout, /^extract p: aborted, nothing applied/m);
   assert.equal(f.readState().projects.p.lastExtract, undefined);
+  const [line] = f.runLog();
+  assert.deepEqual([line.kind, line.exitCode, line.stop], ['extract', 143, 'interrupted']);
+  assert.deepEqual(line.scopes.map((x) => [x.scope, x.outcome]), [['h', 'no-session'], ['p', 'aborted']]);
 });
 
 test('SIGINT and SIGHUP stop the model, apply nothing and free the lock', async (t) => {
@@ -516,6 +521,7 @@ test('organize picks due scopes only: over-limit, then conflicts, then changed; 
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(f.calls().map((c) => c.scope), ['big']);
   assert.match(r.stdout, /^organize big: no-change, 0 change\(s\)/m);
+  assert.deepEqual([f.runLog()[0].stop, f.runLog()[0].scopes.map((x) => x.scope)], ['max-projects', ['big']]);
 
   // big is unchanged since and was organized moments ago: not due, though still over the limit.
   f.setConfig({ maxProjects: 5 });
@@ -750,6 +756,7 @@ test('F3: a session file touched again that holds only turns from before the win
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^extract h: no-session/m);
   assert.deepEqual(f.calls(), []);
+  assert.deepEqual(f.runLog()[0].scopes, [{ scope: 'h', outcome: 'no-session', stopReason: null, costUsd: 0, truncated: false, sessionsLeftOut: 0 }]);
 });
 
 test('F3: with lastExtract 60 days ago, only the last 28 days are read', (t) => {
@@ -782,6 +789,7 @@ test('F3: a cut digest is shown in the headline, the report and lastOutcome; a w
   let outcome = f.readState().projects.h.lastOutcome;
   assert.equal(outcome.truncated, true);
   assert.equal(outcome.sessionsLeftOut, 0);
+  assert.deepEqual(f.runLog()[0].scopes, [{ scope: 'h', outcome: 'applied', stopReason: 'completed', costUsd: 0.25, truncated: true, sessionsLeftOut: 0 }]);
 
   r = f.run('extract', '--project', 'p');
   assert.match(r.stdout, /^extract p: applied, 2 change\(s\), USD 0\.25, stopped: completed$/m);
@@ -1084,6 +1092,9 @@ test('a dry run with a failing model is model-failed, exits 1 and moves no mark'
   assert.match(r.stdout, /^organize p: model-failed, nothing applied, USD unknown, stopped: no-result$/m);
   const p = f.readState().projects.p;
   assert.deepEqual(Object.keys(p), ['lastOutcome']);
+  const [line] = f.runLog();
+  assert.deepEqual([line.dryRun, line.exitCode, line.costUsd, line.scopes], [true, 1, null, [{ scope: 'p', outcome: 'model-failed', stopReason: 'no-result', costUsd: null }]]);
+  assert.equal('stop' in line || 'error' in line, false);
 });
 
 test('extract orders by lastExtractTried: a project rejected every run does not starve the others', (t) => {
@@ -1139,6 +1150,7 @@ test('with named projects the run stops starting scopes once its cost reaches th
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(f.calls().map((c) => c.scope), ['p1', 'p2']);
   assert.match(r.stdout, /ceiling of USD 3\.00/);
+  assert.deepEqual([f.runLog()[0].stop, f.runLog()[0].costUsd], ['ceiling', 3]);
 });
 
 test('item 3: named projects each get their budget; without --project the ceiling is maxProjects × maxBudgetUsd', (t) => {
@@ -1229,6 +1241,8 @@ test('usage errors: unknown kind or option, a project that is not a plain projec
     assert.match(r.stderr, /usage/);
   }
   assert.deepEqual(f.calls(), []);
+  // A name that is no project folder is known only after the scan: those runs have a line.
+  assert.deepEqual(f.runLog().map((l) => [l.kind, l.exitCode, l.error, l.scopes]), [['organize', 2, 'usage', []], ['organize', 2, 'usage', []]]);
 });
 
 test('--model replaces the configured model for one run', (t) => {
@@ -1390,6 +1404,7 @@ test('a model command that cannot start is model-failed and ends the run at once
   assert.equal(r.status, 1);
   assert.match(r.stdout, /^organize p: model-failed, nothing applied, USD unknown, stopped: spawn-failed$/m);
   assert.doesNotMatch(r.stdout, /organize q:/);
+  assert.deepEqual([f.runLog()[0].exitCode, f.runLog()[0].stop], [1, 'model-not-started']);
   const state = f.readState().projects;
   assert.equal(state.p.lastOutcome.outcome, 'model-failed');
   assert.equal(state.p.organizedDigest, undefined);
@@ -1488,6 +1503,9 @@ test('a missing clone, or a folder that is not a clone, ends the run with a mess
     assert.doesNotMatch(r.stdout, /nothing to do/);
   }
   assert.deepEqual(f.calls(), []);
+  // The line names the failure with a fixed word, never with the message, which holds a path.
+  assert.deepEqual(f.runLog().map((l) => [l.exitCode, l.error, l.scopes]), [[1, 'scan-failed', []], [1, 'scan-failed', []]]);
+  assert.doesNotMatch(readFileSync(join(f.state, 'runs.jsonl'), 'utf8'), /nowhere|plain/);
 });
 
 test('run folders older than a day are removed at the start unless marked by --keep', (t) => {
@@ -2213,6 +2231,9 @@ test('TC-AGENT-ORG-001 (driver): organize --agents merges two duplicate notes an
   const state = JSON.parse(b['index/organizer.json']).scopes['codex-alpha'];
   assert.ok(state.lastOrganize && state.lastOrganizeTried && /^[0-9a-f]{64}$/.test(state.organizedDigest));
   assert.equal(state.lastOutcome.outcome, 'applied');
+  const [line] = f.runLog();
+  assert.deepEqual([line.kind, line.agents, line.exitCode, line.scopes, line.costUsd, 'label' in line],
+    ['organize', true, 0, [{ scope: 'agents/codex-alpha', outcome: 'applied', stopReason: 'completed', costUsd: 0.25 }], 0.25, false]);
   // Every write was conditional.
   for (const w of writes(f.log())) assert.ok(w.ifMatch !== null || w.ifNoneMatch === '*', `${w.method} ${w.key}`);
   // Nothing changed since: the next run takes nothing and calls no model.
@@ -2344,6 +2365,63 @@ test('organize --agents: usage errors, a missing agents block and missing creden
   assert.equal(r.status, 1);
   assert.match(r.stdout, /organizing the agent scopes needs "agents" in the consolidate block/);
   assert.deepEqual(plain.calls(), []);
+  assert.deepEqual(f.runLog().map((l) => [l.agents, l.exitCode, l.error]), [[true, 2, 'usage'], [true, 1, 'agents-unreadable']]);
+  assert.deepEqual(plain.runLog().map((l) => [l.exitCode, l.error]), [[1, 'agents-not-configured']]);
+});
+
+// ---- The run log: <stateDir>/runs.jsonl ----
+
+test('every run adds one line to the run log: one that applied, one with nothing to do, a dry run', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct(mergeInstruction());
+  const before = Date.now();
+  assert.equal(f.run('organize').status, 0);
+  const [line] = f.runLog();
+  assert.match(line.runId, /^\d{8}T\d{6}Z-\d+$/);
+  assert.deepEqual({ ...line, runId: undefined, startedAt: undefined, endedAt: undefined }, {
+    schemaVersion: 1, runId: undefined, host: 'alpha', kind: 'organize', agents: false, dryRun: false, startedAt: undefined, endedAt: undefined,
+    exitCode: 0, scopes: [{ scope: 'p', outcome: 'applied', stopReason: 'completed', costUsd: 0.25 }], costUsd: 0.25,
+  });
+  const [start, end] = [Date.parse(line.startedAt), Date.parse(line.endedAt)];
+  assert.ok(before <= start && start <= end && end <= Date.now(), JSON.stringify(line));
+  assert.equal(statSync(join(f.state, 'runs.jsonl')).mode & 0o777, 0o600);
+  // A run with nothing to do and a dry run add theirs.
+  assert.equal(f.run('organize').status, 0);
+  f.seed({ 'projects/p/c.md': note('c', 'C', 'Gamma.') });
+  f.instruct({});
+  assert.equal(f.run('organize', '--dry-run').status, 0);
+  const [, idle, dry] = f.runLog();
+  assert.deepEqual([idle.exitCode, idle.dryRun, idle.scopes, idle.costUsd], [0, false, [], 0]);
+  assert.deepEqual([dry.dryRun, dry.scopes.map((x) => x.outcome)], [true, ['no-change']]);
+  assert.notEqual(idle.runId, line.runId);
+  // The log is this machine's own: nothing of it reaches the clone.
+  assert.ok(!f.remoteFiles().some((name) => /runs/.test(name)));
+});
+
+test('a run that crashes adds its line too, with a fixed word for the failure', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  // The folder for the run's work folders is a file: the run cannot make its work folder.
+  mkdirSync(f.state, { recursive: true });
+  writeFileSync(f.workRoot(), 'not a folder\n');
+  const r = f.run('organize');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^agent-memory consolidate failed: /m);
+  const [line] = f.runLog();
+  assert.deepEqual([line.exitCode, line.error, line.scopes], [1, 'crash', []]);
+  assert.doesNotMatch(JSON.stringify(line), /EEXIST|ENOTDIR|not a folder/);
+});
+
+test('a run log that cannot be written leaves the run and its exit code as they were, and says so', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct(mergeInstruction());
+  mkdirSync(join(f.state, 'runs.jsonl'), { recursive: true });
+  const r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^organize p: applied/m);
+  assert.match(r.stderr, /^agent-memory consolidate: the run could not be added to the run log \(runs\.jsonl is not a regular file\)$/m);
 });
 
 // ---- The label steps: run.sh consolidate-step label-read | label-apply ----
@@ -2804,6 +2882,15 @@ test('the first label run sends only unlabeled notes', (t) => {
   assert.deepEqual(parseReport(report), {
     ...json, stopReason: null, costUsd: Number(json.costUsd.toFixed(2)), written: null, unchanged: null, notWritten: null, scopes: null,
   });
+  // The run's line: no scope of a model run, and the label pass with its figures.
+  const [line] = f.runLog();
+  assert.deepEqual({ ...line, runId: undefined, startedAt: undefined, endedAt: undefined, costUsd: undefined, label: { ...line.label, costUsd: undefined } }, {
+    schemaVersion: 1, runId: undefined, host: 'alpha', kind: 'label', agents: false, dryRun: false, startedAt: undefined, endedAt: undefined,
+    exitCode: 0, scopes: [], costUsd: undefined,
+    label: { outcome: 'applied', failed: false, stop: null, costUsd: undefined, requests: 1, sent: 1, written: 1, unchanged: 0, notWritten: 0 },
+  });
+  assert.equal(line.costUsd, line.label.costUsd);
+  assert.equal(line.costUsd, json.costUsd);
 });
 
 test('an unchanged store sends nothing', (t) => {
@@ -2979,6 +3066,9 @@ test('organize ends with the label pass', (t) => {
   assert.match(f.labelReport(), /^- Model: example-label-model;/m);
   assert.match(f.subjects()[0], /^consolidate\(alpha\): label 1 note\(s\) \(3 file\(s\)\)$/);
   assert.match(f.subjects()[1], /^consolidate\(alpha\): organize projects\/p /);
+  const [line] = f.runLog();
+  assert.deepEqual([line.kind, line.scopes.map((x) => [x.scope, x.outcome]), line.label.outcome, line.label.written], ['organize', [['p', 'applied']], 'applied', 1]);
+  assert.equal(line.costUsd, Math.round((0.25 + line.label.costUsd) * 1e6) / 1e6);
 });
 
 test('missing inputs stop the pass', (t) => {
@@ -3071,6 +3161,9 @@ test('two failed batches in a row stop the pass', (t) => {
   assert.match(report, /^- projects\/q\/b\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
   assert.match(report, /^- projects\/r\/c\.md: not sent; 2 batches in a row failed$/m);
   assert.doesNotMatch(r.stdout + r.stderr + report, /FAKE-MANTLE-BODY/);
+  const [line] = f.runLog();
+  assert.deepEqual([line.exitCode, line.label.outcome, line.label.failed, line.label.stop, line.label.written], [1, 'applied', true, 'failures', 1]);
+  assert.doesNotMatch(JSON.stringify(line), /FAKE-MANTLE-BODY|HTTP 500/);
 });
 
 test('a pass whose tokens are signed takes a new one for each request: no age stop', (t) => {
@@ -3159,6 +3252,7 @@ test('a dry run writes nothing', (t) => {
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /^label: dry-run, 1 label\(s\) to set or change, USD 0\.00, 1 request\(s\)$/m);
   assert.match(r.stdout, /^- projects\/p\/c\.md: unlabeled → personal — fake reason for projects\/p\/c\.md$/m);
+  assert.deepEqual([f.runLog()[0].dryRun, f.runLog()[0].label.outcome, f.runLog()[0].label.written], [true, 'dry-run', 0]);
   assert.deepEqual(f.requests(), [{ paths: ['projects/p/c.md'], auth: true }]);
   assert.equal(liveText(f, 'projects/p/c.md'), note('c', 'C', 'Gamma.'));
   assert.equal(f.head(), head);
@@ -3200,6 +3294,7 @@ test('label without the block says so', (t) => {
   const o = f.run('organize');
   assert.equal(o.status, 0, o.stdout + o.stderr);
   assert.doesNotMatch(o.stdout, /^label/m);
+  assert.deepEqual(f.runLog().map((l) => [l.kind, l.exitCode, l.error ?? null, 'label' in l]), [['label', 1, 'label-not-configured', false], ['organize', 0, null, false]]);
 });
 
 test('a note that Organize must repair first is never sent to the model', (t) => {
@@ -3481,6 +3576,12 @@ test('organize --agents ends with the label pass', (t) => {
   assert.match(again.stdout, /^organize: nothing to do\nlabel agents\/codex-alpha: nothing to do$/m);
   assert.equal(f.calls().length, 1);
   assert.equal(f.requests().length, 1);
+  const [first, second] = f.runLog();
+  assert.deepEqual({ ...first.label, costUsd: undefined }, {
+    outcome: 'done', failed: false, stop: null, costUsd: undefined, requests: 1, sent: 1, written: 1, unchanged: 0, notWritten: 0,
+    scopes: [{ scope: 'agents/codex-alpha', outcome: 'applied', written: 1, unchanged: 0, notWritten: 0 }],
+  });
+  assert.deepEqual([second.scopes, second.label.scopes.map((x) => x.outcome)], [[], ['nothing-to-do']]);
   // Every write was conditional and within what the organizer role may write; the label model's
   // reasons and the token reach no output, and the model client never saw the token or the job's
   // credentials.
@@ -3610,6 +3711,7 @@ test('label --agents: usage errors, missing blocks and an unknown agent', (t) =>
   const unknown = f.labelAgents('--agent', 'nobody');
   assert.equal(unknown.status, 2);
   assert.match(unknown.stderr, /"nobody" is not an agent scope of the bucket\./);
+  assert.deepEqual(f.runLog().map((l) => [l.kind, l.agents, l.exitCode, l.error]), [['label', true, 2, 'usage']]);
   const noAgents = agentLabelFixture(t, { block: null });
   let r = noAgents.labelAgents();
   assert.equal(r.status, 1);
@@ -3618,6 +3720,8 @@ test('label --agents: usage errors, missing blocks and an unknown agent', (t) =>
   r = noLabel.labelAgents();
   assert.equal(r.status, 1);
   assert.match(r.stdout, /^agent-memory: labeling needs "label" in the consolidate block of \S+; nothing was run\.$/m);
+  assert.deepEqual(noAgents.runLog().map((l) => l.error), ['agents-not-configured']);
+  assert.deepEqual(noLabel.runLog().map((l) => l.error), ['label-not-configured']);
   // organize --agents without a label block ends without a label pass.
   noLabel.instruct({});
   r = noLabel.organizeAgents();
