@@ -87,8 +87,11 @@ function readState(stateDir, problems) {
 }
 
 // The reports of the window: each `.json` twin, and each `.md` report without one, which
-// parseReport reads (`source: 'markdown'`), by date, then by name. A report is in the window when
-// the day of its name lies between the window's first and last days.
+// parseReport reads (`source: 'markdown'`), by the end of their run (or their day), then by name. A
+// twin is in the window when its run ended in it (`endedAt` in [since, until), as a run line); a
+// report without a time, from its Markdown, when its day lies in [the first day, the last day): one
+// of the window's last day counts in the next window, so that windows that follow each other never
+// count a report twice.
 function readReports(repoDir, window, problems) {
   const dir = join(repoDir, '_reports');
   const st = lstatOrNull(dir);
@@ -98,6 +101,7 @@ function readReports(repoDir, window, problems) {
     return [];
   }
   const [first, last] = [window.since.slice(0, 10), window.until.slice(0, 10)];
+  const [since, until] = [Date.parse(window.since), Date.parse(window.until)];
   let names;
   try {
     names = readdirSync(dir).sort(byName);
@@ -109,7 +113,8 @@ function readReports(repoDir, window, problems) {
   const reports = [];
   for (const name of names) {
     const m = REPORT_NAME_RE.exec(name);
-    if (!m || m[1] < first || m[1] > last) continue;
+    // A twin is named by the day its run ended: only those of the window's days can be in it.
+    if (!m || m[1] < first || m[1] > last || (m[2] === 'md' && m[1] === last)) continue;
     const base = name.slice(0, -m[2].length - 1);
     if (m[2] === 'md' && twins.has(`${base}.json`)) continue;
     // The name of a file in the clone may hold anything; one that looks like a credential is withheld.
@@ -146,9 +151,13 @@ function readReports(repoDir, window, problems) {
       }
     }
     const source = m[2] === 'md' ? 'markdown' : 'json';
-    reports.push(Object.assign({ file, source }, data, { file, source }));
+    const ended = typeof data.endedAt === 'string' ? Date.parse(data.endedAt) : NaN;
+    if (source === 'json' && !Number.isFinite(ended)) problems.push({ file, problem: 'endedAt has the wrong type' });
+    const inWindow = Number.isFinite(ended) ? ended >= since && ended < until : m[1] < last;
+    if (inWindow) reports.push(Object.assign({ file, source }, data, { file, source }));
   }
-  return reports.sort((a, b) => byName(a.date, b.date) || byName(a.file, b.file));
+  const key = (r) => (typeof r.endedAt === 'string' ? r.endedAt : String(r.date));
+  return reports.sort((a, b) => byName(key(a), key(b)) || byName(a.file, b.file));
 }
 
 // The scope folders of the clone that Organize takes: global/ (when it may be used) and each
@@ -230,9 +239,10 @@ export function consolidationReport({ config, now, since }) {
   const window = { since: since.toISOString(), until: now.toISOString() };
   const log = readRunLog(config.stateDir);
   problems.push(...log.problems);
+  // A run is in the window when it ended in [since, until).
   const runs = log.runs.filter((run) => {
     const t = Date.parse(run.endedAt);
-    return t >= since.getTime() && t <= now.getTime();
+    return t >= since.getTime() && t < now.getTime();
   });
   if (config.consolidateProblem) problems.push({ file: null, problem: `the consolidate block is invalid (${config.consolidateProblem})` });
   let clone = null;

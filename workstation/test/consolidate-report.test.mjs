@@ -5,7 +5,8 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildReport } from '../lib/reports.mjs';
+import { buildReport, reportData } from '../lib/reports.mjs';
+import { consolidationReport, parseReportArgs } from '../lib/run-report.mjs';
 import { isolatedEnv, isolateGit, sh, tempDir } from './helpers.mjs';
 
 isolateGit();
@@ -43,9 +44,9 @@ function snapshotOf(dir) {
   return out;
 }
 
-// A JSON report as the kit writes it.
-const extractJson = (host, date, scope, extra = {}) => ({
-  schemaVersion: 1, host, kind: 'extract', scope, date, model: 'example-model', stopReason: 'completed', costUsd: 0.25, turns: 4,
+// A JSON report as the kit writes it, of a run that ended `daysAgo` days ago.
+const extractJson = (host, daysAgo, scope, extra = {}) => ({
+  schemaVersion: 1, host, kind: 'extract', scope, date: day(daysAgo), endedAt: at(daysAgo), model: 'example-model', stopReason: 'completed', costUsd: 0.25, turns: 4,
   denials: 0, repaired: 0, conversation: { truncated: false, bytes: 900, sessionsLeftOut: 0 }, folders: [],
   retention: { termsKept: 1, termsBefore: 1, share: 1 }, counts: { added: 1, changed: 1, retired: 0, notApplied: 0 },
   changes: [{ kind: 'add', path: 'n.md' }, { kind: 'change', path: 'MEMORY.md' }], ...extra,
@@ -83,9 +84,9 @@ function reportFixture(t, { organize = 'Sun *-*-* 04:30' } = {}) {
     labels: { version: 1, notes: { 'global/g.md': shaOf('global/g.md'), 'projects/example-project/a.md': '0'.repeat(64) } },
   }));
   const reports = {
-    [`${day(1)}-alpha-extract-example-project.json`]: JSON.stringify(extractJson('alpha', day(1), 'example-project')),
+    [`${day(1)}-alpha-extract-example-project.json`]: JSON.stringify(extractJson('alpha', 1, 'example-project')),
     [`${day(1)}-alpha-extract-example-project.md`]: '# kept beside its twin, never read\n',
-    [`${day(2)}-beta-extract-kept.json`]: JSON.stringify(extractJson('beta', day(2), 'kept', { costUsd: null })),
+    [`${day(2)}-beta-extract-kept.json`]: JSON.stringify(extractJson('beta', 2, 'kept', { costUsd: null })),
     [`${day(3)}-alpha-organize-big.md`]: buildReport({
       config: { host: 'alpha' }, kind: 'organize', scope: 'big', date: day(3), model: 'example-model', stopReason: 'completed',
       costUsd: 0.5, turns: 9, denials: 0, pairs: [{ label: 'notes' }], snap: { notes: { 'old.md': 'h' } },
@@ -99,9 +100,9 @@ function reportFixture(t, { organize = 'Sun *-*-* 04:30' } = {}) {
       descriptions: new Map(), conversation: null,
     }),
     [`${day(4)}-alpha-label.json`]: '{"schemaVersion": 1, "kind": "label", "host": "alpha", "date": "cut',
-    [`${day(5)}-gamma-organize-x.json`]: JSON.stringify({ ...extractJson('gamma', day(5), 'x'), schemaVersion: 2 }),
+    [`${day(5)}-gamma-organize-x.json`]: JSON.stringify({ ...extractJson('gamma', 5, 'x'), schemaVersion: 2 }),
     [`${day(5)}-alpha-extract-notes.md`]: '# A note someone filed here\n',
-    [`${day(30)}-alpha-extract-example-project.json`]: JSON.stringify(extractJson('alpha', day(30), 'example-project')),
+    [`${day(25)}-alpha-extract-example-project.json`]: JSON.stringify(extractJson('alpha', 25, 'example-project')),
     'README.md': 'Reports of the consolidation runs.\n',
   };
   for (const [name, text] of Object.entries(reports)) write(repo, `_reports/${name}`, text);
@@ -146,7 +147,8 @@ test('consolidate report gathers the reports of every machine, this machine\'s r
     [`_reports/${day(2)}-beta-extract-kept.json`, 'json', 'beta', 'extract'],
     [`_reports/${day(1)}-alpha-extract-example-project.json`, 'json', 'alpha', 'extract'],
   ]);
-  assert.deepEqual(report.reports[2], { file: `_reports/${day(1)}-alpha-extract-example-project.json`, source: 'json', ...extractJson('alpha', day(1), 'example-project') });
+  const twin = `${day(1)}-alpha-extract-example-project.json`;
+  assert.deepEqual(report.reports[2], { file: `_reports/${twin}`, source: 'json', ...JSON.parse(readFileSync(join(f.repo, '_reports', twin), 'utf8')) });
   assert.deepEqual([report.reports[0].counts, report.reports[0].costUsd, report.reports[0].changes], [
     { added: 0, changed: 0, retired: 1, notApplied: 0 }, 0.5, [{ kind: 'retire', path: 'old.md', target: 'n0.md' }],
   ]);
@@ -189,7 +191,7 @@ test('the window: --since a day, --days n, and seven days without either', (t) =
   assert.deepEqual(since.reports.map((r) => r.date), [day(2), day(1)]);
   assert.deepEqual(since.runs.map((r) => r.runId), ['run-2', 'run-1', 'run-0.5']);
   assert.deepEqual(f.json('--days', '1').runs.map((r) => r.runId), ['run-0.5']);
-  assert.deepEqual(f.json('--days', '30').reports.map((r) => r.date).at(0), day(30));
+  assert.deepEqual(f.json('--days', '30').reports.map((r) => r.date).at(0), day(25));
   const plain = f.json();
   assert.ok(Math.abs(Date.parse(plain.window.until) - Date.parse(plain.window.since) - 7 * DAY_MS) < 1000);
   for (const bad of [['--days', '0'], ['--days', '366'], ['--days', 'x'], ['--days'], ['--since', '2026-02-30'], ['--since', '20261101'],
@@ -304,4 +306,52 @@ test('the summary shows a figure it cannot use as ? and no control character; a 
   const json = f.json();
   assert.ok(json.problems.some((p) => p.file === '_reports/(file name withheld)' && p.problem === 'not valid JSON'), JSON.stringify(json.problems));
   assert.doesNotMatch(r.stdout + JSON.stringify(json), new RegExp(key));
+});
+
+test('back-to-back windows count each report and each run exactly once', (t) => {
+  const tmp = tempDir(t);
+  const repo = join(tmp, 'notes');
+  const state = join(tmp, 'state');
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  mkdirSync(state);
+  const T = Date.parse('2026-11-20T09:00:00.000Z');
+  const iso = (ms) => new Date(ms).toISOString();
+  const sizes = { lines: 0, bytes: 0 };
+  const figures = (endedAt, scope) => ({
+    config: { host: 'alpha' }, kind: 'extract', scope, date: endedAt.slice(0, 10), endedAt, model: 'example-model', stopReason: 'completed',
+    costUsd: 0.1, turns: 1, denials: 0, pairs: [{ label: 'notes' }], snap: { notes: {} }, descriptions: new Map(),
+    conversation: { truncated: false, bytes: 10, sessionsLeftOut: 0 },
+    ev: {
+      changes: [], ignored: [], ignoredEntries: {},
+      stats: {
+        notes: { indexBefore: sizes, indexAfter: sizes, unlistedBefore: 0, unlistedAfter: 0, notesBytesBefore: 0, notesBytesAfter: 0, retiredBytes: 0 },
+        retention: { termsBefore: 0, termsKept: 0, share: 1 },
+      },
+    },
+  });
+  // Twins, by the end of their run: at the start of a window, at its last millisecond, at the next start.
+  const ends = { first: T - 7 * DAY_MS, 'end-of-first': T - 1, second: T, 'end-of-second': T + 7 * DAY_MS - 1, later: T + 7 * DAY_MS };
+  for (const [scope, ms] of Object.entries(ends)) {
+    write(repo, `_reports/${iso(ms).slice(0, 10)}-alpha-extract-${scope}.json`, JSON.stringify(reportData(figures(iso(ms), scope))));
+  }
+  // Markdown reports without a twin, as an older kit wrote them: by their day, the window's last day not included.
+  const days = { 'md-first': '2026-11-13', 'md-end-of-first': '2026-11-19', 'md-second': '2026-11-20', 'md-end-of-second': '2026-11-26', 'md-later': '2026-11-27' };
+  for (const [scope, d] of Object.entries(days)) write(repo, `_reports/${d}-alpha-extract-${scope}.md`, buildReport(figures(`${d}T12:00:00.000Z`, scope)));
+  const run = ([runId, ms]) => JSON.stringify({
+    schemaVersion: 1, runId, host: 'alpha', kind: 'extract', agents: false, dryRun: false, startedAt: iso(ms - 1000), endedAt: iso(ms),
+    exitCode: 0, scopes: [], costUsd: 0,
+  });
+  writeFileSync(join(state, 'runs.jsonl'), `${Object.entries(ends).map(run).join('\n')}\n`);
+  const config = { host: 'alpha', repoDir: repo, stateDir: state, consolidate: null, consolidateProblem: null };
+  const windowEndingAt = (ms) => {
+    const now = new Date(ms);
+    return consolidationReport({ config, now, since: parseReportArgs(['--days', '7'], now).since });
+  };
+  const [one, two] = [windowEndingAt(T), windowEndingAt(T + 7 * DAY_MS)];
+  assert.deepEqual(one.window, { since: iso(T - 7 * DAY_MS), until: iso(T) });
+  assert.deepEqual(one.reports.map((r) => r.scope), ['md-first', 'first', 'md-end-of-first', 'end-of-first']);
+  assert.deepEqual(two.reports.map((r) => r.scope), ['md-second', 'second', 'md-end-of-second', 'end-of-second']);
+  assert.deepEqual(one.runs.map((r) => r.runId), ['first', 'end-of-first']);
+  assert.deepEqual(two.runs.map((r) => r.runId), ['second', 'end-of-second']);
+  assert.deepEqual([...one.problems, ...two.problems], []);
 });

@@ -111,13 +111,14 @@ export function labelReportHead({ date, host, model, requests, costUsd, touched,
 // The folder of the clone that a folder of a scope's report stands for: `notes` is the scope's own.
 const folderOf = (scope, label) => (label === GLOBAL ? GLOBAL : scopeFolder(scope));
 
-// The JSON twin of buildReport's report, from the same figures. A change is `{ kind, path }`, a
+// The JSON twin of buildReport's report, from the same figures, and `endedAt`, when the scope's run
+// ended (the apply step's time; `date` is its day). A change is `{ kind, path }`, a
 // retirement also with `target`; kinds are `add`, `change` and `retire`, in the report's order. A
 // path is as the report shows it: relative to the scope's folder, `global/<note>` for a note of
 // global/ in a project run, `(file name withheld)` for a name that looks like a credential. Every
 // folder of the run is listed, also one it did not change (`changed: false`). No description and
 // no text of a note.
-export function reportData({ config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, ev, conversation, repaired = 0 }) {
+export function reportData({ config, kind, scope, date, endedAt, model, stopReason, costUsd, turns, denials, pairs, ev, conversation, repaired = 0 }) {
   const labels = pairs.map((p) => p.label);
   const order = (c) => `${labels.indexOf(c.label)}\u0000${c.file}`;
   const sorted = [...ev.changes].sort((x, y) => byName(order(x), order(y)));
@@ -129,7 +130,7 @@ export function reportData({ config, kind, scope, date, model, stopReason, costU
   const notNotes = labels.reduce((n, l) => n + (ev.ignoredEntries?.[l] > 0 ? ev.ignoredEntries[l] : 0), 0);
   const r = ev.stats.retention;
   return {
-    schemaVersion: REPORT_SCHEMA_VERSION, host: config.host, kind, scope, date, model, stopReason,
+    schemaVersion: REPORT_SCHEMA_VERSION, host: config.host, kind, scope, date, endedAt, model, stopReason,
     costUsd: costUsd ?? null, turns: turns ?? null, denials: denials ?? null, repaired,
     conversation: conversation
       ? { truncated: conversation.truncated, bytes: conversation.bytes ?? null, sessionsLeftOut: conversation.sessionsLeftOut }
@@ -184,7 +185,8 @@ const amount = (v) => (Number.isFinite(v) && v >= 0 ? v : null);
 const word = (v) => (typeof v === 'string' ? v : null);
 const LABEL_COUNTS = ['work', 'personal', 'general', 'unlabeled'];
 
-// The JSON twin of the label report, which label-apply writes beside it: the plan's figures
+// The JSON twin of the label report, which label-apply writes beside it, with `endedAt`, when the
+// label pass wrote it (`date` is its day): the plan's figures
 // (`data`, labelPlanData's; a figure of the wrong type is null, and without `data` every figure of
 // the driver is) and what label-apply did (`written`, `unchanged`, `skipped`, as
 // applyLabelEntries gives them). For each scope: the labels set where a note had none and changed
@@ -193,7 +195,7 @@ const LABEL_COUNTS = ['work', 'personal', 'general', 'unlabeled'];
 // label-apply did not write), the notes Organize must repair first, the exceptions that name no
 // note, and the counts of the labels after the run as the report gives them (null for a scope the
 // run did not read).
-export function labelReportData({ host, date, data, written, unchanged, skipped }) {
+export function labelReportData({ host, date, endedAt, data, written, unchanged, skipped }) {
   const d = isObject(data) ? data : {};
   const planned = new Map((Array.isArray(d.scopes) ? d.scopes : [])
     .filter((s) => isObject(s) && typeof s.scope === 'string').map((s) => [s.scope, s]));
@@ -218,7 +220,7 @@ export function labelReportData({ host, date, data, written, unchanged, skipped 
     };
   });
   return {
-    schemaVersion: REPORT_SCHEMA_VERSION, host, kind: 'label', date, model: word(d.model),
+    schemaVersion: REPORT_SCHEMA_VERSION, host, kind: 'label', date, endedAt, model: word(d.model),
     stopReason: d.stop === null ? 'completed' : word(d.stop),
     costUsd: amount(d.costUsd), turns: null, denials: null, repaired: null, requests: count(d.requests), sent: count(d.sent),
     notes: { touched: count(d.touched), exceptions: count(d.exceptions), recordedAsTheyWere: count(d.confirmed) },
@@ -247,8 +249,8 @@ const known = (text) => (text === 'unknown' ? null : Number(text));
 // The fields of a report's JSON twin, read from its Markdown: of an Extract or Organize report its
 // head and its lists, of a label report its head. What the Markdown does not hold is null: the cost
 // beyond cents, the size of a complete conversation, the note sizes of a folder the run did not
-// change, and of a label report its stop and what label-apply did; a folder the report does not
-// show is not listed. Null when the text is not such a report.
+// change, when the run ended, and of a label report its stop and what label-apply did; a folder
+// the report does not show is not listed. Null when the text is not such a report.
 export function parseReport(text) {
   const lines = String(text).split('\n');
   if (lines.at(-1) === '') lines.pop();
@@ -264,7 +266,7 @@ function parseLabelHead(lines, [, date, host]) {
   const notes = LABEL_NOTES_LINE_RE.exec(lines[3] ?? '');
   if (!model || !notes) return null;
   return {
-    schemaVersion: REPORT_SCHEMA_VERSION, host, kind: 'label', date, model: model[1], stopReason: null,
+    schemaVersion: REPORT_SCHEMA_VERSION, host, kind: 'label', date, endedAt: null, model: model[1], stopReason: null,
     costUsd: known(model[3]), turns: null, denials: null, repaired: null, requests: Number(model[2]), sent: Number(notes[2]),
     notes: { touched: Number(notes[1]), exceptions: Number(notes[3]), recordedAsTheyWere: Number(notes[4]) },
     written: null, unchanged: null, notWritten: null, scopes: null,
@@ -275,7 +277,7 @@ function parseScopeReport(lines, [, title, scope, date, host]) {
   const model = MODEL_LINE_RE.exec(lines[2] ?? '');
   if (!model) return null;
   const report = {
-    schemaVersion: REPORT_SCHEMA_VERSION, host, kind: title.toLowerCase(), scope, date, model: model[1], stopReason: model[4],
+    schemaVersion: REPORT_SCHEMA_VERSION, host, kind: title.toLowerCase(), scope, date, endedAt: null, model: model[1], stopReason: model[4],
     costUsd: known(model[3]), turns: known(model[2]), denials: known(model[5]), repaired: 0, conversation: null,
     folders: [], retention: null, counts: { added: 0, changed: 0, retired: 0, notApplied: 0 }, changes: [],
   };

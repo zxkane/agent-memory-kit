@@ -186,6 +186,7 @@ test('organize merges a duplicate, commits it with a report and records the stat
   const f = fixture(t);
   duplicateProject(f);
   f.instruct(mergeInstruction());
+  const before = Date.now();
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^organize p: applied, 3 change\(s\), USD 0\.25/m);
@@ -214,8 +215,11 @@ test('organize merges a duplicate, commits it with a report and records the stat
   assert.doesNotMatch(text + r.stdout, new RegExp(SUMMARY));
   const json = f.reportJson(`${today()}-alpha-organize-p.json`);
   assert.equal(statSync(join(f.repo, report.replace(/\.md$/, '.json'))).mode & 0o777, 0o600);
+  // The twin says when the scope's run ended, on the day of its name.
+  assert.ok(before <= Date.parse(json.endedAt) && Date.parse(json.endedAt) <= Date.now(), json.endedAt);
+  assert.equal(json.endedAt.slice(0, 10), json.date);
   assert.deepEqual({ ...json, folders: undefined, retention: undefined }, {
-    schemaVersion: 1, host: 'alpha', kind: 'organize', scope: 'p', date: today(), model: 'test-model', stopReason: 'completed',
+    schemaVersion: 1, host: 'alpha', kind: 'organize', scope: 'p', date: today(), endedAt: json.endedAt, model: 'test-model', stopReason: 'completed',
     costUsd: 0.25, turns: 4, denials: 0, repaired: 0, conversation: null, folders: undefined, retention: undefined,
     counts: { added: 0, changed: 2, retired: 1, notApplied: 0 },
     changes: [{ kind: 'change', path: 'MEMORY.md' }, { kind: 'change', path: 'a.md' }, { kind: 'retire', path: 'b.md', target: 'a.md' }],
@@ -223,7 +227,7 @@ test('organize merges a duplicate, commits it with a report and records the stat
   assert.deepEqual(json.folders.map((x) => [x.folder, x.changed, x.indexBefore.lines, x.indexAfter.lines]), [['projects/p', true, 2, 1], ['global', false, 0, 0]]);
   assert.equal(json.retention.share, 1);
   // The same figures as the Markdown, as far as it holds them.
-  assert.deepEqual(parseReport(text), { ...json, folders: [json.folders[0]] });
+  assert.deepEqual(parseReport(text), { ...json, endedAt: null, folders: [json.folders[0]] });
 
   const entry = f.readState().projects.p;
   assert.ok(!Number.isNaN(Date.parse(entry.lastOrganize)));
@@ -2890,8 +2894,10 @@ test('the first label run sends only unlabeled notes', (t) => {
   assert.deepEqual(readdirSync(f.workRoot()), []);
   // The JSON twin: the same figures, without the model's reasons.
   const json = f.reportJson(`${today()}-alpha-label.json`);
+  assert.equal(json.endedAt.slice(0, 10), json.date);
+  assert.ok(Date.parse(json.endedAt) <= Date.now());
   assert.deepEqual({ ...json, costUsd: undefined }, {
-    schemaVersion: 1, host: 'alpha', kind: 'label', date: today(), model: 'example-label-model', stopReason: 'completed', costUsd: undefined,
+    schemaVersion: 1, host: 'alpha', kind: 'label', date: today(), endedAt: json.endedAt, model: 'example-label-model', stopReason: 'completed', costUsd: undefined,
     turns: null, denials: null, repaired: null, requests: 1, sent: 1, notes: { touched: 1, exceptions: 0, recordedAsTheyWere: 2 },
     written: 1, unchanged: 0, notWritten: 0,
     // Every scope of the run, also one with nothing to say.
@@ -2906,7 +2912,7 @@ test('the first label run sends only unlabeled notes', (t) => {
   assert.ok(json.costUsd > 0 && json.costUsd < 0.01, String(json.costUsd));
   assert.doesNotMatch(JSON.stringify(json), /fake reason/);
   assert.deepEqual(parseReport(report), {
-    ...json, stopReason: null, costUsd: Number(json.costUsd.toFixed(2)), written: null, unchanged: null, notWritten: null, scopes: null,
+    ...json, endedAt: null, stopReason: null, costUsd: Number(json.costUsd.toFixed(2)), written: null, unchanged: null, notWritten: null, scopes: null,
   });
   // The run's line: no scope of a model run, and the label pass with its figures.
   const [line] = f.runLog();

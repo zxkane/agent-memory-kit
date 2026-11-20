@@ -327,7 +327,10 @@ function stepApply(config, rest) {
     const buf = readRegular(join(pair.workDir, c.file));
     if (buf && sha256(buf) === c.hash) descriptions.set(`${c.label}/${c.file}`, cleanDescription(parseNote(buf.toString('utf8')).description));
   }
-  const reportArgs = { config, kind, scope, date, model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation, repaired };
+  const reportArgs = {
+    config, kind, scope, date, endedAt: now.toISOString(), model, stopReason, costUsd, turns, denials, pairs, snap, ev, descriptions, conversation,
+    repaired,
+  };
   const report = () => buildReport(reportArgs);
 
   let outcome;
@@ -499,8 +502,9 @@ function stepLabelApply(config, rest) {
   let reportError = null;
   try {
     // The twin first, as in the apply step.
-    const date = new Date().toISOString().slice(0, 10);
-    const twin = labelReportData({ host: config.host, date, data: plan.data, written, unchanged, skipped });
+    const endedAt = new Date().toISOString();
+    const date = endedAt.slice(0, 10);
+    const twin = labelReportData({ host: config.host, date, endedAt, data: plan.data, written, unchanged, skipped });
     writeReport(config, `${date}-${config.host}-label.json`, jsonText(twin));
     writeReport(config, `${date}-${config.host}-label.md`, labelReportText(plan.report, skipped));
   } catch (err) {

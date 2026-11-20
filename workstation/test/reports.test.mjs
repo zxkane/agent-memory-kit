@@ -17,7 +17,7 @@ const stats = ([ilb, ibb, ila, iba, ub, ua, nb, na, rb]) => ({
 const CASES = {
   // A project run that changes, retires and adds to global/, with a repair run and scratch files.
   projectOrganize: {
-    config: { host: 'alpha' }, kind: 'organize', scope: 'example-project', date: '2026-11-20', model: 'example-model',
+    config: { host: 'alpha' }, kind: 'organize', scope: 'example-project', date: '2026-11-20', endedAt: '2026-11-20T04:41:12.000Z', model: 'example-model',
     stopReason: 'completed', costUsd: 0.25, turns: 4, denials: 1, repaired: 2, conversation: null,
     pairs: [{ label: 'notes' }, { label: 'global' }],
     snap: { notes: { 'MEMORY.md': 'h1', 'a.md': 'h2', 'b.md': 'h3' }, global: { 'MEMORY.md': 'h4' } },
@@ -39,7 +39,7 @@ const CASES = {
   },
   // An Extract run whose conversation text was cut, with unknown figures and entries not applied.
   extractCut: {
-    config: { host: 'beta-2' }, kind: 'extract', scope: 'p q', date: '2026-01-05', model: 'm;x',
+    config: { host: 'beta-2' }, kind: 'extract', scope: 'p q', date: '2026-01-05', endedAt: '2026-01-05T23:59:59.999Z', model: 'm;x',
     stopReason: 'error_max_turns', costUsd: null, turns: null, denials: null, repaired: 0,
     conversation: { truncated: true, bytes: 10000, sessionsLeftOut: 3 },
     pairs: [{ label: 'notes' }],
@@ -53,7 +53,7 @@ const CASES = {
   },
   // global/ on its own, with a note name that looks like a credential and one without a description.
   globalWithheld: {
-    config: { host: 'alpha' }, kind: 'organize', scope: 'global', date: '2026-11-20', model: 'example-model',
+    config: { host: 'alpha' }, kind: 'organize', scope: 'global', date: '2026-11-20', endedAt: '2026-11-20T00:00:00.000Z', model: 'example-model',
     stopReason: 'completed', costUsd: 1.005, turns: 12, denials: 0, repaired: 0, conversation: { truncated: false, bytes: 1234, sessionsLeftOut: 0 },
     pairs: [{ label: 'notes' }],
     snap: { notes: { 'MEMORY.md': 'h1', [`${KEY}.md`]: 'h2' } },
@@ -70,7 +70,7 @@ const CASES = {
   },
   // No change at all: only the head and a count of scratch files in global/.
   nothing: {
-    config: { host: 'alpha' }, kind: 'organize', scope: 'p', date: '2026-11-20', model: 'example-model',
+    config: { host: 'alpha' }, kind: 'organize', scope: 'p', date: '2026-11-20', endedAt: '2026-11-20T12:00:00.000Z', model: 'example-model',
     stopReason: 'completed', costUsd: 0, turns: 1, denials: 0, conversation: undefined,
     pairs: [{ label: 'notes' }, { label: 'global' }],
     snap: { notes: {}, global: {} },
@@ -82,7 +82,7 @@ const CASES = {
   },
   // A project run that changes global/ only.
   onlyGlobal: {
-    config: { host: 'alpha' }, kind: 'organize', scope: 'p', date: '2026-11-20', model: 'example-model',
+    config: { host: 'alpha' }, kind: 'organize', scope: 'p', date: '2026-11-20', endedAt: '2026-11-20T12:00:00.000Z', model: 'example-model',
     stopReason: 'completed', costUsd: 0.3, turns: 2, denials: 0, repaired: 1, conversation: null,
     pairs: [{ label: 'notes' }, { label: 'global' }],
     snap: { notes: { 'MEMORY.md': 'h' }, global: { 'MEMORY.md': 'h2', 'old.md': 'h3' } },
@@ -210,7 +210,7 @@ test('labelReportHead gives the head of the label report as before', () => {
 test('reportData gives the figures of the report as JSON, without a description or a text', () => {
   const data = reportData(CASES.projectOrganize);
   assert.deepEqual(data, {
-    schemaVersion: 1, host: 'alpha', kind: 'organize', scope: 'example-project', date: '2026-11-20', model: 'example-model',
+    schemaVersion: 1, host: 'alpha', kind: 'organize', scope: 'example-project', date: '2026-11-20', endedAt: '2026-11-20T04:41:12.000Z', model: 'example-model',
     stopReason: 'completed', costUsd: 0.25, turns: 4, denials: 1, repaired: 2, conversation: null,
     folders: [
       {
@@ -253,6 +253,7 @@ function markdownView(data) {
   const own = data.folders[0].folder;
   return {
     ...data,
+    endedAt: null,
     costUsd: data.costUsd === null ? null : Number(data.costUsd.toFixed(2)),
     conversation: data.conversation && { ...data.conversation, bytes: data.conversation.truncated ? data.conversation.bytes : null },
     folders: data.folders.filter((f) => f.folder === own || f.changed)
@@ -320,9 +321,9 @@ function labelRun() {
 test('the JSON of the label report counts what label-apply did in each scope, with the figures of the plan', () => {
   const { data, applied } = labelRun();
   assert.doesNotMatch(JSON.stringify(data), /MODEL-REASON|Mantle Responses/);
-  const json = labelReportData({ host: 'alpha', date: '2026-11-20', data, ...applied });
+  const json = labelReportData({ host: 'alpha', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', data, ...applied });
   assert.deepEqual(json, {
-    schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', model: 'example-label-model', stopReason: 'ceiling',
+    schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', model: 'example-label-model', stopReason: 'ceiling',
     costUsd: 0.0028, turns: null, denials: null, repaired: null, requests: 2, sent: 3,
     notes: { touched: 4, exceptions: 1, recordedAsTheyWere: 2 },
     written: 2, unchanged: 2, notWritten: 1,
@@ -339,8 +340,8 @@ test('the JSON of the label report counts what label-apply did in each scope, wi
   });
   assert.equal(labelReportData({ host: 'alpha', date: '2026-11-20', data: { ...data, stop: null }, ...applied }).stopReason, 'completed');
   // Without the plan's figures (a plan that has none), only what label-apply knows.
-  assert.deepEqual(labelReportData({ host: 'alpha', date: '2026-11-20', data: undefined, ...applied }), {
-    schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', model: null, stopReason: null,
+  assert.deepEqual(labelReportData({ host: 'alpha', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', data: undefined, ...applied }), {
+    schemaVersion: 1, host: 'alpha', kind: 'label', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', model: null, stopReason: null,
     costUsd: null, turns: null, denials: null, repaired: null, requests: null, sent: null,
     notes: { touched: null, exceptions: null, recordedAsTheyWere: null },
     written: 2, unchanged: 1, notWritten: 1,
@@ -363,9 +364,9 @@ test('parseReport reads back the head of a label report', () => {
     ...labelReportHead({ date: '2026-11-20', host: 'alpha', model: 'example-label-model', requests: asked.requests, costUsd: asked.spent, touched: 4, sent: asked.sent, exceptions: 1, confirmed: 2 }),
     '', labelReport(results).trimEnd(),
   ].join('\n').concat('\n');
-  const json = labelReportData({ host: 'alpha', date: '2026-11-20', data, ...applied });
+  const json = labelReportData({ host: 'alpha', date: '2026-11-20', endedAt: '2026-11-20T05:02:03.000Z', data, ...applied });
   // The Markdown holds the head only: the cost in cents, and nothing of what label-apply did.
   assert.deepEqual(parseReport(text), {
-    ...json, stopReason: null, costUsd: Number(json.costUsd.toFixed(2)), written: null, unchanged: null, notWritten: null, scopes: null,
+    ...json, endedAt: null, stopReason: null, costUsd: Number(json.costUsd.toFixed(2)), written: null, unchanged: null, notWritten: null, scopes: null,
   });
 });
