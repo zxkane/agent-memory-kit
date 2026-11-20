@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { parseNote } from '../lib/notes.mjs';
 import {
-  LABELS, readDomain, setDomain, parseDomains, scopeDefault, readLabelInputs, tagLine, tagIndexLines,
+  LABELS, readDomain, setDomain, parseDomains, scopeDefault, readLabelInputs, linkedFile, tagLine, tagIndexLines,
 } from '../lib/domains.mjs';
 
 const NOTE = '---\nname: a\ndescription: d\nmetadata:\n  type: project\n  originSessionId: x\n---\n\nbody\n';
@@ -168,6 +168,14 @@ test('readLabelInputs refuses symlinks, directories and large files', t => {
   assert.deepEqual(readLabelInputs({ domainsFile: join(dir, 'big.json'), personaFile: p }), { problem: 'domainsFile' });
   writeFileSync(d + '2', GOOD);
   assert.deepEqual(readLabelInputs({ domainsFile: d + '2', personaFile: dir }), { problem: 'personaFile' });
+});
+
+test('linkedFile gives the file an index line links, or null', () => {
+  assert.equal(linkedFile('- [A](a.md) — about a'), 'a.md');
+  assert.equal(linkedFile('- [A](a.md)\u0085—[work] x'), 'a.md');
+  for (const line of ['- [A](a.md) about a', '- [A](../x/a.md) — about a', '* [A](a.md) — about a', '# Heading', '']) {
+    assert.equal(linkedFile(line), null, line);
+  }
 });
 
 test('tagLine tags work and personal only', () => {

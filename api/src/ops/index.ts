@@ -13,17 +13,19 @@ async function domainsOf(
   scope: string,
   log?: (line: object) => void,
 ): Promise<Map<string, Domain>> {
-  const domains = new Map<string, Domain>();
+  let notes: Note[];
   try {
-    for (const note of await snapshots.load()) {
-      const at = note.path.lastIndexOf('/');
-      if (note.domain && note.path.slice(0, at) === scope) domains.set(note.path.slice(at + 1), note.domain);
-    }
+    notes = await snapshots.load();
   } catch (err) {
-    domains.clear();
     // One line says the index went out untagged; the name of the error only, never its message.
     const error = err instanceof ApiError ? err.code : err instanceof Error ? err.name : 'unknown';
     log?.({ op: 'memory_index', untagged: true, error });
+    return new Map();
+  }
+  const domains = new Map<string, Domain>();
+  for (const note of notes) {
+    const at = note.path.lastIndexOf('/');
+    if (note.domain && note.path.slice(0, at) === scope) domains.set(note.path.slice(at + 1), note.domain);
   }
   return domains;
 }

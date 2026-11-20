@@ -1,4 +1,4 @@
-import { tagLine } from '../../workstation/lib/domains.mjs';
+import { linkedFile, tagLine } from '../../workstation/lib/domains.mjs';
 import type { Domain } from './snapshot.ts';
 
 // The tag of an index line comes only from the note, by the rule of tagLine on the workstation: a run of [work] /
@@ -8,8 +8,8 @@ export function tagIndexText(text: string, domains: Map<string, Domain>): string
   return text
     .split('\n')
     .map((line) => {
-      const m = /^- \[[^\]]*\]\(([A-Za-z0-9][A-Za-z0-9._-]*\.md)\)/.exec(line);
-      return tagLine(line, m ? (domains.get(m[1]!) ?? null) : null) as string;
+      const file = linkedFile(line);
+      return tagLine(line, file === null ? null : (domains.get(file) ?? null)) as string;
     })
     .join('\n');
 }

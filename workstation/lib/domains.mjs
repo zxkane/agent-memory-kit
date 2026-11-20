@@ -165,6 +165,11 @@ export function readLabelInputs({ domainsFile, personaFile }) {
   return { domains: parsed.value, persona };
 }
 
+// The file name that an index line links (TAG_LINE_RE), or null when the line is not an index line.
+export function linkedFile(line) {
+  return TAG_LINE_RE.exec(line)?.groups.file ?? null;
+}
+
 // The tag of an index line comes only from the note it links. In a line that links a note of its folder, a run
 // of tags at the start of the hook (HOOK_START_RE) is removed with the white space or format characters around
 // it, then the note's own tag is inserted: work and personal get one, general and unlabeled notes none. A hook
@@ -186,9 +191,9 @@ export function tagLine(line, label) {
 // in the memory API: its line gets no tag, and a run of tags written there is removed.
 export function tagIndexLines(lines, dir) {
   return lines.map(line => {
-    const m = TAG_LINE_RE.exec(line);
-    if (!m) return line;
-    const note = readText(join(dir, m.groups.file), MAX_NOTE_BYTES);
+    const file = linkedFile(line);
+    if (file === null) return line;
+    const note = readText(join(dir, file), MAX_NOTE_BYTES);
     return tagLine(line, note === null ? null : readDomain(note));
   });
 }
