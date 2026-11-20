@@ -140,18 +140,20 @@ const batchesOf = (...scopes) => scopes.map((scope) => ({ scope, notes: [{ ...no
 const leftOf = (out) => Object.fromEntries(out.left);
 
 // A stand-in for the caller's labelBatch call: the calls whose number (from 1) is in `fails` fail
-// as an endpoint out of reach does, those in `refused` and those holding a note of `bad` as an
-// answer that fails does; the others label every note `work`. An answer costs `cost`, one that
-// fails 0.01, and each call moves `clock` on by `step` ms.
-function fakeModel({ fails = [], refused = [], bad = [], cost = 0.25, clock = null, step = 0, onCall = () => {} } = {}) {
+// as an endpoint out of reach does, those in `rejected` as an HTTP 400 does (an answer, not about
+// the notes), those in `refused` and those holding a note of `bad` as a refusal does (an answer
+// about the notes); the others label every note `work`. An answer costs `cost`, a refusal 0.01,
+// and each call moves `clock` on by `step` ms.
+function fakeModel({ fails = [], rejected = [], refused = [], bad = [], cost = 0.25, clock = null, step = 0, onCall = () => {} } = {}) {
   const calls = [];
   const labelBatch = async (notes) => {
     calls.push(notes.map((n) => n.path));
     if (clock) clock.ms += step;
     onCall(calls.length);
-    if (fails.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 500', transport: true, costUsd: 0, requests: 1 };
+    if (fails.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 500', transport: true, content: false, costUsd: 0, requests: 1 };
+    if (rejected.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 400', transport: false, content: false, costUsd: 0, requests: 1 };
     if (refused.includes(calls.length) || notes.some((n) => bad.includes(n.path))) {
-      return { ok: false, error: 'model refused', transport: false, costUsd: 0.01, requests: 1 };
+      return { ok: false, error: 'model refused', transport: false, content: true, costUsd: 0.01, requests: 1 };
     }
     return { ok: true, labels: new Map(notes.map((n) => [n.id, { label: 'work', reason: `reason for ${n.path}` }])), costUsd: cost, requests: 1 };
   };
@@ -292,10 +294,11 @@ test('sendBatches splits a batch that fails for a content reason, down to the no
   const model = fakeModel({ bad: ['global/n07.md'] });
   const out = await run([batchOf('global', names), ...batchesOf('projects/p')], model);
   const span = (from, to) => pathsIn('global', names.slice(from - 1, to));
-  // The halves of a failed batch go at once, before the next batch: the first ⌈n/2⌉ notes, then the rest.
+  // The halves of a failed batch go at once, before the next batch: the first ⌈n/2⌉ notes, then the
+  // rest; the half that failed alone is split in turn.
   assert.deepEqual(model.calls, [
-    span(1, 19), span(1, 10), span(1, 5), span(6, 10), span(6, 8), span(6, 7), span(6, 6), span(7, 7), span(8, 8), span(9, 10),
-    span(11, 19), ['projects/p/n.md'],
+    span(1, 19), span(1, 10), span(11, 19), span(1, 5), span(6, 10), span(6, 8), span(9, 10), span(6, 7), span(8, 8), span(6, 6),
+    span(7, 7), ['projects/p/n.md'],
   ]);
   assert.deepEqual(leftOf(out), { 'global/n07.md': 'the model call failed (model refused)' });
   assert.equal(out.labels.size, 19);
@@ -333,6 +336,41 @@ test('a batch that does not reach the model is never split', async () => {
   assert.equal(stopped.failed, true);
   assert.equal(leftOf(stopped)['global/a.md'], failed);
   assert.equal(leftOf(stopped)['projects/p/n.md'], 'not sent; 2 batches in a row failed');
+});
+
+test('only an answer about the notes splits a batch: an HTTP error on every request costs one request per batch', async () => {
+  // A wrong model or parameter fails every request at once, unbilled: splitting would cost 2n - 1
+  // requests per batch with no ceiling to stop them.
+  const model = fakeModel({ rejected: [1, 2, 3] });
+  const out = await run([batchOf('global', ['a', 'b', 'c']), batchOf('projects/p', ['d', 'e']), ...batchesOf('projects/q')], model);
+  assert.deepEqual(model.calls, [pathsIn('global', ['a', 'b', 'c']), pathsIn('projects/p', ['d', 'e']), ['projects/q/n.md']]);
+  assert.equal(out.requests, 3);
+  assert.equal(out.stop, null, 'the endpoint answered');
+  assert.equal(out.failed, true);
+  const why = 'the model call failed (Mantle Responses HTTP 400)';
+  assert.deepEqual(leftOf(out), {
+    'global/a.md': why, 'global/b.md': why, 'global/c.md': why, 'projects/p/d.md': why, 'projects/p/e.md': why, 'projects/q/n.md': why,
+  });
+});
+
+test('when both halves of a split fail, their notes stay touched and the run splits no more', async () => {
+  // Two halves that both fail say the batch failed as a whole, not one note of it.
+  const model = fakeModel({ bad: ['global/a.md', 'global/c.md', 'projects/p/e.md'] });
+  const out = await run([batchOf('global', ['a', 'b', 'c', 'd']), batchOf('projects/p', ['e', 'f'])], model);
+  assert.deepEqual(model.calls, [
+    pathsIn('global', ['a', 'b', 'c', 'd']), pathsIn('global', ['a', 'b']), pathsIn('global', ['c', 'd']), pathsIn('projects/p', ['e', 'f']),
+  ]);
+  const why = 'the model call failed (model refused)';
+  assert.deepEqual(leftOf(out), Object.fromEntries([...pathsIn('global', ['a', 'b', 'c', 'd']), ...pathsIn('projects/p', ['e', 'f'])].map((p) => [p, why])));
+  assert.equal(out.failed, true);
+  assert.deepEqual([out.requests, out.sent], [4, 6]);
+  // A half that fails while the other is answered is still split, down to the note.
+  const one = fakeModel({ bad: ['global/d.md'] });
+  const alone = await run([batchOf('global', ['a', 'b', 'c', 'd'])], one);
+  assert.deepEqual(one.calls, [
+    pathsIn('global', ['a', 'b', 'c', 'd']), pathsIn('global', ['a', 'b']), pathsIn('global', ['c', 'd']), ['global/c.md'], ['global/d.md'],
+  ]);
+  assert.deepEqual(leftOf(alone), { 'global/d.md': why });
 });
 
 test('the ceiling, the token age and the signal apply before every half of a split batch', async () => {

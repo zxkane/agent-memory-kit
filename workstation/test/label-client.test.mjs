@@ -335,26 +335,34 @@ test('parseLabelAnswer keeps model text out of errors and reasons', () => {
   assert.equal(cut.get('n001').reason, 'a'.repeat(299));
 });
 
-test('labelBatch marks the failures that did not reach the model', async () => {
-  const batch = (fetchImpl) => labelBatch({ notes: [note('n001')], persona: 'p', label: LABEL, token: 't', fetchImpl, sleep: noSleep });
+test('labelBatch says whether a failure reached the model, and whether it was an answer about the notes', async () => {
+  const batch = (fetchImpl, extra = {}) => labelBatch({ notes: [note('n001')], persona: 'p', label: LABEL, token: 't', fetchImpl, sleep: noSleep, ...extra });
   const status = (code) => async () => new Response('x', { status: code });
   const refusal = { status: 'completed', output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'no' }] }] };
-  // Out of reach: a network error or a timeout, 429 and 5xx after their retries, and a token the endpoint does not take.
+  const kinds = (out) => ({ ok: out.ok, transport: out.transport, content: out.content });
+  // Out of reach: a network error or a timeout, 429 and 5xx after their retries, a token the
+  // endpoint does not take, and an endpoint or a model that is not there (404).
   for (const [what, fetchImpl] of [
     ['network', async () => { throw new TypeError('connect failed'); }],
-    ['429', status(429)], ['500', status(500)], ['503', status(503)], ['401', status(401)], ['403', status(403)],
-  ]) {
-    const out = await batch(fetchImpl);
-    assert.deepEqual({ ok: out.ok, transport: out.transport }, { ok: false, transport: true }, what);
-  }
-  // Answered: a refusal, an incomplete answer, an answer that fails the check twice, any other 4xx.
+    ['429', status(429)], ['500', status(500)], ['503', status(503)], ['401', status(401)], ['403', status(403)], ['404', status(404)],
+  ]) assert.deepEqual(kinds(await batch(fetchImpl)), { ok: false, transport: true, content: false }, what);
+  // Answered, about the notes: a refusal, an incomplete answer, two answers that fail the check.
+  const thenRefused = [json(answer('nonsense')), json(refusal)];
   for (const [what, fetchImpl] of [
     ['refusal', async () => json(refusal)], ['incomplete', async () => json(answer('x', {}, { status: 'incomplete' }))],
-    ['bad answer', async () => json(answer('nonsense'))], ['400', status(400)], ['404', status(404)], ['413', status(413)],
-  ]) {
-    const out = await batch(fetchImpl);
-    assert.deepEqual({ ok: out.ok, transport: out.transport }, { ok: false, transport: false }, what);
-  }
+    ['bad answer twice', async () => json(answer('nonsense'))], ['bad answer, then a refusal', async () => thenRefused.shift()],
+  ]) assert.deepEqual(kinds(await batch(fetchImpl)), { ok: false, transport: false, content: true }, what);
+  // Answered, but not about the notes: any other HTTP error status, an answer that is not JSON or
+  // is too large, a response that did not complete otherwise, an abort.
+  const thenRejected = [json(answer('nonsense')), new Response('x', { status: 400 })];
+  const aborted = AbortSignal.abort();
+  for (const [what, fetchImpl, extra] of [
+    ['400', status(400)], ['413', status(413)], ['422', status(422)], ['bad answer, then a 400', async () => thenRejected.shift()],
+    ['not JSON', async () => new Response('<html>', { status: 200 })],
+    ['too large', async () => new Response('x'.repeat(4 * 1024 * 1024 + 1), { status: 200 })],
+    ['failed', async () => json(answer('x', {}, { status: 'failed' }))],
+    ['aborted', async () => json(refusal), { signal: aborted }],
+  ]) assert.deepEqual(kinds(await batch(fetchImpl, extra)), { ok: false, transport: false, content: false }, what);
 });
 
 test('tokenForRun says when the age of the run\'s token starts', async (t) => {

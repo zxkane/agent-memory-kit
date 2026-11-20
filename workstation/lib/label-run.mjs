@@ -88,65 +88,104 @@ const TOKEN_NOT_MADE = 'not sent; the label token could not be made';
 
 // Sends the batches to the model in order, one `labelBatch(notes)` each: the caller's call, with
 // its token, persona and endpoint, giving labelBatch's result. A batch of several notes whose
-// answer failed (a refusal, an incomplete answer, two answers that fail the check, another 4xx) is
-// split in two halves, its first ⌈n/2⌉ notes and the rest, each sent at once as a batch of its own
-// before the next batch, and a half that fails so is split again, down to single notes: batches go
-// in the same order every run, and one note that no answer can label must not hold up the others of
-// its batch. A batch whose request did not reach the model is never split. Before each request, a
-// half's too, it stops when `signal` is aborted (`interrupted`), after FAILURES_IN_A_ROW batches in
-// a row whose request did not reach the model (`failures`, a failure: labelBatch marks them
-// `transport`), when the cost so far reached `ceiling` USD (`ceiling`, a limit), or when the token,
-// made at `tokenAt` (of `now()`, in ms; null when its age is not known), is TOKEN_MAX_AGE_MS old
-// (`token-age`, a limit). A failed answer does not stop it: the endpoint answered, which also ends
-// a row of failures. Returns the labels given (path -> { label, reason }), the notes not labeled
-// (path -> why: those of a failed batch that was not split, and those not sent after a stop),
-// `stop` (null when it sent every batch), `failed` (a note was left by a failed request), what it
-// spent and requested (split requests included), and how many notes it sent (each once).
+// answer was about its notes and failed (`content`: a refusal, an incomplete answer, two answers
+// that fail the check) is split in two halves, its first ⌈n/2⌉ notes and the rest, both sent at
+// once as batches of their own before the next batch: batches go in the same order every run, and
+// one note that no answer can label must not hold up the others of its batch. When only one half
+// fails, it is settled the same way (split again if its answer was about its notes, down to single
+// notes, otherwise left). When both halves fail, the batch failed as a whole: their notes are left
+// with their reasons, and no batch of the run is split again. A failure that is not about the notes
+// (an HTTP error status, an answer that is not JSON or is too large, an abort, a request that did
+// not reach the model) never splits: a wrong model or parameter fails every request at once,
+// unbilled, and splitting would multiply them. Before each request, a half's too, it stops when
+// `signal` is aborted (`interrupted`), after FAILURES_IN_A_ROW batches in a row whose request did
+// not reach the model (`failures`, a failure: labelBatch marks them `transport`), when the cost so
+// far reached `ceiling` USD (`ceiling`, a limit), or when the token, made at `tokenAt` (of `now()`,
+// in ms; null when its age is not known), is TOKEN_MAX_AGE_MS old (`token-age`, a limit). Any other
+// failure does not stop it: the endpoint answered, which also ends a row of failures. Returns the
+// labels given (path -> { label, reason }), the notes not labeled (path -> why: those of a failed
+// batch that was not split, and those not sent after a stop), `stop` (null when it sent every
+// batch), `failed` (a note was left by a failed request), what it spent and requested (split
+// requests included), and how many notes it sent (each once).
 export async function sendBatches({ batches, labelBatch, ceiling, now, tokenAt, signal }) {
   const out = { labels: new Map(), left: new Map(), stop: null, failed: false, spent: 0, requests: 0, sent: 0 };
   const leave = (list, why) => list.forEach((b) => b.notes.forEach((n) => out.left.set(n.path, why)));
-  const stopBefore = (failures) => {
+  const leaveFailed = (batch, res) => {
+    out.failed = true;
+    leave([batch], `the model call failed (${res.error})`);
+  };
+  let failures = 0;
+  let splitting = true;
+  const stopBefore = () => {
     if (signal?.aborted) return 'interrupted';
     if (failures >= FAILURES_IN_A_ROW) return 'failures';
     if (out.spent >= ceiling) return 'ceiling';
     if (tokenAt !== null && tokenAt !== undefined && now() - tokenAt >= TOKEN_MAX_AGE_MS) return 'token-age';
     return null;
   };
-  // What is still to send, in order: the halves of a split batch go first.
-  const queue = batches.map((batch) => ({ batch, half: false }));
-  let failures = 0;
-  while (queue.length > 0) {
-    out.stop = stopBefore(failures);
+  // One request: labelBatch's result, its labels kept when it succeeded, or null when the run
+  // stopped before or during it (its notes are left with the stop's reason).
+  const send = async (batch, { half }) => {
+    out.stop = stopBefore();
     if (out.stop) {
-      leave(queue.map((q) => q.batch), NOT_SENT[out.stop]);
-      break;
+      leave([batch], NOT_SENT[out.stop]);
+      return null;
     }
-    const { batch, half } = queue.shift();
     const res = await labelBatch(batch.notes);
     out.spent += res.costUsd;
     out.requests += res.requests;
     if (!half) out.sent += batch.notes.length;
     if (signal?.aborted) {
       out.stop = 'interrupted';
-      leave([batch, ...queue.map((q) => q.batch)], NOT_SENT.interrupted);
-      break;
+      leave([batch], NOT_SENT.interrupted);
+      return null;
     }
     if (!res.ok) {
       failures = res.transport ? failures + 1 : 0;
-      if (!res.transport && batch.notes.length > 1) {
-        const cut = Math.ceil(batch.notes.length / 2);
-        queue.unshift({ batch: { ...batch, notes: batch.notes.slice(0, cut) }, half: true },
-          { batch: { ...batch, notes: batch.notes.slice(cut) }, half: true });
-        continue;
-      }
-      out.failed = true;
-      leave([batch], `the model call failed (${res.error})`);
-      continue;
+      return res;
     }
     failures = 0;
     for (const n of batch.notes) {
       const answer = res.labels.get(n.id);
       out.labels.set(n.path, { label: answer.label, reason: answer.reason || null });
+    }
+    return res;
+  };
+  // A failed batch: split when its answer was about its notes, otherwise left.
+  const settle = async (batch, res) => {
+    if (splitting && res.content === true && batch.notes.length > 1) await split(batch);
+    else leaveFailed(batch, res);
+  };
+  // Sends both halves of `batch`, then settles the one that failed alone; when both failed, the run
+  // splits no more.
+  const split = async (batch) => {
+    const cut = Math.ceil(batch.notes.length / 2);
+    const halves = [{ ...batch, notes: batch.notes.slice(0, cut) }, { ...batch, notes: batch.notes.slice(cut) }];
+    const results = [];
+    for (const half of halves) {
+      if (out.stop === null) {
+        results.push(await send(half, { half: true }));
+      } else {
+        leave([half], NOT_SENT[out.stop]);
+        results.push(null);
+      }
+    }
+    const failed = halves.map((half, i) => [half, results[i]]).filter(([, res]) => res !== null && !res.ok);
+    if (out.stop) {
+      for (const [half, res] of failed) leaveFailed(half, res);
+    } else if (failed.length === 2) {
+      splitting = false;
+      for (const [half, res] of failed) leaveFailed(half, res);
+    } else if (failed.length === 1) {
+      await settle(...failed[0]);
+    }
+  };
+  for (const [i, batch] of batches.entries()) {
+    const res = await send(batch, { half: false });
+    if (res !== null && !res.ok) await settle(batch, res);
+    if (out.stop) {
+      leave(batches.slice(i + 1), NOT_SENT[out.stop]);
+      break;
     }
   }
   return out;

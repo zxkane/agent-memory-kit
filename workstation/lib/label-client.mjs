@@ -105,26 +105,29 @@ async function readAnswer(res) {
 
 const count = (n) => (Number.isFinite(n) && n > 0 ? n : 0);
 
-// The text, usage or error of a parsed answer.
+// The text, usage or error of a parsed answer. A refusal and an incomplete answer are answers
+// about the notes (`content`); a response that ended otherwise without completing is not.
 function readResponse(data) {
   const usage = { input: count(data?.usage?.input_tokens), output: count(data?.usage?.output_tokens) };
   const status = typeof data?.status === 'string' && /^[a-z_]{1,32}$/.test(data.status) ? data.status : 'unknown';
-  if (status !== 'completed') return { ok: false, error: `response status ${status}`, usage };
+  if (status !== 'completed') return { ok: false, error: `response status ${status}`, usage, content: status === 'incomplete' };
   const parts = (Array.isArray(data.output) ? data.output : [])
     .filter((item) => item?.type === 'message' && Array.isArray(item.content)).flatMap((item) => item.content);
-  if (parts.some((part) => part?.type === 'refusal')) return { ok: false, error: 'model refused', usage };
+  if (parts.some((part) => part?.type === 'refusal')) return { ok: false, error: 'model refused', usage, content: true };
   const text = parts.filter((part) => part?.type === 'output_text' && typeof part.text === 'string').map((part) => part.text).join('');
   return { ok: true, text, usage };
 }
 
-// The HTTP statuses that mean the request did not reach the model: busy, failing, or not taking
-// the token. Every later request would most likely fail the same way.
-const OUT_OF_REACH = (status) => status === 429 || status >= 500 || status === 401 || status === 403;
+// The HTTP statuses that mean the request did not reach the model: busy, failing, not taking the
+// token, or not there (the endpoint or the model). Every later request would most likely fail the
+// same way.
+const OUT_OF_REACH = (status) => status === 429 || status >= 500 || status === 401 || status === 403 || status === 404;
 
 // One Responses request, with up to ATTEMPTS attempts for 429, 5xx and network errors (a timeout
 // of one attempt is a network error). An abort of the caller's signal stops it at once. A failure
 // has `transport` true when the request did not reach the model (a network error or a timeout, or
-// HTTP 429, 5xx, 401 or 403), false when the endpoint answered.
+// HTTP 429, 5xx, 401, 403 or 404), false when the endpoint answered, and `content` true when the
+// answer was about the notes: a refusal or an incomplete answer.
 export async function requestLabels({ prompt, label, token, fetchImpl = fetch, signal, sleep = defaultSleep }) {
   const started = Date.now();
   const done = (result) => ({ ...result, ms: Date.now() - started });
@@ -136,7 +139,7 @@ export async function requestLabels({ prompt, label, token, fetchImpl = fetch, s
     if (attempt > 0) {
       await sleep(BACKOFF_MS[attempt - 1] * (0.8 + Math.random() * 0.4));
     }
-    if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false });
+    if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false, content: false });
     const limit = AbortSignal.timeout(ATTEMPT_TIMEOUT_MS);
     try {
       const res = await fetchImpl(`${label.endpoint}/responses`, {
@@ -153,25 +156,25 @@ export async function requestLabels({ prompt, label, token, fetchImpl = fetch, s
       }
       if (res.status < 200 || res.status >= 300) {
         await res.body?.cancel().catch(() => {});
-        return done({ ok: false, error: `Mantle Responses HTTP ${res.status}`, transport: OUT_OF_REACH(res.status) });
+        return done({ ok: false, error: `Mantle Responses HTTP ${res.status}`, transport: OUT_OF_REACH(res.status), content: false });
       }
       let data;
       try {
         data = JSON.parse(await readAnswer(res));
       } catch (err) {
-        if (err instanceof Failure) return done({ ok: false, error: err.message, transport: false });
-        if (err instanceof SyntaxError) return done({ ok: false, error: 'Mantle Responses answer is not JSON', transport: false });
+        if (err instanceof Failure) return done({ ok: false, error: err.message, transport: false, content: false });
+        if (err instanceof SyntaxError) return done({ ok: false, error: 'Mantle Responses answer is not JSON', transport: false, content: false });
         throw err;
       }
       const read = readResponse(data);
       return done(read.ok ? read : { ...read, transport: false });
     } catch (err) {
-      if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false });
+      if (signal?.aborted) return done({ ok: false, error: 'request aborted', transport: false, content: false });
       error = 'Mantle Responses request failed';
     }
   }
   // Every attempt got 429 or 5xx, or no answer.
-  return done({ ok: false, error, transport: true });
+  return done({ ok: false, error, transport: true, content: false });
 }
 
 export function costOf(usage, label) {
@@ -180,8 +183,10 @@ export function costOf(usage, label) {
 
 // Labels a batch of notes. An answer that fails parseLabelAnswer is asked once more; an HTTP or
 // network failure (after its own retries) ends the batch. A failed batch has `transport` true when
-// its request did not reach the model (see requestLabels); a refusal, an incomplete answer, two
-// answers that fail the check and any other 4xx are answers, with `transport` false.
+// its request did not reach the model (see requestLabels), and `content` true when its last answer
+// was about the notes: a refusal, an incomplete answer, or (twice) an answer that fails the check.
+// Any other failure (another 4xx, an answer that is not JSON or is too large, a response that did
+// not complete otherwise, an abort) has both false.
 export async function labelBatch({ notes, persona, label, token, fetchImpl, signal, sleep }) {
   const prompt = labelPrompt({ notes, persona });
   const ids = notes.map((n) => n.id);
@@ -189,6 +194,7 @@ export async function labelBatch({ notes, persona, label, token, fetchImpl, sign
   let requests = 0;
   let error = 'no answer';
   let transport = false;
+  let content = false;
   for (let round = 0; round < 2; round += 1) {
     requests += 1;
     const res = await requestLabels({ prompt, label, token, fetchImpl, signal, sleep });
@@ -199,6 +205,7 @@ export async function labelBatch({ notes, persona, label, token, fetchImpl, sign
     if (!res.ok) {
       error = res.error;
       transport = res.transport === true;
+      content = res.content === true;
       break;
     }
     try {
@@ -206,9 +213,10 @@ export async function labelBatch({ notes, persona, label, token, fetchImpl, sign
       return { ok: true, labels, usage, costUsd: costOf(usage, label), requests };
     } catch (err) {
       error = err.message;
+      content = true;
     }
   }
-  return { ok: false, usage, costUsd: costOf(usage, label), requests, error, transport };
+  return { ok: false, usage, costUsd: costOf(usage, label), requests, error, transport, content };
 }
 
 const BAD_TOKEN_FILE = 'the label token file is not a token';

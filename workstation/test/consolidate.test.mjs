@@ -3264,10 +3264,10 @@ test('a run over every scope names the exceptions of folders it did not read', (
   assert.doesNotMatch(r.stdout, /agents\//);
 });
 
-test('a batch whose answer fails is split, and labels its notes when its halves are answered', (t) => {
+test('a batch whose answer is refused is split, and labels its notes when its halves are answered', (t) => {
   const f = labelFixture(t);
   f.seed({ 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/c.md': note('c', 'C', 'Gamma.') });
-  f.mantle({ labels: { 'projects/p/a.md': 'work', 'projects/p/b.md': 'work', 'projects/p/c.md': 'personal' }, fail: { status: 400, times: 1 } });
+  f.mantle({ labels: { 'projects/p/a.md': 'work', 'projects/p/b.md': 'work', 'projects/p/c.md': 'personal' }, refuse: { times: 1 } });
   const r = f.label();
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md'], ['projects/p/a.md', 'projects/p/b.md'], ['projects/p/c.md']]);
@@ -3275,6 +3275,31 @@ test('a batch whose answer fails is split, and labels its notes when its halves 
   assert.equal(liveText(f, 'projects/p/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
   assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md']);
   assert.match(f.labelReport(), /^- Notes: 3 touched, 3 sent to the model, 0 with an exception, 0 recorded as they were$/m);
+});
+
+test('an HTTP error on every request splits no batch; a 404 counts toward the failure stop', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/p/b.md': note('b', 'B', 'Beta.'), 'projects/p/c.md': note('c', 'C', 'Gamma.'),
+    'projects/q/d.md': note('d', 'D', 'Delta.'), 'projects/r/e.md': note('e', 'E', 'Echo.'),
+  });
+  // A bad parameter fails every request at once: one request per batch, no split, no stop.
+  f.mantle({ labels: {}, fail: { status: 400, times: 10 } });
+  let r = f.label();
+  assert.equal(r.status, 1);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['projects/p/a.md', 'projects/p/b.md', 'projects/p/c.md'], ['projects/q/d.md'], ['projects/r/e.md']]);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.match(r.stdout, /^- projects\/p\/b\.md: the model call failed \(Mantle Responses HTTP 400\)$/m);
+  // An endpoint or a model that is not there: two batches in a row stop the run.
+  f.mantle({ labels: {}, fail: { status: 404, times: 10 } });
+  r = f.label();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^label: stopped; 2 batches in a row failed$/m);
+  assert.equal(f.requests().length, 5);
+  assert.match(r.stdout, /^- projects\/r\/e\.md: not sent; 2 batches in a row failed$/m);
+  assert.doesNotMatch(r.stdout + r.stderr, /FAKE-MANTLE-BODY/);
+  // Every note stays touched for the next run.
+  assert.deepEqual(f.readState().labels.notes, {});
 });
 
 // ---- The label pass over the agent scopes: label --agents, and the end of every organize --agents run ----
