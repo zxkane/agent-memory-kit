@@ -2960,27 +2960,98 @@ test('missing inputs stop the pass', (t) => {
 
 test('a failed batch leaves its notes for the next run', (t) => {
   const f = labelFixture(t);
-  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/q/c.md': note('c', 'C', 'Gamma.') });
-  // The first batch (global/) is answered; the second (projects/q) fails on each of its attempts.
-  f.mantle({ labels: { 'global/g.md': 'work', 'projects/q/c.md': 'personal' }, fail: { status: 500, times: 3, after: 1 } });
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/c.md': note('c', 'C', 'Gamma.') });
+  // The first batch (global/) fails on each of its attempts; the pass goes on with the two others.
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'personal', 'projects/q/c.md': 'personal' }, fail: { status: 500, times: 3 } });
   const r = f.label();
   assert.equal(r.status, 1);
-  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md'], ['projects/q/c.md'], ['projects/q/c.md'], ['projects/q/c.md']]);
-  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
-  assert.equal(liveText(f, 'projects/q/c.md'), note('c', 'C', 'Gamma.'));
-  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md']);
-  assert.match(r.stdout, /^label: applied, 1 label\(s\) written, 0 unchanged, USD 0\.00, 2 request\(s\)$/m);
-  assert.match(r.stdout, /^- projects\/q\/c\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  assert.deepEqual(f.requests().map((q) => q.paths),
+    [['global/g.md'], ['global/g.md'], ['global/g.md'], ['projects/p/a.md'], ['projects/q/c.md']]);
+  assert.doesNotMatch(r.stdout, /^label: stopped/m);
+  assert.equal(liveText(f, 'global/g.md'), note('g', 'G', 'General.'));
+  assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
+  assert.equal(liveText(f, 'projects/q/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['projects/p/a.md', 'projects/q/c.md']);
+  assert.match(r.stdout, /^label: applied, 2 label\(s\) written, 0 unchanged, USD 0\.00, 3 request\(s\)$/m);
+  assert.match(r.stdout, /^- global\/g\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
   const report = f.labelReport();
-  assert.match(report, /^Left for the next run:\n- projects\/q\/c\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  assert.match(report, /^Left for the next run:\n- global\/g\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
   assert.doesNotMatch(r.stdout + r.stderr + report, /FAKE-MANTLE-BODY/);
   // The next run sends what was left, and only that.
-  f.mantle({ labels: { 'projects/q/c.md': 'personal' } });
+  f.mantle({ labels: { 'global/g.md': 'work' } });
   const again = f.label();
   assert.equal(again.status, 0, again.stdout + again.stderr);
-  assert.equal(f.requests().length, 5);
-  assert.deepEqual(f.requests().at(-1).paths, ['projects/q/c.md']);
-  assert.equal(liveText(f, 'projects/q/c.md'), labeledNote('c', 'C', 'Gamma.', 'personal'));
+  assert.equal(f.requests().length, 6);
+  assert.deepEqual(f.requests().at(-1).paths, ['global/g.md']);
+  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
+});
+
+test('two failed batches in a row stop the pass', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'),
+    'projects/q/b.md': note('b', 'B', 'Beta.'), 'projects/r/c.md': note('c', 'C', 'Gamma.'),
+  });
+  // The first batch is answered; the next two fail on each of their attempts.
+  f.mantle({ labels: { 'global/g.md': 'work' }, fail: { status: 500, times: 6, after: 1 } });
+  const r = f.label();
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /^label: stopped; two batches in a row failed$/m);
+  // The fourth batch is never sent.
+  assert.deepEqual(f.requests().map((q) => q.paths),
+    [['global/g.md'], ...Array(3).fill(['projects/p/a.md']), ...Array(3).fill(['projects/q/b.md'])]);
+  // The batch answered before is written and recorded; the others stay touched.
+  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
+  assert.equal(liveText(f, 'projects/r/c.md'), note('c', 'C', 'Gamma.'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md']);
+  const report = f.labelReport();
+  assert.match(report, /^- projects\/p\/a\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  assert.match(report, /^- projects\/q\/b\.md: the model call failed \(Mantle Responses HTTP 500\)$/m);
+  assert.match(report, /^- projects\/r\/c\.md: not sent; two batches in a row failed$/m);
+  assert.doesNotMatch(r.stdout + r.stderr + report, /FAKE-MANTLE-BODY/);
+});
+
+test('the token age stops the pass', (t) => {
+  const f = labelFixture(t);
+  f.seed({ 'global/g.md': note('g', 'G', 'General.'), 'projects/p/a.md': note('a', 'A', 'Alpha.'), 'projects/q/b.md': note('b', 'B', 'Beta.') });
+  // Each request moves the driver's clock 30 minutes on: the third batch would start with a token an hour old.
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'personal' }, advanceMs: 30 * 60 * 1000 });
+  const r = f.label();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^label: stopped; the label token of this run is near the end of its hour$/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md'], ['projects/p/a.md']]);
+  assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha.', 'personal'));
+  assert.equal(liveText(f, 'projects/q/b.md'), note('b', 'B', 'Beta.'));
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md', 'projects/p/a.md']);
+  assert.match(f.labelReport(), /^- projects\/q\/b\.md: not sent; the label token of this run was near the end of its hour$/m);
+});
+
+test('an --all run that stops leaves its notes to the next run', (t) => {
+  const f = labelFixture(t);
+  f.seed({
+    'global/g.md': labeledNote('g', 'G', 'General.', 'general'),
+    'projects/p/a.md': labeledNote('a', 'A', 'Alpha.', 'work'),
+    'projects/q/b.md': labeledNote('b', 'B', 'Beta.', 'personal'),
+  });
+  // A first run records the three labels as they are.
+  assert.equal(f.label().status, 0);
+  assert.deepEqual(f.requests(), []);
+  // A full relabel whose first batch reaches the ceiling.
+  f.setConfig({ maxBudgetUsd: 0.001 });
+  f.mantle({ labels: { 'global/g.md': 'work', 'projects/p/a.md': 'work', 'projects/q/b.md': 'personal' } });
+  const all = f.label('--all');
+  assert.equal(all.status, 0, all.stdout + all.stderr);
+  assert.match(all.stdout, /^label: stopped; the model cost of this run reached its ceiling of USD 0\.00$/m);
+  assert.deepEqual(f.requests().map((q) => q.paths), [['global/g.md']]);
+  assert.equal(liveText(f, 'global/g.md'), labeledNote('g', 'G', 'General.', 'work'));
+  // The notes it did not reach lose their entries, which still matched them.
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md']);
+  // A plain run sends exactly those notes.
+  f.setConfig();
+  const next = f.label();
+  assert.equal(next.status, 0, next.stdout + next.stderr);
+  assert.deepEqual(f.requests().slice(1).map((q) => q.paths), [['projects/p/a.md'], ['projects/q/b.md']]);
+  assert.deepEqual(Object.keys(f.readState().labels.notes), ['global/g.md', 'projects/p/a.md', 'projects/q/b.md']);
 });
 
 test('a dry run writes nothing', (t) => {

@@ -26,7 +26,7 @@ import { labelBatch, labelToken } from './lib/label-client.mjs';
 import {
   applyLabelEntries, collectScopeNotes, digestAfterLabels, digestOfFiles, fileDigests, labelEntryProblem,
 } from './lib/label-notes.mjs';
-import { labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched } from './lib/label-run.mjs';
+import { labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, sendBatches } from './lib/label-run.mjs';
 import { modelArgs, renderPrompt, runModel } from './lib/model-run.mjs';
 import { INDEX, NOTE_NAME_RE, indexStats, parseNote } from './lib/notes.mjs';
 import { scanText } from './lib/secret-scan.mjs';
@@ -1480,7 +1480,8 @@ const notesFolderOf = (path) => path.slice(0, path.lastIndexOf('/'));
 
 // The label pass over the clone's scopes: `scopes` names some (`global` or project folders), none
 // means every scope. It reads the notes (label-read), sends the touched ones to the label model in
-// batches until the pass's cost ceiling (maxBudgetUsd), writes their labels and the exceptions'
+// batches until it has sent them all or must stop (sendBatches: the cost ceiling maxBudgetUsd, the
+// age of the token, two failed batches in a row), writes the labels given and the exceptions'
 // (label-apply), records what it saw in `state.labels`, and moves Organize's record of each scope
 // it wrote into, where that was the content it found. Prints what it did. `failed`: the inputs are
 // missing or invalid, no token could be made, a batch failed, or a step failed. A signal stops it
@@ -1545,9 +1546,12 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
 
   const asked = await askLabelModel({ batches, label, persona, ceiling: config.consolidate.maxBudgetUsd, say });
   // Interrupted: nothing is written, and every note stays as it is.
-  if (asked.interrupted) return { failed: asked.failed };
+  if (asked.stop === 'interrupted' || (await signalsHandled())) return { failed: asked.failed };
   let failed = asked.failed;
-  const planned = new Map([...exceptions.map((e) => [e.path, { label: e.label, reason: null, exception: true }]), ...asked.planned]);
+  const planned = new Map([
+    ...exceptions.map((e) => [e.path, { label: e.label, reason: null, exception: true }]),
+    ...[...asked.labels].map(([path, given]) => [path, { ...given, exception: false }]),
+  ]);
   const results = labelResults({ scopes: runScopes, notes: listed.filter(inRun), planned, left: asked.left, exceptions: domains.exceptions });
   const sections = labelReport(results, { reasons: true });
   const report = [
@@ -1580,15 +1584,19 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   const { applied } = outcome;
 
   // The record: what label-apply wrote or found labeled, and on a first run what was labeled
-  // already. A run that read only some scopes keeps the entries of the others.
+  // already. A note the run took but did not record (a failed batch, a stop, a failed step) loses
+  // its entry, which still matches it after --all, so that the next run sends it. A run that read
+  // only some scopes keeps the entries of the others.
   const done = ['applied', 'no-change', 'apply-interrupted'].includes(applied?.outcome) ? applied : { written: [], unchanged: [] };
   const recorded = (list) => (list ?? []).map((x) => ({ path: x.path, digest: x.sha256 }));
+  const kept = new Set([...(done.written ?? []), ...(done.unchanged ?? [])].map((x) => x.path));
   const readFolders = readNames.map(scopeFolder);
   const elsewhere = readAll ? [] : Object.keys(record ?? {}).filter((path) => !readFolders.includes(notesFolderOf(path)));
   state.labels = {
     version: 1,
     notes: nextLabelRecord(record, {
       present: [...listed.map((n) => n.path), ...elsewhere], written: recorded(done.written), unchanged: recorded(done.unchanged), confirmed,
+      left: touched.map((n) => n.path).filter((path) => !kept.has(path)),
     }),
   };
   // Labels never make a scope due for Organize: its record moves with them where it was the
@@ -1607,52 +1615,28 @@ async function labelScopes({ config, opts, state, scopes, label, domains, person
   return { failed };
 }
 
-// The model's labels for the batches, one request each, until the pass's cost `ceiling`: `planned`
-// (path -> { label, reason, exception: false }), `left` (path -> why it was not labeled), what was
-// spent and sent. `failed` when no token could be made or a batch failed; `interrupted` when a
-// signal stopped it. One token for the run, and only when there is a batch to send.
+// The model's labels for the batches (sendBatches), with one token for the run, made only when
+// there is a batch to send, and a line saying why the pass stopped before its last batch. `failed`
+// when no token could be made or a batch failed.
 async function askLabelModel({ batches, label, persona, ceiling, say }) {
-  const asked = { planned: new Map(), left: new Map(), failed: false, interrupted: false, spent: 0, requests: 0, sent: 0 };
-  const leave = (list, why) => list.forEach((b) => b.notes.forEach((n) => asked.left.set(n.path, why)));
-  if (batches.length === 0) return asked;
+  const none = { labels: new Map(), left: new Map(), stop: null, failed: false, spent: 0, requests: 0, sent: 0 };
+  if (batches.length === 0) return none;
   let token;
   try {
     token = await labelToken(label);
   } catch (err) {
     say(`label: the label token could not be made (${awsText(err)}); no note was sent to the model.`);
-    leave(batches, 'not sent; the label token could not be made');
-    asked.failed = true;
-    asked.interrupted = (await signalsHandled()) !== null;
-    return asked;
+    const left = new Map(batches.flatMap((b) => b.notes.map((n) => [n.path, 'not sent; the label token could not be made'])));
+    return { ...none, left, failed: true };
   }
-  for (const [i, batch] of batches.entries()) {
-    if (await signalsHandled()) {
-      asked.interrupted = true;
-      return asked;
-    }
-    if (asked.spent >= ceiling) {
-      say(`label: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}`);
-      leave(batches.slice(i), 'not sent; the model cost of this run reached its ceiling');
-      break;
-    }
-    const res = await labelBatch({ notes: batch.notes, persona, label, token, signal: abort.signal });
-    asked.spent += res.costUsd;
-    asked.requests += res.requests;
-    asked.sent += batch.notes.length;
-    if (await signalsHandled()) {
-      asked.interrupted = true;
-      return asked;
-    }
-    if (!res.ok) {
-      asked.failed = true;
-      leave([batch], `the model call failed (${res.error})`);
-      continue;
-    }
-    for (const n of batch.notes) {
-      const answer = res.labels.get(n.id);
-      asked.planned.set(n.path, { label: answer.label, reason: answer.reason || null, exception: false });
-    }
-  }
+  // The token was made just now and lasts an hour.
+  const asked = await sendBatches({
+    batches, ceiling, signal: abort.signal, now: () => Date.now(), tokenAt: Date.now(),
+    labelBatch: (notes) => labelBatch({ notes, persona, label, token, signal: abort.signal }),
+  });
+  if (asked.stop === 'failures') say('label: stopped; two batches in a row failed');
+  else if (asked.stop === 'ceiling') say(`label: stopped; the model cost of this run reached its ceiling of ${usd(ceiling)}`);
+  else if (asked.stop === 'token-age') say('label: stopped; the label token of this run is near the end of its hour');
   return asked;
 }
 

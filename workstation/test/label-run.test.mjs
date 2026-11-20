@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseDomains } from '../lib/domains.mjs';
-import { labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched } from '../lib/label-run.mjs';
+import {
+  FAILURES_IN_A_ROW, TOKEN_MAX_AGE_MS, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, sendBatches,
+} from '../lib/label-run.mjs';
 
 const hex = (c) => c.repeat(64);
 const scopeOf = (path) => path.slice(0, path.lastIndexOf('/'));
@@ -119,6 +121,113 @@ test('nextLabelRecord drops notes that are gone and keeps skipped ones out', () 
   assert.deepEqual(Object.keys(next), Object.keys(next).sort(), 'sorted by path');
   assert.deepEqual({ ...nextLabelRecord(null, { present: ['global/a.md'], written: [], unchanged: [], confirmed: [{ path: 'global/a.md', digest: hex('1') }] }) },
     { 'global/a.md': hex('1') });
+});
+
+test('nextLabelRecord drops the entries of notes the run took but did not label', () => {
+  // After an --all run, a note not reached still matches its entry: it loses it, so the next run sends it.
+  const record = { 'global/a.md': hex('1'), 'global/b.md': hex('2'), 'global/c.md': hex('3') };
+  const next = nextLabelRecord(record, {
+    present: ['global/a.md', 'global/b.md', 'global/c.md'],
+    written: [{ path: 'global/a.md', digest: hex('4') }],
+    left: ['global/b.md'],
+  });
+  assert.deepEqual(next, { 'global/a.md': hex('4'), 'global/c.md': hex('3') });
+});
+
+// Batches of one note each, one per scope, as planLabelBatches gives them.
+const batchesOf = (...scopes) => scopes.map((scope) => ({ scope, notes: [{ ...note(`${scope}/n.md`), id: 'n001', default: 'general' }] }));
+const leftOf = (out) => Object.fromEntries(out.left);
+
+// A stand-in for the caller's labelBatch call: the calls whose number (from 1) is in `fails` fail,
+// the others label every note `work`; each costs `cost` and moves `clock` on by `step` ms.
+function fakeModel({ fails = [], cost = 0.25, clock = null, step = 0, onCall = () => {} } = {}) {
+  const calls = [];
+  const labelBatch = async (notes) => {
+    calls.push(notes.map((n) => n.path));
+    if (clock) clock.ms += step;
+    onCall(calls.length);
+    if (fails.includes(calls.length)) return { ok: false, error: 'Mantle Responses HTTP 500', costUsd: 0, requests: 1 };
+    return { ok: true, labels: new Map(notes.map((n) => [n.id, { label: 'work', reason: `reason for ${n.path}` }])), costUsd: cost, requests: 1 };
+  };
+  return { labelBatch, calls };
+}
+const run = (batches, model, extra = {}) => sendBatches({ batches, labelBatch: model.labelBatch, ceiling: 5, now: () => 0, tokenAt: 0, ...extra });
+
+test('sendBatches goes on after a failed batch', async () => {
+  const model = fakeModel({ fails: [1] });
+  const out = await run(batchesOf('global', 'projects/p', 'projects/q'), model);
+  assert.deepEqual(model.calls, [['global/n.md'], ['projects/p/n.md'], ['projects/q/n.md']]);
+  assert.equal(out.stop, null);
+  assert.equal(out.failed, true);
+  assert.deepEqual(Object.fromEntries(out.labels), {
+    'projects/p/n.md': { label: 'work', reason: 'reason for projects/p/n.md' },
+    'projects/q/n.md': { label: 'work', reason: 'reason for projects/q/n.md' },
+  });
+  assert.deepEqual(leftOf(out), { 'global/n.md': 'the model call failed (Mantle Responses HTTP 500)' });
+  assert.deepEqual([out.spent, out.requests, out.sent], [0.5, 3, 3]);
+  // A success between two failures starts the count again.
+  const apart = fakeModel({ fails: [1, 3] });
+  assert.equal((await run(batchesOf('global', 'projects/p', 'projects/q', 'projects/r'), apart)).stop, null);
+  assert.equal(apart.calls.length, 4);
+});
+
+test('sendBatches stops after two failed batches in a row', async () => {
+  assert.equal(FAILURES_IN_A_ROW, 2);
+  const model = fakeModel({ fails: [2, 3] });
+  const out = await run(batchesOf('global', 'projects/p', 'projects/q', 'projects/r', 'projects/s'), model);
+  assert.deepEqual(model.calls, [['global/n.md'], ['projects/p/n.md'], ['projects/q/n.md']]);
+  assert.equal(out.stop, 'failures');
+  assert.equal(out.failed, true);
+  assert.deepEqual([...out.labels.keys()], ['global/n.md']);
+  assert.deepEqual(leftOf(out), {
+    'projects/p/n.md': 'the model call failed (Mantle Responses HTTP 500)',
+    'projects/q/n.md': 'the model call failed (Mantle Responses HTTP 500)',
+    'projects/r/n.md': 'not sent; two batches in a row failed',
+    'projects/s/n.md': 'not sent; two batches in a row failed',
+  });
+});
+
+test('sendBatches stops at the cost ceiling, which is not a failure', async () => {
+  const model = fakeModel({ cost: 0.6 });
+  const out = await run(batchesOf('global', 'projects/p', 'projects/q'), model, { ceiling: 1 });
+  // 0.6 after the first batch is below the ceiling; 1.2 after the second is not.
+  assert.equal(model.calls.length, 2);
+  assert.equal(out.stop, 'ceiling');
+  assert.equal(out.failed, false);
+  assert.deepEqual(leftOf(out), { 'projects/q/n.md': 'not sent; the model cost of this run reached its ceiling' });
+  assert.equal(out.spent, 1.2);
+});
+
+test('sendBatches stops when the token is near the end of its hour', async () => {
+  assert.equal(TOKEN_MAX_AGE_MS, 55 * 60 * 1000);
+  const minutes = 60 * 1000;
+  // Each call takes 30 minutes: the third batch would start with a token an hour old.
+  const clock = { ms: 1_000_000 };
+  const model = fakeModel({ clock, step: 30 * minutes });
+  const out = await run(batchesOf('global', 'projects/p', 'projects/q'), model, { now: () => clock.ms, tokenAt: clock.ms });
+  assert.equal(model.calls.length, 2);
+  assert.equal(out.stop, 'token-age');
+  assert.equal(out.failed, false);
+  assert.deepEqual(leftOf(out), { 'projects/q/n.md': 'not sent; the label token of this run was near the end of its hour' });
+  // The limit itself stops; a millisecond less does not; a token of unknown age never stops.
+  const at = (age) => run(batchesOf('global'), fakeModel(), { now: () => clock.ms, tokenAt: clock.ms - age });
+  assert.equal((await at(55 * minutes)).stop, 'token-age');
+  assert.equal((await at(55 * minutes - 1)).stop, null);
+  assert.equal((await run(batchesOf('global'), fakeModel(), { now: () => clock.ms, tokenAt: null })).stop, null);
+});
+
+test('sendBatches stops when the signal aborts', async () => {
+  const abort = new AbortController();
+  const model = fakeModel({ onCall: () => abort.abort() });
+  const out = await run(batchesOf('global', 'projects/p'), model, { signal: abort.signal });
+  assert.equal(model.calls.length, 1);
+  assert.equal(out.stop, 'interrupted');
+  assert.deepEqual(out.labels, new Map());
+  assert.deepEqual(Object.keys(leftOf(out)), ['global/n.md', 'projects/p/n.md']);
+  // Aborted before it starts: nothing is sent.
+  const none = fakeModel();
+  assert.equal((await run(batchesOf('global'), none, { signal: abort.signal })).stop, 'interrupted');
+  assert.deepEqual(none.calls, []);
 });
 
 // The results of a run over global/ and projects/p, as a workstation pass builds them.

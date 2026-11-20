@@ -1,6 +1,7 @@
 // The label step's decisions, the same for the notes clone and for the agent scopes: which notes go
-// to the model, the batches and the exceptions, the record of what the step saw, and the report.
-// Pure functions; no file, Git, network or model. A note here is `{ path, scope, digest, domain,
+// to the model, the batches and the exceptions, when to stop sending them, the record of what the
+// step saw, and the report. No file, Git or network access of their own: sendBatches makes the
+// model calls only through the function it is given. A note here is `{ path, scope, digest, domain,
 // name, description, body }`: `digest` is what the record keeps for it (the file's SHA-256 in the
 // clone, the object's ETag in the bucket), `domain` its label or null, `scope` its folder
 // (`global`, `projects/<name>` or `agents/<agent>`).
@@ -55,12 +56,77 @@ export function planLabelBatches({ notes, touched, domains, batchNotes }) {
 // The record after a run, sorted by path: the old entries of the notes still `present`, then the
 // notes the run recorded, each `{ path, digest }`: `confirmed` (labeled notes found on a first
 // run), `unchanged` (the label was already the one given) and `written`, a later list winning. A
-// note that the run skipped, or whose batch failed, gets no new entry, so it stays touched.
-export function nextLabelRecord(record, { present, written = [], unchanged = [], confirmed = [] }) {
+// note that the run skipped, or whose batch failed, gets no new entry, so it stays touched. `left`
+// (paths) are the notes the run took but did not record: they lose their old entry too, which
+// still matches them after an `--all` run, so that the next run sends them.
+export function nextLabelRecord(record, { present, written = [], unchanged = [], confirmed = [], left = [] }) {
   const keep = new Set(present);
+  for (const path of left) keep.delete(path);
   const next = new Map(Object.entries(record ?? {}).filter(([path]) => keep.has(path)));
   for (const { path, digest } of [...confirmed, ...unchanged, ...written]) next.set(path, digest);
   return Object.fromEntries([...next].sort(([a], [b]) => byName(a, b)));
+}
+
+// A label token lasts an hour: no batch starts once the run's token is this old.
+export const TOKEN_MAX_AGE_MS = 55 * 60 * 1000;
+// After this many failed batches in a row the endpoint is taken as out of reach.
+export const FAILURES_IN_A_ROW = 2;
+
+// Why the notes of the batches after a stop were not sent.
+const NOT_SENT = {
+  interrupted: 'not sent; the run was interrupted',
+  failures: 'not sent; two batches in a row failed',
+  ceiling: 'not sent; the model cost of this run reached its ceiling',
+  'token-age': 'not sent; the label token of this run was near the end of its hour',
+};
+
+// Sends the batches to the model in order, one `labelBatch(notes)` each: the caller's call, with
+// its token, persona and endpoint, giving labelBatch's result. Before each batch it stops when
+// `signal` is aborted (`interrupted`), after FAILURES_IN_A_ROW failed batches in a row (`failures`,
+// a failure), when the cost so far reached `ceiling` USD (`ceiling`, a limit), or when the token,
+// made at `tokenAt` (of `now()`, in ms; null when its age is not known), is TOKEN_MAX_AGE_MS old
+// (`token-age`, a limit). A failed batch alone does not stop it. Returns the labels given (path ->
+// { label, reason }), the notes not labeled (path -> why), `stop` (null when it sent every batch),
+// `failed` (a batch failed), and what it spent, requested and sent.
+export async function sendBatches({ batches, labelBatch, ceiling, now, tokenAt, signal }) {
+  const out = { labels: new Map(), left: new Map(), stop: null, failed: false, spent: 0, requests: 0, sent: 0 };
+  const leave = (list, why) => list.forEach((b) => b.notes.forEach((n) => out.left.set(n.path, why)));
+  const stopBefore = (failures) => {
+    if (signal?.aborted) return 'interrupted';
+    if (failures >= FAILURES_IN_A_ROW) return 'failures';
+    if (out.spent >= ceiling) return 'ceiling';
+    if (tokenAt !== null && tokenAt !== undefined && now() - tokenAt >= TOKEN_MAX_AGE_MS) return 'token-age';
+    return null;
+  };
+  let failures = 0;
+  for (const [i, batch] of batches.entries()) {
+    out.stop = stopBefore(failures);
+    if (out.stop) {
+      leave(batches.slice(i), NOT_SENT[out.stop]);
+      break;
+    }
+    const res = await labelBatch(batch.notes);
+    out.spent += res.costUsd;
+    out.requests += res.requests;
+    out.sent += batch.notes.length;
+    if (signal?.aborted) {
+      out.stop = 'interrupted';
+      leave(batches.slice(i), NOT_SENT.interrupted);
+      break;
+    }
+    if (!res.ok) {
+      out.failed = true;
+      failures += 1;
+      leave([batch], `the model call failed (${res.error})`);
+      continue;
+    }
+    failures = 0;
+    for (const n of batch.notes) {
+      const answer = res.labels.get(n.id);
+      out.labels.set(n.path, { label: answer.label, reason: answer.reason || null });
+    }
+  }
+  return out;
 }
 
 // What a run did in each of its `scopes` (folder names, in order), for labelReport.
