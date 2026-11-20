@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { describe } from 'node:test';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { MODEL_RE, loadConfig } from '../lib/config.mjs';
@@ -100,7 +100,7 @@ test('consolidate block is returned with given values', (t) => {
     maxTranscriptBytes: 50000, maxTurns: 10, maxBudgetUsd: 1.5, timeoutMinutes: 12,
   };
   write({ ...BASE, consolidate: block });
-  assert.deepEqual(loadConfig(env).consolidate, { ...block, agents: null });
+  assert.deepEqual(loadConfig(env).consolidate, { ...block, agents: null, label: null });
 });
 
 test('consolidate defaults are filled', (t) => {
@@ -108,7 +108,7 @@ test('consolidate defaults are filled', (t) => {
   write({ ...BASE, consolidate: { command: '/bin/m', model: 'm1' } });
   assert.deepEqual(loadConfig(env).consolidate, {
     command: '/bin/m', model: 'm1', env: {}, extract: null, organize: null,
-    maxProjects: 5, maxTranscriptBytes: 200000, maxTurns: 200, maxBudgetUsd: 5, timeoutMinutes: 30, agents: null,
+    maxProjects: 5, maxTranscriptBytes: 200000, maxTurns: 200, maxBudgetUsd: 5, timeoutMinutes: 30, agents: null, label: null,
   });
 });
 
@@ -218,7 +218,7 @@ test('item 4: a key the consolidate block does not know makes it invalid, naming
     maxProjects: 2, maxTranscriptBytes: 20000, maxTurns: 20, maxBudgetUsd: 2, timeoutMinutes: 20,
   };
   write({ ...BASE, consolidate: every });
-  assert.deepEqual(loadConfig(env).consolidate, { ...every, agents: null });
+  assert.deepEqual(loadConfig(env).consolidate, { ...every, agents: null, label: null });
   assert.equal(loadConfig(env).consolidateProblem, null);
 });
 
@@ -256,6 +256,92 @@ test('an invalid agents part makes the consolidate block invalid, naming its fie
     assert.equal(cfg.consolidate, null, problem);
     assert.equal(cfg.consolidateProblem, problem);
   }
+});
+
+describe('consolidate.label', () => {
+  const OK = { command: '/bin/m', model: 'm1' };
+  const LABEL = { model: '<model-id>', region: 'us-east-1', inputUsdPerMillion: 1.1, outputUsdPerMillion: 5.5 };
+  const parse = (t, label) => {
+    const { env, write } = setup(t);
+    write({ ...BASE, consolidate: { ...OK, label } });
+    return loadConfig(env);
+  };
+
+  test('no block means null', (t) => {
+    const { env, write } = setup(t);
+    write({ ...BASE, consolidate: OK });
+    assert.equal(loadConfig(env).consolidate.label, null);
+  });
+
+  test('minimal block gets the defaults', (t) => {
+    const cfg = parse(t, LABEL);
+    assert.equal(cfg.consolidateProblem, null);
+    assert.deepEqual(cfg.consolidate.label, {
+      ...LABEL, endpoint: 'https://bedrock-mantle.us-east-1.api.aws/openai/v1', credentials: 'instance', roleArn: null,
+      tokenFile: null, reasoningEffort: 'low', batchNotes: 19, domainsFile: null, personaFile: null,
+    });
+  });
+
+  test('every key can be given; a trailing slash of the endpoint is removed', (t) => {
+    const full = {
+      ...LABEL, endpoint: 'https://example.com/openai/v1/', credentials: 'environment', roleArn: ORGANIZER_ARN,
+      reasoningEffort: 'high', batchNotes: 50, domainsFile: '/etc/domains.json', personaFile: '/etc/persona.md',
+    };
+    const cfg = parse(t, full);
+    assert.equal(cfg.consolidateProblem, null);
+    assert.deepEqual(cfg.consolidate.label, { ...full, endpoint: 'https://example.com/openai/v1', tokenFile: null });
+  });
+
+  test('a token file excludes credentials and roleArn', (t) => {
+    const tokenFile = '/home/u/token';
+    assert.equal(parse(t, { ...LABEL, tokenFile, credentials: 'instance' }).consolidateProblem, 'label.tokenFile');
+    assert.equal(parse(t, { ...LABEL, tokenFile, roleArn: ORGANIZER_ARN }).consolidateProblem, 'label.tokenFile');
+    const cfg = parse(t, { ...LABEL, tokenFile });
+    assert.equal(cfg.consolidateProblem, null);
+    assert.equal(cfg.consolidate.label.credentials, null);
+    assert.equal(cfg.consolidate.label.tokenFile, tokenFile);
+  });
+
+  test('an invalid field makes the consolidate block invalid, naming it', (t) => {
+    const { model: _m, inputUsdPerMillion: _i, outputUsdPerMillion: _o, ...noPrices } = LABEL;
+    for (const [label, problem] of [
+      ['x', 'label'],
+      [[LABEL], 'label'],
+      [{ ...LABEL, model: undefined }, 'label.model'],
+      [{ ...LABEL, model: '-x' }, 'label.model'],
+      [{ ...LABEL, region: 'tokyo' }, 'label.region'],
+      [{ ...LABEL, region: undefined }, 'label.region'],
+      [{ ...LABEL, endpoint: 'http://x' }, 'label.endpoint'],
+      [{ ...LABEL, endpoint: 'https://x.example.com/v1?a=b' }, 'label.endpoint'],
+      [{ ...LABEL, endpoint: 'https://x.example.com/v1#h' }, 'label.endpoint'],
+      [{ ...LABEL, endpoint: 'https://u:p@x.example.com/v1' }, 'label.endpoint'],
+      [{ ...LABEL, endpoint: 'not a url' }, 'label.endpoint'],
+      [{ ...LABEL, credentials: 'file' }, 'label.credentials'],
+      [{ ...LABEL, roleArn: 'arn:aws:iam::123456789012:user/someone' }, 'label.roleArn'],
+      [{ ...LABEL, tokenFile: 'rel/token' }, 'label.tokenFile'],
+      [{ ...LABEL, reasoningEffort: 'max' }, 'label.reasoningEffort'],
+      [{ ...LABEL, batchNotes: 0 }, 'label.batchNotes'],
+      [{ ...LABEL, batchNotes: 51 }, 'label.batchNotes'],
+      [{ ...LABEL, batchNotes: 1.5 }, 'label.batchNotes'],
+      [{ ...LABEL, inputUsdPerMillion: undefined }, 'label.inputUsdPerMillion'],
+      [{ ...LABEL, inputUsdPerMillion: 0 }, 'label.inputUsdPerMillion'],
+      [{ ...LABEL, inputUsdPerMillion: 1001 }, 'label.inputUsdPerMillion'],
+      [{ ...LABEL, inputUsdPerMillion: '1' }, 'label.inputUsdPerMillion'],
+      [{ ...LABEL, outputUsdPerMillion: undefined }, 'label.outputUsdPerMillion'],
+      [{ ...LABEL, outputUsdPerMillion: 0 }, 'label.outputUsdPerMillion'],
+      [{ ...LABEL, outputUsdPerMillion: 1001 }, 'label.outputUsdPerMillion'],
+      [{ ...noPrices, model: '<model-id>', region: 'us-east-1' }, 'label.inputUsdPerMillion'],
+      [{ ...LABEL, domainsFile: 'domains.json' }, 'label.domainsFile'],
+      [{ ...LABEL, domainsFile: '/a\nb' }, 'label.domainsFile'],
+      [{ ...LABEL, personaFile: 'persona.md' }, 'label.personaFile'],
+      [{ ...LABEL, labelModel: 'x' }, 'label.labelModel'],
+      [{ ...LABEL, ['AKIA' + 'ABCDEFGHIJKLMNOP']: 'x' }, 'label.(an unknown key)'],
+    ]) {
+      const cfg = parse(t, label);
+      assert.equal(cfg.consolidate, null, problem);
+      assert.equal(cfg.consolidateProblem, problem);
+    }
+  });
 });
 
 const BRIDGE_OK = {
