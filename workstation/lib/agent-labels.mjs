@@ -1,28 +1,37 @@
 // The label step over the agent scopes of the memory API's bucket (`label --agents`, and the end of
 // every `organize --agents` run), with the decisions of label-run.mjs and each object's ETag as the
-// digest of its note. It lists the bucket once and reads the notes it needs: on a scope's first run
-// every note, to see which carry a label; on later runs the touched ones (no record entry, or
-// another ETag) and those with an exception. It asks the model in batches, then, scope by scope,
+// digest of its note. It lists the bucket once, reads the search entries before the model calls and
+// again before the writes, and reads the notes it needs: on a scope's first run every note, to see
+// which carry a label; on later runs the touched ones (no record entry, or another ETag), those
+// with an exception, and those whose search entry carries no label. It asks the model in batches,
+// except for a note that no label would let fit what the memory API accepts, then, scope by scope,
 // writes each changed label over the version it listed and read (If-Match: an agent's write
-// meanwhile wins), gives the written notes their search entries (setNoteEntries), and records what
-// it saw in the scope's entry of index/organizer.json (`labels`: file -> ETag, `lastLabel`), where
-// Organize's record moves with the labels. A label that would take a scope past what the memory
-// API accepts is not written. A dry run writes nothing. Its lines hold names, labels, counts and
-// fixed reasons: never a note's text, the model's reasons, a response body or the token.
+// meanwhile wins), gives the written notes their search entries, and the notes it read whose entry
+// lacks their label that label, in one update (setNoteEntries), and records what it saw in the
+// scope's entry of index/organizer.json (`labels`: file -> ETag, `lastLabel`), where Organize's
+// record moves with the labels. A label that would take a scope past what the memory API accepts
+// is not written. A dry run writes nothing. Its lines hold names, labels, counts and fixed reasons:
+// never a note's text, the model's reasons, a response body or the token.
 
 import {
   API_LIMITS, FILE_RE, MARKDOWN, MAX_OBJECT_BYTES, listAgentScopes, noteEntry, readOrganizerState,
   readSearchEntries, recordOrganizerState, scopeDigest, setNoteEntries,
 } from './agent-scopes.mjs';
 import { AwsError } from './aws.mjs';
-import { readDomain, setDomain } from './domains.mjs';
+import { LABELS, readDomain, setDomain } from './domains.mjs';
 import { labelBatch as modelBatch } from './label-client.mjs';
 import { isLabelNoteName, labelNoteOf } from './label-notes.mjs';
 import {
-  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched,
+  askLabelModel, errorText, labelReport, labelResults, nextLabelRecord, planLabelBatches, selectTouched, unreadScopeResults,
 } from './label-run.mjs';
 
 const bytes = (text) => Buffer.byteLength(text, 'utf8');
+// The label whose `domain` field takes the most bytes in a search entry.
+const LONGEST = LABELS.reduce((a, b) => (b.length > a.length ? b : a));
+// The search entries of a scope (path -> entry), and whether such entries stay within what the
+// memory API accepts of a scope (api/src/ops/write.ts).
+const scopeEntriesOf = (entries, scope) => new Map(entries.filter((e) => e.path.startsWith(`${scope}/`)).map((e) => [e.path, e]));
+const fits = (scopeEntries) => bytes(JSON.stringify([...scopeEntries.values()])) <= API_LIMITS.scopeBytes;
 
 // Why a note the pass took was not labeled; it stays touched.
 const LEFT = {
@@ -43,18 +52,19 @@ function recordOf(scope, entry) {
 }
 
 // What the pass reads of one scope from its listing `files` (sorted by name): every note when the
-// scope has no record or with `all`, otherwise the notes whose ETag is not the one recorded and
-// those with an exception. A note is read in the version listed only: one that changed since (an
-// agent wrote it) waits for the next run. `read`: the notes as labelNoteOf gives them, with
-// `digest` (the ETag) and `text`; `present`: the paths of all the scope's notes; `left`: the notes
-// not read, with why.
-async function readScope({ s3, scope, files, record, all, domains }) {
+// scope has no record or with `all`, otherwise the notes whose ETag is not the one recorded, those
+// with an exception, and those whose search entry carries no label (`bare`: paths), as after an
+// older kit's Organize, which rewrites the entries without labels. A note is read in the version
+// listed only: one that changed since (an agent wrote it) waits for the next run. `read`: the notes
+// as labelNoteOf gives them, with `digest` (the ETag) and `text`; `present`: the paths of all the
+// scope's notes; `left`: the notes not read, with why.
+async function readScope({ s3, scope, files, record, all, domains, bare }) {
   const out = { read: [], present: [], left: new Map() };
   for (const f of files) {
     if (!isLabelNoteName(f.file)) continue;
     const path = `${scope}/${f.file}`;
     const recorded = record !== null && Object.hasOwn(record, path) && record[path] === f.etag;
-    if (recorded && !all && !domains.exceptions.has(path)) {
+    if (recorded && !all && !domains.exceptions.has(path) && !bare.has(path)) {
       out.present.push(path);
       continue;
     }
@@ -85,15 +95,24 @@ async function getNote(s3, key) {
   }
 }
 
+// Why the memory API would refuse note `n` of scope `s` with any label the model could give, so
+// that it is not sent: its text after the frontmatter is over the API's limit, or with the longest
+// label its scope's search entries (`scopeEntries`) would be. Null when every label fits.
+function misfit(s, n, scopeEntries) {
+  const entry = noteEntry(s.agent, n.file, setDomain(n.text, LONGEST).text);
+  if (bytes(entry.body) > API_LIMITS.contentBytes) return LEFT.content;
+  return fits(new Map(scopeEntries).set(n.path, entry)) ? null : LEFT.scope;
+}
+
 // Writes the labels `planned` gives the notes of scope `s`, each only while it fits what the memory
-// API accepts, then the written notes' search entries, then the scope's record, where Organize's
-// record moves to the listing the pass read with its own writes, if it was that listing. `entries`:
-// the search entries as read before the writes. In a dry run, only what would be written.
+// API accepts, then in one update the search entries of the written notes and of the notes read
+// whose entry does not carry their label, each such entry while it fits, then the scope's record,
+// where Organize's record moves to the listing the pass read with its own writes, if it was that
+// listing. `entries`: the search entries as read before the writes. In a dry run, only what would be
+// written.
 async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
   const out = { written: [], unchanged: [], left: new Map(), notWritten: 0, details: [], failed: false };
-  // The scope's entries as the memory API counts them against its limit (api/src/ops/write.ts).
-  const scopeEntries = new Map(entries.filter((e) => e.path.startsWith(`${s.scope}/`)).map((e) => [e.path, e]));
-  const fits = (next) => bytes(JSON.stringify([...next.values()])) <= API_LIMITS.scopeBytes;
+  const scopeEntries = scopeEntriesOf(entries, s.scope);
   const skip = (path, why) => {
     out.left.set(path, why);
     out.notWritten += 1;
@@ -148,19 +167,39 @@ async function writeScope({ s3For, s, planned, entries, started, dryRun }) {
     out.failed = true;
     out.details.push(`  - a write to the bucket failed (${broken}); the scope's other labels are left for the next run`);
   }
+  // A note read that keeps its label but whose entry does not carry it (a labeled note found on a
+  // first run, one whose label held under --all or an exception, an entry an older kit's Organize
+  // rewrote) gets it in the same update, while it fits. A note whose write was tried is left out.
+  const tried = new Set([...out.written.map((w) => w.path), ...out.left.keys()]);
+  const updates = out.written.map((w) => ({ file: w.file, text: w.text }));
+  for (const n of s.editable) {
+    const current = scopeEntries.get(n.path);
+    if (tried.has(n.path) || current === undefined || (current.domain ?? null) === readDomain(n.text)) continue;
+    const entry = noteEntry(s.agent, n.file, n.text);
+    if (!fits(new Map(scopeEntries).set(n.path, entry))) continue;
+    scopeEntries.set(n.path, entry);
+    updates.push({ file: n.file, text: n.text });
+  }
   try {
     client ??= await s3For();
-    let entriesWritten = true;
-    if (out.written.length > 0) {
-      try {
-        await setNoteEntries(client, s.agent, out.written.map((w) => ({ file: w.file, text: w.text })));
-      } catch (err) {
-        entriesWritten = false;
-        out.failed = true;
-        out.details.push(`  - the search entries of the scope could not be updated (${errorText(err)});`
-          + ' it stays due for Organize, which rewrites them');
-      }
+  } catch (err) {
+    out.failed = true;
+    const entriesToo = updates.length > 0 ? 'the search entries of the scope could not be updated and ' : '';
+    out.details.push(`  - ${entriesToo}the run could not be recorded in index/organizer.json: ${errorText(err)}`);
+    return out;
+  }
+  let entriesWritten = true;
+  if (updates.length > 0) {
+    try {
+      await setNoteEntries(client, s.agent, updates);
+    } catch (err) {
+      entriesWritten = false;
+      out.failed = true;
+      const due = out.written.length > 0 ? '; it stays due for Organize, which rewrites them' : '';
+      out.details.push(`  - the search entries of the scope could not be updated (${errorText(err)})${due}`);
     }
+  }
+  try {
     const kept = new Set([...out.written, ...out.unchanged].map((x) => x.path));
     const record = nextLabelRecord(s.record, {
       present: s.present, written: out.written.map((w) => ({ path: w.path, digest: w.etag })), unchanged: out.unchanged,
@@ -208,30 +247,51 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
   const c = config.consolidate;
   const lines = [];
   const scopes = [];
+  // The search entries as the run starts: a recorded note whose entry carries no label is read
+  // again, and a touched note that no label would let fit its scope is not sent.
+  let startEntries;
   try {
     const s3 = await s3For({ signal });
     const listing = await listAgentScopes(s3);
     const state = await readOrganizerState(s3);
+    startEntries = await readSearchEntries(s3);
+    const bare = new Set(startEntries.filter((e) => e.domain === undefined).map((e) => e.path));
     const agents = (opts.agentNames.length > 0 ? opts.agentNames : [...listing.keys()]).filter((agent) => listing.has(agent));
     for (const agent of agents) {
       const scope = `agents/${agent}`;
       const files = listing.get(agent);
       const record = recordOf(scope, state.scopes[agent]);
-      scopes.push({ agent, scope, files, record, ...(await readScope({ s3, scope, files, record, all: opts.all, domains })) });
+      scopes.push({ agent, scope, files, record, ...(await readScope({ s3, scope, files, record, all: opts.all, domains, bare })) });
     }
   } catch (err) {
     if (signal?.aborted) return { failed: false, lines };
     return { failed: true, lines: [`label: the agent scopes could not be read (${errorText(err)}); no label was written.`] };
   }
-  if (scopes.length === 0) return { failed: false, lines: ['label: nothing to do'] };
+  // A run over every scope also names the exceptions of agent scopes it did not find: a typo there is never applied.
+  const unread = opts.agentNames.length > 0 ? []
+    : unreadScopeResults({ scopes: scopes.map((s) => s.scope), exceptions: domains.exceptions, own: (scope) => scope.startsWith('agents/') });
+  // The report of the scopes, without the model's reasons, as lines.
+  const reportLines = (results) => {
+    const report = labelReport([...results, ...unread], { reasons: false });
+    return report === '' ? [] : report.trimEnd().split('\n');
+  };
+  if (scopes.length === 0) return { failed: false, lines: ['label: nothing to do', ...reportLines([])] };
 
-  // Only notes whose frontmatter the pass can edit go to the model or take an exception.
+  // Only notes whose frontmatter the pass can edit go to the model or take an exception, and only
+  // those that any label lets fit what the memory API accepts go to the model: the others stay
+  // touched, with why.
   for (const s of scopes) {
     s.editable = s.read.filter((n) => n.skip === null);
     Object.assign(s, selectTouched({ notes: s.editable, record: s.record, all: opts.all }));
+    const scopeEntries = scopeEntriesOf(startEntries, s.scope);
+    for (const n of s.touched) {
+      const why = domains.exceptions.has(n.path) ? null : misfit(s, n, scopeEntries);
+      if (why !== null) s.left.set(n.path, why);
+    }
   }
   const { exceptions, batches } = planLabelBatches({
-    notes: scopes.flatMap((s) => s.editable), touched: scopes.flatMap((s) => s.touched), domains, batchNotes: c.label.batchNotes,
+    notes: scopes.flatMap((s) => s.editable), touched: scopes.flatMap((s) => s.touched.filter((n) => !s.left.has(n.path))),
+    domains, batchNotes: c.label.batchNotes,
   });
   const asked = await askLabelModel({
     batches, token, ceiling: c.maxBudgetUsd, now: () => Date.now(), signal,
@@ -247,6 +307,7 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
     ...[...asked.labels].map(([path, given]) => [path, { ...given, exception: false }]),
   ]);
 
+  // The entries again, right before the writes that are checked against them: the model calls take a while.
   let entries;
   try {
     entries = await readSearchEntries(await s3For({ signal }));
@@ -277,7 +338,6 @@ export async function labelAgentScopes({ config, opts, s3For, started, domains, 
       left: new Map([...[...asked.left].filter(([path]) => mine(path)), ...s.left, ...out.left]),
     })[0]);
   }
-  const report = labelReport(results, { reasons: false });
-  if (report !== '') lines.push(...report.trimEnd().split('\n'));
+  lines.push(...reportLines(results));
   return { failed, lines };
 }

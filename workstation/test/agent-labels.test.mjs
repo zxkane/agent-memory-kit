@@ -3,6 +3,7 @@ import test from 'node:test';
 import { createHash } from 'node:crypto';
 import { labelAgentScopes } from '../lib/agent-labels.mjs';
 import { SNAPSHOT_KEY, STATE_KEY, listAgentScopes, scopeDigest } from '../lib/agent-scopes.mjs';
+import { AwsError } from '../lib/aws.mjs';
 import { parseDomains } from '../lib/domains.mjs';
 import { createS3 } from '../lib/s3.mjs';
 import { createFakeS3 } from './fake-s3.mjs';
@@ -58,6 +59,18 @@ function bucket(scopes = SCOPES) {
     setState: (scopesState) => put(STATE_KEY, JSON.stringify({ version: 1, scopes: scopesState })),
     writes: () => fake.requests.filter((r) => r.method === 'PUT' || r.method === 'DELETE'),
     digest: async (agent) => scopeDigest((await listAgentScopes(client)).get(agent)),
+    // The label of a note in its search entry, as the pass writes it.
+    labelEntry(path, label) {
+      const next = doc();
+      next.notes = next.notes.map((n) => (n.path === path ? { ...n, domain: label } : n));
+      put(SNAPSHOT_KEY, JSON.stringify(next));
+    },
+    // What an older kit's Organize does to the search entries: it rewrites them without labels.
+    stripLabels() {
+      const next = doc();
+      next.notes = next.notes.map(({ domain: _label, ...n }) => n);
+      put(SNAPSHOT_KEY, JSON.stringify(next));
+    },
     // An agent's write through the API, in the API's order: the search entry, then the note.
     agentWrites(agent, name, description, content) {
       const path = `agents/${agent}/${name}.md`;
@@ -102,14 +115,22 @@ function tokens() {
   return { token, made };
 }
 
-function pass(b, m, { opts = {}, domains = domainsOf(), token = tokens().token, signal, config = CONFIG } = {}) {
+function pass(b, m, { opts = {}, domains = domainsOf(), token = tokens().token, signal, config = CONFIG, s3For = b.s3 } = {}) {
   return labelAgentScopes({
-    config, opts: { agentNames: [], all: false, dryRun: false, ...opts }, s3For: b.s3, started: STARTED,
+    config, opts: { agentNames: [], all: false, dryRun: false, ...opts }, s3For, started: STARTED,
     domains, persona: 'The owner is an example tester.', token, labelBatch: m.labelBatch, signal,
   });
 }
 
 const reads = (b, from) => b.fake.requests.slice(from).filter((r) => r.method === 'GET' && r.key.startsWith('agents/')).map((r) => r.key);
+
+// Makes the `nth` request `method key` (from 1) fail on every attempt of the client, with HTTP 503.
+function failOn(b, method, key, nth = 1) {
+  let seen = 0;
+  b.fake.onRequest((r) => {
+    if (r.method === method && r.key === key && ++seen === nth) b.fake.failNext(3, 503);
+  });
+}
 
 test('the first run records labeled notes by ETag', async () => {
   const b = bucket();
@@ -348,14 +369,15 @@ test('a dry run writes nothing', async () => {
 });
 
 // Notes the memory API could have written (at most 50,000 bytes of text each) that bring the
-// search entries of codex-alpha to `240000 - room` bytes. Each is labeled already, so a first run
-// only confirms it.
+// search entries of codex-alpha to `240000 - room` bytes. Each is labeled already, with the label
+// in its entry, so a first run only confirms it.
 function fill(b, room) {
   const BASE = 47_500;
   const filler = (i, size) => [`filler-${i}`, `Filler ${i}`, 'f'.repeat(size)];
   const write = ([name, description, content]) => {
     b.agentWrites('codex-alpha', name, description, content);
     b.put(`agents/codex-alpha/${name}.md`, labeled(name, description, content, 'general'));
+    b.labelEntry(`agents/codex-alpha/${name}.md`, 'general');
   };
   for (let i = 1; i <= 5; i++) write(filler(i, BASE));
   const entries = () => JSON.parse(b.text(SNAPSHOT_KEY)).notes.filter((n) => n.path.startsWith('agents/codex-alpha/'));
@@ -365,33 +387,54 @@ function fill(b, room) {
   assert.equal(Buffer.byteLength(JSON.stringify(entries())), 240_000 - room);
 }
 
-test("a label that would take a scope past the memory API's limits is not written", async () => {
-  // A `domain` field of `work` adds 16 bytes to the entry: with 15 bytes of room it does not fit.
+const scopeBytes = (b) => Buffer.byteLength(JSON.stringify(JSON.parse(b.text(SNAPSHOT_KEY)).notes.filter((n) => n.path.startsWith('agents/codex-alpha/'))));
+
+test("a note that no label lets fit into the memory API's limits is not sent to the model", async () => {
+  // The longest label, `personal`, adds 20 bytes to an entry: with 19 bytes of room it would not fit.
   const b = bucket();
-  fill(b, 15);
-  const out = await pass(b, model({ 'agents/codex-alpha/deploys.md': 'work' }));
+  b.labelEntry('agents/codex-alpha/deploy-steps.md', 'work');
+  fill(b, 19);
+  const m = model({ 'agents/codex-alpha/deploys.md': 'work' });
+  const out = await pass(b, m);
+  assert.deepEqual(m.paths(), [['agents/example-agent/family.md']]);
   assert.equal(b.text('agents/codex-alpha/deploys.md'), apiNote('deploys', ...DEPLOYS));
   assert.equal(b.entry('agents/codex-alpha/deploys.md').domain, undefined);
-  assert.ok(out.lines.includes('label agents/codex-alpha: no-change, 0 label(s) written, 0 unchanged, 1 not written'), out.lines.join('\n'));
+  assert.ok(out.lines.includes('label agents/codex-alpha: nothing written'), out.lines.join('\n'));
   assert.ok(out.lines.includes("- agents/codex-alpha/deploys.md: not written; the scope's search entries would take more than the 240000 bytes the memory API allows"), out.lines.join('\n'));
-  // The note stays touched: it has no record entry and goes to the model again.
+  // It stays touched: it has no record entry, and every run checks it again without sending it.
   assert.equal(Object.hasOwn(b.scope('codex-alpha').labels, 'deploys.md'), false);
-  const again = model({ 'agents/codex-alpha/deploys.md': 'work' });
+  const again = model();
   await pass(b, again);
-  assert.deepEqual(again.paths(), [['agents/codex-alpha/deploys.md']]);
-  // With 16 bytes of room it fits exactly.
+  assert.deepEqual(again.calls, []);
+  // With 20 bytes of room every label fits: it is sent, and `personal` takes the scope to the limit exactly.
   const c = bucket();
-  fill(c, 16);
-  await pass(c, model({ 'agents/codex-alpha/deploys.md': 'work' }));
-  assert.equal(c.text('agents/codex-alpha/deploys.md'), labeled('deploys', ...DEPLOYS, 'work'));
-  assert.equal(Buffer.byteLength(JSON.stringify(JSON.parse(c.text(SNAPSHOT_KEY)).notes.filter((n) => n.path.startsWith('agents/codex-alpha/')))), 240_000);
+  c.labelEntry('agents/codex-alpha/deploy-steps.md', 'work');
+  fill(c, 20);
+  const n = model({ 'agents/codex-alpha/deploys.md': 'personal' });
+  await pass(c, n);
+  assert.deepEqual(n.paths(), [['agents/codex-alpha/deploys.md'], ['agents/example-agent/family.md']]);
+  assert.equal(c.text('agents/codex-alpha/deploys.md'), labeled('deploys', ...DEPLOYS, 'personal'));
+  assert.equal(scopeBytes(c), 240_000);
 
-  // A note whose text after the frontmatter is over the API's 50,000 bytes is not written either.
+  // A note whose text after the frontmatter is over the API's 50,000 bytes is never sent either.
   const d = bucket({ 'example-agent': { huge: ['A long note', 'h'.repeat(50_001), null] } });
-  const res = await pass(d, model());
+  const dm = model();
+  const res = await pass(d, dm);
+  assert.deepEqual(dm.calls, []);
   assert.equal(d.text('agents/example-agent/huge.md'), apiNote('huge', 'A long note', 'h'.repeat(50_001)));
   assert.ok(res.lines.includes('- agents/example-agent/huge.md: not written; its text after the frontmatter is over the 50000 bytes the memory API allows'), res.lines.join('\n'));
   assert.deepEqual(d.scope('example-agent').labels, {});
+});
+
+test('a label written at the limit of the scope is checked again before it is written', async () => {
+  // Two touched notes, each alone within the limit: the first label written takes the room of the second.
+  const b = bucket({ 'codex-alpha': { deploys: [...DEPLOYS, null], 'deploy-steps': [...STEPS, null] } });
+  fill(b, 35);
+  await pass(b, model({ 'agents/codex-alpha/deploy-steps.md': 'personal', 'agents/codex-alpha/deploys.md': 'personal' }));
+  assert.equal(b.text('agents/codex-alpha/deploy-steps.md'), labeled('deploy-steps', ...STEPS, 'personal'));
+  assert.equal(b.text('agents/codex-alpha/deploys.md'), apiNote('deploys', ...DEPLOYS));
+  assert.ok(scopeBytes(b) <= 240_000);
+  assert.deepEqual(Object.keys(b.scope('codex-alpha').labels).filter((file) => !file.startsWith('filler-')), ['deploy-steps.md']);
 });
 
 test("a note whose frontmatter the pass cannot edit is left for Organize's repair", async () => {
@@ -449,4 +492,196 @@ test('the pass covers the named scopes only, and says when the bucket cannot be 
   const down = await pass(b, m);
   assert.equal(down.failed, true);
   assert.deepEqual(down.lines, ['label: the agent scopes could not be read (list failed: 503 ServiceUnavailable); no label was written.']);
+});
+
+// ---- Failure paths ----
+
+test('a note write that fails leaves the scope\'s other labels for the next run and fails the pass', async () => {
+  const b = bucket({ 'codex-alpha': { deploys: [...DEPLOYS, null], steps: [...STEPS, null] }, 'example-agent': { family: [...FAMILY, null] } });
+  failOn(b, 'PUT', 'agents/codex-alpha/deploys.md');
+  const out = await pass(b, model());
+  assert.equal(out.failed, true);
+  // After the failed write no other note of the scope is written.
+  assert.deepEqual(b.writes().filter((r) => r.key.startsWith('agents/codex-alpha/')).map((r) => r.key), Array(3).fill('agents/codex-alpha/deploys.md'));
+  assert.equal(b.text('agents/codex-alpha/steps.md'), apiNote('steps', ...STEPS));
+  for (const line of [
+    'label agents/codex-alpha: no-change, 0 label(s) written, 0 unchanged, 2 not written',
+    '  - a write to the bucket failed (put failed: 503 ServiceUnavailable); the scope\'s other labels are left for the next run',
+    '- agents/codex-alpha/deploys.md: not written; a write to the bucket failed',
+    '- agents/codex-alpha/steps.md: not written; a write to the bucket failed',
+  ]) assert.ok(out.lines.includes(line), out.lines.join('\n'));
+  // Neither is recorded: the next run sends both again. The next scope is written.
+  assert.deepEqual(b.scope('codex-alpha').labels, {});
+  assert.equal(b.text('agents/example-agent/family.md'), labeled('family', ...FAMILY, 'general'));
+  const next = model();
+  await pass(b, next);
+  assert.deepEqual(next.paths(), [['agents/codex-alpha/deploys.md', 'agents/codex-alpha/steps.md']]);
+});
+
+test('a failed update of the search entries leaves the scope due for Organize and fails the pass', async () => {
+  const b = bucket();
+  const organized = await b.digest('codex-alpha');
+  b.setState({ 'codex-alpha': { organizedDigest: organized } });
+  failOn(b, 'PUT', SNAPSHOT_KEY);
+  const out = await pass(b, model({ 'agents/codex-alpha/deploys.md': 'work' }));
+  assert.equal(out.failed, true);
+  assert.ok(out.lines.includes('  - the search entries of the scope could not be updated (put failed: 503 ServiceUnavailable);'
+    + ' it stays due for Organize, which rewrites them'), out.lines.join('\n'));
+  // The label is written and recorded, its entry is not updated, and Organize's record does not move.
+  assert.equal(b.text('agents/codex-alpha/deploys.md'), labeled('deploys', ...DEPLOYS, 'work'));
+  assert.equal(b.entry('agents/codex-alpha/deploys.md').domain, undefined);
+  assert.deepEqual(b.scope('codex-alpha').labels, {
+    'deploy-steps.md': b.etag('agents/codex-alpha/deploy-steps.md'), 'deploys.md': b.etag('agents/codex-alpha/deploys.md'),
+  });
+  assert.equal(b.scope('codex-alpha').organizedDigest, organized);
+  assert.notEqual(await b.digest('codex-alpha'), organized, 'Organize finds the scope due');
+  // The next scope is written and recorded.
+  assert.equal(b.entry('agents/example-agent/family.md').domain, 'general');
+});
+
+test('a record that cannot be written fails the pass; the labels stay', async () => {
+  const b = bucket();
+  failOn(b, 'PUT', STATE_KEY);
+  const out = await pass(b, model({ 'agents/codex-alpha/deploys.md': 'work' }));
+  assert.equal(out.failed, true);
+  assert.ok(out.lines.includes('  - the run could not be recorded in index/organizer.json: put failed: 503 ServiceUnavailable'), out.lines.join('\n'));
+  assert.equal(b.text('agents/codex-alpha/deploys.md'), labeled('deploys', ...DEPLOYS, 'work'));
+  assert.equal(b.scope('codex-alpha'), undefined);
+  assert.deepEqual(Object.keys(b.scope('example-agent').labels), ['family.md']);
+  // The scope's next run is a first run: it records the labels it finds and sends nothing.
+  const next = model();
+  const again = await pass(b, next);
+  assert.equal(again.failed, false, again.lines.join('\n'));
+  assert.deepEqual(next.calls, []);
+  assert.deepEqual(Object.keys(b.scope('codex-alpha').labels), ['deploy-steps.md', 'deploys.md']);
+});
+
+test('a note larger than the memory API can have written is not read', async () => {
+  const b = bucket({ 'example-agent': { family: [...FAMILY, null] } });
+  b.put('agents/example-agent/huge.md', apiNote('huge', 'Huge', 'h'.repeat(1_000_000)));
+  const m = model();
+  const out = await pass(b, m);
+  assert.deepEqual(reads(b, 0), ['agents/example-agent/family.md']);
+  assert.deepEqual(m.paths(), [['agents/example-agent/family.md']]);
+  assert.ok(out.lines.includes('- agents/example-agent/huge.md: not read; larger than 1000000 bytes'), out.lines.join('\n'));
+  assert.deepEqual(Object.keys(b.scope('example-agent').labels), ['family.md']);
+  // A note that grows past the limit between the listing and its read is not taken either.
+  const c = bucket({ 'example-agent': { family: [...FAMILY, null] } });
+  c.fake.onRequest(({ method, key }) => {
+    if (method === 'GET' && key === 'agents/example-agent/family.md') c.put(key, apiNote('family', FAMILY[0], 'f'.repeat(1_000_000)));
+  });
+  const n = model();
+  const res = await pass(c, n);
+  assert.deepEqual(n.calls, []);
+  assert.ok(res.lines.includes('- agents/example-agent/family.md: not read; larger than 1000000 bytes'), res.lines.join('\n'));
+  assert.deepEqual(c.scope('example-agent').labels, {});
+});
+
+test('the search entries of the notes read get their note\'s label in the same update', async () => {
+  // A first run: the labeled note it finds gets its label in its entry, with the written note's.
+  const b = bucket();
+  let from = b.fake.requests.length;
+  await pass(b, model({ 'agents/codex-alpha/deploys.md': 'work' }));
+  assert.equal(b.entry('agents/codex-alpha/deploy-steps.md').domain, 'work');
+  assert.equal(b.entry('agents/codex-alpha/deploys.md').domain, 'work');
+  const snapshotPuts = (since) => b.fake.requests.slice(since).filter((r) => r.method === 'PUT' && r.key === SNAPSHOT_KEY).length;
+  assert.equal(snapshotPuts(from), 2, 'one update per scope');
+  // An older kit's Organize rewrites the entries without labels. The next run reads the recorded
+  // notes again, sends none of them, and gives their entries the labels back.
+  b.stripLabels();
+  const m = model();
+  from = b.fake.requests.length;
+  const out = await pass(b, m);
+  assert.equal(out.failed, false, out.lines.join('\n'));
+  assert.deepEqual(m.calls, []);
+  assert.deepEqual(reads(b, from), ['agents/codex-alpha/deploy-steps.md', 'agents/codex-alpha/deploys.md', 'agents/example-agent/family.md']);
+  assert.deepEqual(['codex-alpha/deploy-steps', 'codex-alpha/deploys', 'example-agent/family'].map((n) => b.entry(`agents/${n}.md`).domain), ['work', 'work', 'general']);
+  assert.equal(snapshotPuts(from), 2);
+  // Then nothing is read again.
+  from = b.fake.requests.length;
+  await pass(b, m);
+  assert.deepEqual(reads(b, from), []);
+  assert.equal(snapshotPuts(from), 0);
+  // A note whose label holds under --all, or under its exception, gets it in its entry too.
+  b.stripLabels();
+  const exceptions = { 'agents/example-agent/family.md': 'general' };
+  await pass(b, model({ 'agents/codex-alpha/deploys.md': 'work', 'agents/codex-alpha/deploy-steps.md': 'work' }), { opts: { all: true }, domains: domainsOf({ exceptions }) });
+  assert.deepEqual(['codex-alpha/deploy-steps', 'codex-alpha/deploys', 'example-agent/family'].map((n) => b.entry(`agents/${n}.md`).domain), ['work', 'work', 'general']);
+  // A dry run writes no entry.
+  b.stripLabels();
+  const before = b.text(SNAPSHOT_KEY);
+  await pass(b, model(), { opts: { dryRun: true } });
+  assert.equal(b.text(SNAPSHOT_KEY), before);
+});
+
+test('an entry that would take its scope past the limit keeps what it has', async () => {
+  // `domain: work` adds 16 bytes to the entry of the labeled note: with 15 bytes of room it stays without.
+  const b = bucket({ 'codex-alpha': { 'deploy-steps': [...STEPS, 'work'] } });
+  fill(b, 15);
+  const out = await pass(b, model());
+  assert.equal(out.failed, false, out.lines.join('\n'));
+  assert.equal(b.entry('agents/codex-alpha/deploy-steps.md').domain, undefined);
+  assert.equal(scopeBytes(b), 240_000 - 15);
+  // With 16 bytes it gets the label, to the limit exactly.
+  const c = bucket({ 'codex-alpha': { 'deploy-steps': [...STEPS, 'work'] } });
+  fill(c, 16);
+  await pass(c, model());
+  assert.equal(c.entry('agents/codex-alpha/deploy-steps.md').domain, 'work');
+  assert.equal(scopeBytes(c), 240_000);
+});
+
+test('a run over every agent scope names the exceptions of scopes it did not find', async () => {
+  const exceptions = { 'agents/nobody/x.md': 'work', 'agents/codex-alpha/gone.md': 'general', 'projects/example-project/y.md': 'work' };
+  const b = bucket();
+  const out = await pass(b, model(), { domains: domainsOf({ exceptions }) });
+  const text = out.lines.join('\n');
+  assert.match(text, /^Exceptions that name no note:\n- agents\/codex-alpha\/gone\.md$/m);
+  assert.match(text, /\n\n## agents\/nobody\n\nExceptions that name no note:\n- agents\/nobody\/x\.md$/);
+  assert.doesNotMatch(text, /example-project/);
+  // A run that names its scopes names only theirs.
+  const named = await pass(b, model(), { domains: domainsOf({ exceptions }), opts: { agentNames: ['codex-alpha'] } });
+  assert.doesNotMatch(named.lines.join('\n'), /nobody/);
+  // A bucket without agent scopes says so, and still names them.
+  const empty = createFakeS3();
+  const client = createS3({ bucket: 'example-bucket', region: 'ap-northeast-1', credentials, fetchImpl: empty.fetch, sleep: async () => {} });
+  const none = await pass({ s3: async () => client }, model(), { domains: domainsOf({ exceptions }) });
+  assert.deepEqual(none, { failed: false, lines: ['label: nothing to do', '## agents/codex-alpha', '', 'Exceptions that name no note:', '- agents/codex-alpha/gone.md', '', '## agents/nobody', '', 'Exceptions that name no note:', '- agents/nobody/x.md'] });
+});
+
+test('a search snapshot that cannot be read, before or after the model calls, writes no label', async () => {
+  const b = bucket();
+  failOn(b, 'GET', SNAPSHOT_KEY, 1);
+  const m = model();
+  const first = await pass(b, m);
+  assert.deepEqual(first, { failed: true, lines: ['label: the agent scopes could not be read (get failed: 503 ServiceUnavailable); no label was written.'] });
+  assert.deepEqual(m.calls, []);
+  // Read again right before the writes, for their limits.
+  const c = bucket();
+  failOn(c, 'GET', SNAPSHOT_KEY, 2);
+  const n = model();
+  const second = await pass(c, n);
+  assert.equal(second.failed, true);
+  assert.equal(n.calls.length, 2);
+  assert.equal(second.lines.at(-1), 'label: the search entries of the agent scopes could not be read (get failed: 503 ServiceUnavailable); no label was written.');
+  assert.deepEqual(c.writes(), []);
+});
+
+test('when no S3 client can be made for the writes, the line says what was not done', async () => {
+  // Labeled notes whose entries lack their labels: there are entries to update, and no note to write.
+  const b = bucket({ 'codex-alpha': { 'deploy-steps': [...STEPS, 'work'] } });
+  let made = 0;
+  const s3For = async () => {
+    made += 1;
+    if (made > 2) throw new AwsError('sts', 0, 'Network');
+    return b.client;
+  };
+  const out = await pass(b, model(), { s3For });
+  assert.equal(out.failed, true);
+  assert.ok(out.lines.includes('  - the search entries of the scope could not be updated and the run could not be recorded in index/organizer.json: sts failed: 0 Network'), out.lines.join('\n'));
+  assert.deepEqual(b.writes(), []);
+  // With no entry to update, only the record is named.
+  b.labelEntry('agents/codex-alpha/deploy-steps.md', 'work');
+  made = 0;
+  const again = await pass(b, model(), { s3For });
+  assert.ok(again.lines.includes('  - the run could not be recorded in index/organizer.json: sts failed: 0 Network'), again.lines.join('\n'));
 });
