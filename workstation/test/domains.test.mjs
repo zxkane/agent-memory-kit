@@ -259,6 +259,43 @@ test('tagLine drops the gap at the start of a hook it tags, so tagging again giv
   }
 });
 
+test('tagLine takes any gap after the dash, and a line it changes gets " — "', () => {
+  // No gap, a no-break space, a tab.
+  for (const line of ['- [A](a.md) —[work] about', '- [A](a.md) —\u00a0[work] about', '- [A](a.md) —\t[work] about']) {
+    assert.equal(tagLine(line, 'general'), '- [A](a.md) — about', line);
+    assert.equal(tagLine(line, null), '- [A](a.md) — about', line);
+    assert.equal(tagLine(line, 'work'), '- [A](a.md) — [work] about', line);
+    assert.equal(tagLine(line, 'personal'), '- [A](a.md) — [personal] about', line);
+  }
+  // Without a run, a general or unlabeled line stays byte for byte as it is.
+  for (const line of ['- [A](a.md) —about', '- [A](a.md) —\u00a0about', '- [A](a.md) —\tabout', '- [A](a.md) —\u200b\u00a0about']) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, null), line, line);
+    assert.equal(tagLine(line, 'personal'), '- [A](a.md) — [personal] about', line);
+  }
+  // A line without the em dash after the link, or with a link into another folder, is not an index line.
+  for (const line of [
+    '- [A](a.md) [work] about', '- [A](a.md) -[work] about', '- [A](a.md) \u2013[work] about',
+    '- [A](../x/a.md) —[work] about', '- [A](../x/a.md) —\t[work] about',
+  ]) {
+    assert.equal(tagLine(line, 'general'), line, line);
+    assert.equal(tagLine(line, 'personal'), line, line);
+  }
+});
+
+test('tagIndexLines reads the note of a line with any gap after the dash', t => {
+  const dir = tmp(t);
+  writeFileSync(join(dir, 'g.md'), NOTE.replace('  originSessionId: x', '  domain: general'));
+  writeFileSync(join(dir, 'w.md'), NOTE.replace('  originSessionId: x', '  domain: work'));
+  writeFileSync(join(dir, 'p.md'), NOTE.replace('  originSessionId: x', '  domain: personal'));
+  for (const gap of ['', '\u00a0', '\t']) {
+    const lines = [`- [G](g.md) —${gap}[work] g`, `- [W](w.md) —${gap}[personal] w`, `- [P](p.md) —${gap}[work] p`, `- [G](g.md) —${gap}g`];
+    assert.deepEqual(tagIndexLines(lines, dir), [
+      '- [G](g.md) — g', '- [W](w.md) — [work] w', '- [P](p.md) — [personal] p', `- [G](g.md) —${gap}g`,
+    ], JSON.stringify(gap));
+  }
+});
+
 test('tagIndexLines reads each linked note of the folder', t => {
   const dir = tmp(t);
   writeFileSync(join(dir, 'a.md'), NOTE.replace('  originSessionId: x', '  domain: work'));

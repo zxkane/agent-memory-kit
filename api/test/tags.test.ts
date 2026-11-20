@@ -76,3 +76,29 @@ test('tagIndexText drops the gap at the start of a hook it tags, so tagging agai
     assert.equal(tagIndexText(line, new Map()), line, JSON.stringify(gap));
   }
 });
+
+test('tagIndexText takes any gap after the dash, and a line it changes gets " — "', () => {
+  // No gap, a no-break space, a tab.
+  for (const line of ['- [A](a.md) —[work] about', '- [A](a.md) —\u00a0[work] about', '- [A](a.md) —\t[work] about']) {
+    assert.equal(tag(line, 'general'), '- [A](a.md) — about', line);
+    assert.equal(tagIndexText(line, new Map()), '- [A](a.md) — about', line);
+    assert.equal(tag(line, 'work'), '- [A](a.md) — [work] about', line);
+    assert.equal(tag(line, 'personal'), '- [A](a.md) — [personal] about', line);
+  }
+  // Without a run, a general or unlabeled line stays byte for byte as it is.
+  for (const line of ['- [A](a.md) —about', '- [A](a.md) —\u00a0about', '- [A](a.md) —\tabout', '- [A](a.md) —\u200b\u00a0about']) {
+    assert.equal(tag(line, 'general'), line, line);
+    assert.equal(tagIndexText(line, new Map()), line, line);
+    assert.equal(tag(line, 'personal'), '- [A](a.md) — [personal] about', line);
+  }
+  // A line without the em dash after the link, or with a link into another folder, is not an index line.
+  for (const line of [
+    '- [A](a.md) [work] about', '- [A](a.md) -[work] about', '- [A](a.md) \u2013[work] about',
+    '- [A](../x/a.md) —[work] about', '- [A](../x/a.md) —\t[work] about',
+  ]) {
+    assert.equal(tag(line, 'general'), line, line);
+    assert.equal(tag(line, 'personal'), line, line);
+  }
+  const index = '# T\r\n- [A](a.md) —\t[personal] x\r\n- [B](b.md) —y\r\n';
+  assert.equal(tagIndexText(index, new Map([['a.md', 'work']])), '# T\r\n- [A](a.md) — [work] x\r\n- [B](b.md) —y\r\n');
+});
