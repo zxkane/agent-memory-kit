@@ -9,5 +9,9 @@
   },
   "scripts": {
     "test": "node --test workstation/test/*.test.mjs && bash test/setup.test.sh"
+  },
+  "dependencies": {
+    "@aws-sdk/credential-providers": "3.1173.0",
+    "@aws/bedrock-token-generator": "1.1.0"
   }
 }
