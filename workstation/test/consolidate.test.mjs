@@ -285,6 +285,43 @@ test('organize moves a note to global/: both folders and both indexes change', (
   assert.match(text, /^- Notes \(global\/\): \d+ bytes → \d+ bytes; retired: 0 bytes$/m);
 });
 
+test('organize takes global/ after the project scopes: a note a project adds there is organized in the same run', (t) => {
+  const f = fixture(t, { consolidate: { maxProjects: 2 } });
+  f.seed({
+    'global/MEMORY.md': index('g.md'),
+    'global/g.md': note('g', 'General', 'Something general.'),
+    'projects/p/MEMORY.md': index('a.md', 'k.md'),
+    'projects/p/a.md': note('a', 'Prefers short answers', 'The person prefers short answers.'),
+    'projects/p/k.md': note('k', 'Kept', 'Stays here.'),
+    'projects/q/MEMORY.md': index('b.md'),
+    'projects/q/b.md': note('b', 'B', 'Another project.'),
+  });
+  f.instruct({
+    p: {
+      writes: {
+        'global/short-answers.md': note('short-answers', 'Prefers short answers', 'The person prefers short answers.'),
+        'global/MEMORY.md': index('g.md', 'short-answers.md'),
+        'notes/a.md': 'MOVED TO [[global:short-answers]]\n',
+        'notes/MEMORY.md': index('k.md'),
+      },
+    },
+  });
+  // None was organized: global/ comes first by name, and maxProjects takes it and p.
+  let r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'global']);
+  assert.match(r.stdout, /^organize p: applied, 4 change\(s\)[\s\S]*^organize global: no-change/m);
+  // global/ was organized with the note p added, so the next run takes only q.
+  assert.equal(f.readState().projects.global.organizedDigest, folderDigest(join(f.repo, 'global')));
+  r = f.run('organize');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope), ['p', 'global', 'q']);
+  // Named with --project, global/ runs last too.
+  r = f.run('organize', '--project', 'global', '--project', 'q');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(f.calls().map((c) => c.scope).slice(3), ['q', 'global']);
+});
+
 test('organize of global works on global/ alone', (t) => {
   const f = fixture(t);
   f.seed({

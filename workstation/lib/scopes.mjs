@@ -163,3 +163,16 @@ export function organizeScopes(scan, state, opts, now) {
   });
   return due.map((i) => ({ scope: i.name }));
 }
+
+// The order in which an Organize run takes the scopes of `list` (organizeScopes), of which it
+// takes the first `limit`: global/ after the project scopes it takes. A project's Organize may add
+// notes to global/, and global/ organized first would be due again at the next run. Only when
+// global/ runs changes, not whether: the run takes the same scopes.
+export function globalLast(list, limit) {
+  const taken = Math.min(limit, list.length);
+  const at = list.findIndex((item) => item.scope === GLOBAL);
+  if (at < 0 || at >= taken) return list;
+  const out = list.filter((_, i) => i !== at);
+  out.splice(taken - 1, 0, list[at]);
+  return out;
+}
