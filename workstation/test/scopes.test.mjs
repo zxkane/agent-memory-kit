@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { REVISIT_MS, neverOrganized, organizeDue, organizeScopes } from '../lib/scopes.mjs';
+import { REVISIT_MS, globalLast, neverOrganized, organizeDue, organizeScopes } from '../lib/scopes.mjs';
 
 const NOW = Date.parse('2026-11-20T12:00:00.000Z');
 const DAY_MS = 24 * 3600 * 1000;
@@ -50,6 +50,23 @@ test('organizeScopes takes exactly the scopes organizeDue names', () => {
   assert.deepEqual(new Set(due), new Set(infos.filter((i) => organizeDue(i, state.projects[i.name], NOW) !== null).map((i) => i.name)));
   // Named scopes are all taken, in the order given.
   assert.deepEqual(organizeScopes(scan, state, { projects: ['d', 'global'] }, NOW), [{ scope: 'd' }, { scope: 'global' }]);
+});
+
+test('globalLast moves global/ behind the project scopes a run takes, and the run takes the same scopes', () => {
+  const list = (...names) => names.map((scope) => ({ scope }));
+  const order = (items, limit) => globalLast(items, limit).map((i) => i.scope);
+  assert.deepEqual(order(list('global', 'a', 'b', 'c'), 2), ['a', 'global', 'b', 'c']);
+  assert.deepEqual(order(list('a', 'global', 'b', 'c'), 3), ['a', 'b', 'global', 'c']);
+  assert.deepEqual(order(list('global', 'a', 'b'), Infinity), ['a', 'b', 'global'], 'named scopes: global/ last of all');
+  assert.deepEqual(order(list('global', 'a'), 5), ['a', 'global']);
+  assert.deepEqual(order(list('a', 'b', 'global'), 2), ['a', 'b', 'global'], 'global/ not taken: the order stays');
+  assert.deepEqual(order(list('a', 'global'), 5), ['a', 'global']);
+  assert.deepEqual(order(list('global'), 5), ['global']);
+  assert.deepEqual(order(list('global', 'a'), 1), ['global', 'a'], 'a run of one scope takes global/ alone');
+  assert.deepEqual(order([], 5), []);
+  const items = list('global', 'a');
+  globalLast(items, 5);
+  assert.deepEqual(items, list('global', 'a'), 'the list given is not changed');
 });
 
 test('never organized comes from one field, the time of the last organize, for the due rule and the report alike', () => {

@@ -36,7 +36,7 @@ import {
 } from './lib/reports.mjs';
 import { RUN_LOG_SCHEMA_VERSION, appendRunLine } from './lib/run-log.mjs';
 import {
-  GLOBAL, INDEX_MAX_BYTES, INDEX_MAX_LINES, cloneProblem, isPlainName, listProjects, liveFolder, lstatOrNull, organizeScopes, projectsDir,
+  GLOBAL, INDEX_MAX_BYTES, INDEX_MAX_LINES, cloneProblem, globalLast, isPlainName, listProjects, liveFolder, lstatOrNull, organizeScopes, projectsDir,
   scopeFolder, scopeInfo, timeOf,
 } from './lib/scopes.mjs';
 import { runSync, writeStatus } from './lib/sync-engine.mjs';
@@ -1749,8 +1749,8 @@ async function driverMain(argv) {
   }
 
   const state = readState(config, started);
-  const list = opts.kind === 'extract' ? extractScopes(scan, state, opts, now) : organizeScopes(scan, state, opts, now);
   const limit = opts.projects.length > 0 ? Infinity : c.maxProjects;
+  const list = opts.kind === 'extract' ? extractScopes(scan, state, opts, now) : globalLast(organizeScopes(scan, state, opts, now), limit);
   // The run's cost ceiling: maxBudgetUsd for each scope the run may take, which is maxProjects,
   // or the number of projects named with --project.
   const ceiling = (opts.projects.length > 0 ? opts.projects.length : c.maxProjects) * c.maxBudgetUsd;
