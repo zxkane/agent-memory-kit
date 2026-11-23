@@ -245,7 +245,104 @@ test('buildDigest leaves out sessions that are neither interactive nor memory-wr
   assert.ok(!d.text.includes('hhhhhhhh'));
 });
 
-test('buildDigest stops before a session that would pass maxBytes', async (t) => {
+// A session of `n` typed turns of `size` characters, tagged `<tag>-<nn>`, the last at `lastAt`, a
+// minute apart.
+function turnsSession(dir, name, lastAt, n, size, tag) {
+  const end = Date.parse(lastAt);
+  const file = join(dir, name);
+  writeJsonl(file, Array.from({ length: n }, (_, i) => user(`${tag}-${String(i).padStart(2, '0')} ${'w'.repeat(size)}`,
+    { promptSource: 'typed', timestamp: new Date(end - (n - 1 - i) * 60000).toISOString() })));
+  return file;
+}
+const turnsOf = (text, tag) => [...text.matchAll(new RegExp(`${tag}-(\\d\\d)`, 'g'))].map((m) => Number(m[1]));
+const sessionIds = (text) => [...text.matchAll(/^=== Claude Code session (\w+),/gm)].map((m) => m[1]);
+
+test('a session that does not fit no longer leaves out the older sessions after it', async (t) => {
+  const dir = tempDir(t);
+  const files = claude(
+    turnsSession(dir, 'aaaaaaaa.jsonl', '2026-11-20T10:00:00Z', 1, 900, 'newest'),
+    turnsSession(dir, 'bbbbbbbb.jsonl', '2026-11-18T10:00:00Z', 30, 900, 'large'),
+    turnsSession(dir, 'cccccccc.jsonl', '2026-11-16T10:00:00Z', 3, 900, 'medium'),
+    turnsSession(dir, 'dddddddd.jsonl', '2026-11-15T10:00:00Z', 1, 10, 'oldest'),
+  );
+  const d = await buildDigest({ files, repoDir: REPO, maxBytes: 12000 });
+  assert.deepEqual([d.sessions, d.sessionsLeftOut, d.truncated], [4, 0, true]);
+  assert.ok(Buffer.byteLength(d.text, 'utf8') <= 12000);
+  assert.deepEqual(sessionIds(d.text), ['aaaaaaaa', 'bbbbbbbb', 'cccccccc', 'dddddddd']);
+  // The sessions that fit are whole; the large one keeps its newest turns, in their order.
+  assert.deepEqual(turnsOf(d.text, 'newest'), [0]);
+  assert.deepEqual(turnsOf(d.text, 'medium'), [0, 1, 2]);
+  assert.deepEqual(turnsOf(d.text, 'oldest'), [0]);
+  const large = turnsOf(d.text, 'large');
+  assert.ok(large.length >= 3 && large.length < 30, `${large.length} turns`);
+  assert.deepEqual(large, Array.from({ length: large.length }, (_, i) => 30 - large.length + i));
+});
+
+test('an oversized newest session leaves room for the older sessions', async (t) => {
+  const dir = tempDir(t);
+  const files = claude(
+    turnsSession(dir, 'aaaaaaaa.jsonl', '2026-11-20T10:00:00Z', 30, 900, 'large'),
+    turnsSession(dir, 'bbbbbbbb.jsonl', '2026-11-19T10:00:00Z', 2, 900, 'older'),
+  );
+  const d = await buildDigest({ files, repoDir: REPO, maxBytes: 8000 });
+  assert.deepEqual([d.sessions, d.sessionsLeftOut, d.truncated], [2, 0, true]);
+  assert.deepEqual(turnsOf(d.text, 'older'), [0, 1]);
+  assert.equal(turnsOf(d.text, 'large').at(-1), 29);
+  assert.deepEqual(sessionIds(d.text), ['aaaaaaaa', 'bbbbbbbb']);
+});
+
+test('the room a small session does not need goes to the larger ones, an equal share each', async (t) => {
+  const dir = tempDir(t);
+  const files = claude(
+    turnsSession(dir, 'aaaaaaaa.jsonl', '2026-11-20T10:00:00Z', 20, 900, 'first'),
+    turnsSession(dir, 'bbbbbbbb.jsonl', '2026-11-19T10:00:00Z', 20, 900, 'second'),
+    turnsSession(dir, 'cccccccc.jsonl', '2026-11-18T10:00:00Z', 1, 10, 'small'),
+  );
+  const d = await buildDigest({ files, repoDir: REPO, maxBytes: 10000 });
+  assert.equal(d.sessions, 3);
+  assert.deepEqual(turnsOf(d.text, 'small'), [0]);
+  const [a, b] = [turnsOf(d.text, 'first').length, turnsOf(d.text, 'second').length];
+  assert.ok(a >= 4 && Math.abs(a - b) <= 1, `${a} and ${b} turns`);
+  // Less than a turn of each large session is left unused.
+  const turn = Buffer.byteLength(d.text.match(/USER \(.*\):\nfirst-19 w+\n\n/)[0], 'utf8');
+  assert.ok(10000 - Buffer.byteLength(d.text, 'utf8') < 2 * turn);
+});
+
+test('a session for which its least is no longer left is skipped, and an older one that still fits gets its place', async (t) => {
+  const dir = tempDir(t);
+  const files = claude(
+    turnsSession(dir, 'aaaaaaaa.jsonl', '2026-11-20T10:00:00Z', 2, 900, 'newest'),
+    turnsSession(dir, 'bbbbbbbb.jsonl', '2026-11-19T10:00:00Z', 2, 900, 'middle'),
+    turnsSession(dir, 'cccccccc.jsonl', '2026-11-18T10:00:00Z', 1, 10, 'oldest'),
+  );
+  // The newest session's least (its header and 512 bytes of its newest turn), then room for the
+  // oldest one's short turn but not for the middle one's 512 bytes.
+  const one = await buildDigest({ files: [files[0]], repoDir: REPO, maxBytes: 100000 });
+  const header = Buffer.byteLength(one.text.split('\n', 1)[0], 'utf8') + 1;
+  const label = Buffer.byteLength(one.text.match(/^USER \(.*\):\n/m)[0], 'utf8');
+  const d = await buildDigest({ files, repoDir: REPO, maxBytes: header + label + 512 + 7 + 200 });
+  assert.deepEqual([d.sessions, d.sessionsLeftOut, d.truncated], [2, 1, true]);
+  assert.deepEqual(sessionIds(d.text), ['aaaaaaaa', 'cccccccc']);
+  assert.deepEqual(turnsOf(d.text, 'oldest'), [0]);
+});
+
+test('many sessions in a small room: each placed keeps 512 bytes of its newest turn, the oldest are left out', async (t) => {
+  const dir = tempDir(t);
+  const files = claude(...Array.from({ length: 30 }, (_, i) => turnsSession(dir, `${String(i).padStart(8, '0')}.jsonl`,
+    new Date(Date.parse('2026-11-20T10:00:00Z') - i * 3600000).toISOString(), 3, 900, `s${String(i).padStart(2, '0')}`)));
+  const d = await buildDigest({ files, repoDir: REPO, maxBytes: 10000 });
+  assert.ok(d.sessions >= 10 && d.sessions < 30, `${d.sessions} sessions`);
+  assert.equal(d.sessions + d.sessionsLeftOut, 30);
+  assert.ok(Buffer.byteLength(d.text, 'utf8') <= 10000);
+  // The newest sessions are those placed, each with at least 512 bytes of its newest turn.
+  assert.deepEqual(sessionIds(d.text), Array.from({ length: d.sessions }, (_, i) => String(i).padStart(8, '0')));
+  for (const block of d.text.split(/^=== /m).filter(Boolean)) {
+    const turn = block.match(/USER \(.*\):\n(s\d\d-02 w*)/);
+    assert.ok(turn && Buffer.byteLength(turn[1], 'utf8') >= 512, block.slice(0, 80));
+  }
+});
+
+test('when not even the newest turn of an older session fits after the newer ones, that session is left out', async (t) => {
   const dir = tempDir(t);
   const a = sessionFile(dir, 'aaaaaaaa.jsonl', '2026-11-09T00:00:00Z');
   const b = sessionFile(dir, 'bbbbbbbb.jsonl', '2026-11-08T00:00:00Z');

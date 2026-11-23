@@ -1,6 +1,7 @@
 // The reports of consolidation: `_reports/<date>-<host>-<kind>-<scope>.md` of an Extract or
-// Organize scope that was applied, and `_reports/<date>-<host>-label.md` of the label step, which
-// the run commits to the notes clone with its changes. Each has a JSON twin of the same name
+// Organize scope that was applied, and `_reports/<date>-<host>-label.md` of the label step (a later
+// run of the same day adds `-2`, `-3` and so on to the name), which the run commits to the notes
+// clone with its changes. Each has a JSON twin of the same name
 // (`.json`), rendered from the same figures, for programs: the Markdown is for people and its form
 // is the kit's own. parseReport reads the Markdown of a report back, for one that an older kit
 // wrote without its twin. No file, Git or network access of its own.

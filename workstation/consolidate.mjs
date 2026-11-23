@@ -10,8 +10,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
-  writeFileSync,
+  chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,20 +35,19 @@ import {
 } from './lib/reports.mjs';
 import { RUN_LOG_SCHEMA_VERSION, appendRunLine } from './lib/run-log.mjs';
 import {
-  GLOBAL, INDEX_MAX_BYTES, INDEX_MAX_LINES, cloneProblem, globalLast, isPlainName, listProjects, liveFolder, lstatOrNull, organizeScopes, projectsDir,
-  scopeFolder, scopeInfo, timeOf,
+  EXTRACT_MAX_WINDOW_MS, GLOBAL, INDEX_MAX_BYTES, INDEX_MAX_LINES, cloneProblem, extractCandidates, globalLast, isPlainName, listProjects,
+  liveFolder, lstatOrNull, organizeScopes, projectsDir, scopeFolder, scopeInfo, timeOf,
 } from './lib/scopes.mjs';
 import { runSync, writeStatus } from './lib/sync-engine.mjs';
-import { buildDigest, codexProjectSessions, filesChangedSince, projectSessionDirs, sessionFilesSince } from './lib/transcripts.mjs';
+import { buildDigest, codexProjectSessions, projectSessionDirs } from './lib/transcripts.mjs';
 import { apply, evaluate, readRegular, snapshot } from './lib/workdir.mjs';
 
 const RUN_SH = join(dirname(fileURLToPath(import.meta.url)), 'run.sh');
 const KINDS = ['extract', 'organize'];
 const DAY_MS = 24 * 3600 * 1000;
-const EXTRACT_LOOKBACK_MS = 7 * DAY_MS;
-// The session window of a project that was extracted before never reaches back further than this.
-const EXTRACT_MAX_WINDOW_MS = 28 * DAY_MS;
 const REPORT_KEEP_DAYS = 90;
+// A second run of the same day writes `<name>-2`, and so on; never more than this many a name.
+const MAX_REPORTS_A_NAME = 99;
 const KEEP_MARKER = '.keep';
 // The read-only reference copy of the scope's notes that a repair run gets, in the work folder.
 const ORIGINAL = 'original';
@@ -58,7 +56,7 @@ const REPAIR_MIN_USD = 0.1;
 // Exit code of `run.sh consolidate-step` when the wait for the sync lock timed out.
 const LOCK_TIMEOUT_CODE = 75;
 const NOT_CONFIGURED = 'agent-memory: consolidation is not configured.';
-const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run] | report [--since <YYYY-MM-DD> | --days <n>] [--format json|md]';
+const USAGE = 'usage: run.sh consolidate extract|organize [--project <name>]... | extract --project <name>... --since <YYYY-MM-DD|time> | organize --agents [--agent <name>]... [--dry-run] [--keep] [--model <id>] [--min-retention <0..1>] | label [--project <name>]... [--all] [--dry-run] [--keep] [--model <id>] | label --agents [--agent <name>]... [--all] [--dry-run] | report [--since <YYYY-MM-DD> | --days <n>] [--format json|md]';
 const HASH_RE = /^[0-9a-f]{64}$/;
 const STOP_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const RETENTION_RE = /^(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)$/;
@@ -251,6 +249,18 @@ function writeReport(config, name, text) {
   }
 }
 
+// The name, without its extension, of a run's report and its JSON twin: `base`, or `base-2`,
+// `base-3` and so on when an earlier run of the day wrote a report or a twin of that name, so that a
+// second run of the same day never replaces the first one's.
+function freeReportName(config, base) {
+  const dir = join(config.repoDir, '_reports');
+  for (let n = 1; n <= MAX_REPORTS_A_NAME; n++) {
+    const name = n === 1 ? base : `${base}-${n}`;
+    if (lstatOrNull(join(dir, `${name}.json`)) === null && lstatOrNull(join(dir, `${name}.md`)) === null) return name;
+  }
+  throw new Error(`_reports holds ${MAX_REPORTS_A_NAME} reports named ${base}`);
+}
+
 // Deletes reports, and their JSON twins, whose date is more than REPORT_KEEP_DAYS days before `now`.
 function pruneReports(config, now) {
   const dir = join(config.repoDir, '_reports');
@@ -365,9 +375,8 @@ function stepApply(config, rest) {
   const digest = folderDigest(pairs[0].liveDir);
   let reportError = null;
   try {
-    // The twin first: when it cannot be written, neither is the report, so that no twin of an
-    // earlier run of the day stays paired with a new report.
-    const name = `${date}-${config.host}-${kind}-${scope}`;
+    // The twin first: when it cannot be written, neither is the report.
+    const name = freeReportName(config, `${date}-${config.host}-${kind}-${scope}`);
     writeReport(config, `${name}.json`, jsonText(reportData(reportArgs)));
     writeReport(config, `${name}.md`, report());
     if (kind === 'organize') pruneReports(config, now);
@@ -505,8 +514,9 @@ function stepLabelApply(config, rest) {
     const endedAt = new Date().toISOString();
     const date = endedAt.slice(0, 10);
     const twin = labelReportData({ host: config.host, date, endedAt, data: plan.data, written, unchanged, skipped });
-    writeReport(config, `${date}-${config.host}-label.json`, jsonText(twin));
-    writeReport(config, `${date}-${config.host}-label.md`, labelReportText(plan.report, skipped));
+    const name = freeReportName(config, `${date}-${config.host}-label`);
+    writeReport(config, `${name}.json`, jsonText(twin));
+    writeReport(config, `${name}.md`, labelReportText(plan.report, skipped));
   } catch (err) {
     reportError = errorText(err);
   }
@@ -619,11 +629,25 @@ function labelSummary(outcome, { failed = false, asked = null, applied = null, h
   };
 }
 
+// The start that `extract --since` gives, in ms: a day (00:00 UTC) or a time with its offset, such as
+// 2026-11-15T17:00:00Z, not after now; null for anything else.
+const SINCE_RE = /^(\d{4}-\d\d-\d\d)(?:T\d\d:\d\d(?::\d\d(?:\.\d{1,3})?)?(?:Z|[+-]\d\d:\d\d))?$/;
+function parseSince(value) {
+  const m = typeof value === 'string' ? SINCE_RE.exec(value) : null;
+  if (!m) return null;
+  const t = Date.parse(value === m[1] ? `${value}T00:00:00Z` : value);
+  // A day that does not exist (2026-02-30) is not one Date.parse rolls over into the next month.
+  const day = Date.parse(`${m[1]}T00:00:00Z`);
+  if (!Number.isFinite(t) || !Number.isFinite(day) || new Date(day).toISOString().slice(0, 10) !== m[1]) return null;
+  return t <= Date.now() ? t : null;
+}
+
 function parseDriverArgs(argv) {
   const [kind, ...rest] = argv;
   if (!DRIVER_KINDS.includes(kind)) return null;
   const opts = {
     kind, projects: [], agents: false, agentNames: [], all: false, dryRun: false, keep: false, model: undefined, minRetention: undefined,
+    since: null,
   };
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
@@ -652,11 +676,17 @@ function parseDriverArgs(argv) {
       const v = parseRetention(rest[++i]);
       if (opts.minRetention !== undefined || v === null) return null;
       opts.minRetention = v;
+    } else if (arg === '--since') {
+      const v = parseSince(rest[++i]);
+      if (opts.since !== null || v === null) return null;
+      opts.since = v;
     } else {
       return null;
     }
   }
   if (kind === 'extract' && opts.projects.includes(GLOBAL)) return null;
+  // --since moves the start of the session window back, for named projects only.
+  if (opts.since !== null && (kind !== 'extract' || opts.projects.length === 0)) return null;
   // --all (a full relabel) belongs to label, --min-retention to Extract and Organize.
   if (opts.all && kind !== 'label') return null;
   if (kind === 'label' && opts.minRetention !== undefined) return null;
@@ -728,47 +758,13 @@ function writeState(config, state) {
   }
 }
 
-// Where a project's session window starts: at its last extract, but never more than
-// EXTRACT_MAX_WINDOW_MS back (a run that stopped early keeps lastExtract, and the window must not
-// grow without end); EXTRACT_LOOKBACK_MS back when it was never extracted.
-function windowStart(entry, now) {
-  const last = timeOf(entry?.lastExtract);
-  return last === null ? now - EXTRACT_LOOKBACK_MS : Math.max(last, now - EXTRACT_MAX_WINDOW_MS);
-}
-
-// Extract: projects with a session file of Claude Code or Codex changed since their window start.
-// The one whose model run was tried longest ago goes first (never tried first, which includes state
-// written before `lastExtractTried` existed), so every project gets its turn across runs even when
-// one is rejected every time; then the oldest session window, then the newest session.
+// Extract: the projects of the scan with a session file of Claude Code or Codex changed since their
+// window start, in the order extractCandidates (lib/scopes.mjs) gives, which the report shares.
 function extractScopes(scan, state, opts, now) {
-  const dirs = new Map(scan.sessions);
+  const sessions = new Map(scan.sessions);
   const codex = new Map(scan.codexSessions ?? []);
-  const names = opts.projects.length > 0 ? opts.projects : [...new Set([...dirs.keys(), ...codex.keys()])];
-  const list = [];
-  for (const scope of names) {
-    const tried = timeOf(state.projects[scope]?.lastExtractTried) ?? -Infinity;
-    const last = timeOf(state.projects[scope]?.lastExtract);
-    const since = windowStart(state.projects[scope], now);
-    const files = [
-      ...sessionFilesSince(dirs.get(scope) ?? [], since).map((file) => ({ tool: 'claude', file })),
-      ...filesChangedSince(codex.get(scope) ?? [], since).map((file) => ({ tool: 'codex', file })),
-    ];
-    if (opts.projects.length === 0 && files.length === 0) continue;
-    let newest = 0;
-    for (const { file } of files) {
-      try {
-        newest = Math.max(newest, statSync(file).mtimeMs);
-      } catch {
-        // Vanished: does not count.
-      }
-    }
-    list.push({ scope, files, since, newest, tried, last: last ?? -Infinity });
-  }
-  const older = (a, b) => (a === b ? 0 : a - b);
-  if (opts.projects.length === 0) {
-    list.sort((x, y) => older(x.tried, y.tried) || older(x.last, y.last) || y.newest - x.newest || byName(x.scope, y.scope));
-  }
-  return list;
+  const names = [...new Set([...sessions.keys(), ...codex.keys()])];
+  return extractCandidates({ names, sessions, codex, state, now, since: opts.since, named: opts.projects });
 }
 
 // Removes a folder tree, also one whose folders lost their permissions. Never throws.

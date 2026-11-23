@@ -254,8 +254,9 @@ export function loadConfig(env = process.env) {
     const claudeDir = raw.claudeDir ?? join(home, '.claude');
     // Codex keeps its sessions under $CODEX_HOME (default ~/.codex). A timer does not get the shell's
     // CODEX_HOME, so `codexDir` in the file fixes it for every run; a relative CODEX_HOME is ignored.
-    // Only Extract reads it: a `codexDir` that is not an absolute path is null (no Codex sessions are
-    // read, and Extract says so) instead of turning the whole configuration off.
+    // Only Extract and the report's Extract backlog read it: a `codexDir` that is not an absolute
+    // path is null (no Codex sessions are read, and Extract says so) instead of turning the whole
+    // configuration off.
     const codexHome = typeof env.CODEX_HOME === 'string' && isAbsolute(env.CODEX_HOME) ? env.CODEX_HOME : null;
     const codexDirRaw = raw.codexDir ?? codexHome ?? join(home, '.codex');
     const codexDir = typeof codexDirRaw === 'string' && isAbsolute(codexDirRaw) && !CONTROL_RE.test(codexDirRaw) ? codexDirRaw : null;

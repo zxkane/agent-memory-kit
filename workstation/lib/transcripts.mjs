@@ -326,11 +326,43 @@ function inWindow(session, since) {
   return { ...session, turns, firstAt: times[0] ?? null, lastAt: times.at(-1) ?? null };
 }
 
+const CUT_END = '[cut]\n\n';
+// What every session placed keeps at least of its newest turn, in bytes (all of it when it is
+// shorter): a session for which that much is not left is left out, so that many sessions do not
+// fill the digest with headers and fragments. The first session placed needs only one character,
+// as a lone session that is too large always did.
+const LEAST_TURN_BYTES = 512;
+
+// A session's text in at most `room` bytes, `room` being at least its leastBytes: its header and its
+// newest turns that fit whole, in their order; when not even its newest turn fits, that turn cut
+// further so that the header and one turn fit.
+function newestTurns(item, room) {
+  let size = item.headerBytes;
+  let first = item.blocks.length;
+  while (first > 0 && size + item.sizes[first - 1] <= room) size += item.sizes[--first];
+  if (first < item.blocks.length) return item.header + item.blocks.slice(first).join('');
+  const last = item.turns.at(-1);
+  return `${item.header}${last.label}${fitBytes(last.body, room - item.headerBytes - bytes(last.label) - bytes(CUT_END))}${CUT_END}`;
+}
+
+// The fewest bytes in which newestTurns gives a session that keeps at least `floor` bytes of its
+// newest turn, and never less than one character of it: the whole turn when that is shorter.
+function leastBytes(item, floor) {
+  const last = item.turns.at(-1);
+  const kept = fitBytes(last.body, floor) || ([...last.body][0] ?? '');
+  return item.headerBytes + Math.min(item.sizes.at(-1), bytes(last.label) + bytes(kept) + bytes(CUT_END));
+}
+
 // A bounded digest of the sessions of every tool together, newest session first. `files` lists
 // `{ tool, file }` entries, `tool` being `claude` or `codex`. With `since`, only turns after it are
-// used, and a session with none left is not used. When the newest session alone is too large,
-// its newest turns are kept (in their order); when not even its newest turn fits, that turn is
-// cut. `truncated` says that anything was cut or left out; `sessionsLeftOut` counts the
+// used, and a session with none left is not used. When everything fits, every session is whole.
+// Otherwise the sessions get their places newest first, each with its header and at least
+// LEAST_TURN_BYTES of its newest turn (the first one placed with at least one character); a session
+// for which that is not left is left out, and the next one is still tried. Then the rest of the
+// room is shared out among the sessions placed, an equal share each, the session that needs least
+// first, so that what a small session does not need goes to the larger ones. A session that does not
+// get all it needs keeps its newest turns (in their order); when not even its newest turn fits, that
+// turn is cut. `truncated` says that anything was cut or left out; `sessionsLeftOut` counts the
 // qualifying sessions of which nothing reached the digest.
 export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 2000, since = null }) {
   const sessions = [];
@@ -348,45 +380,35 @@ export async function buildDigest({ files, repoDir, maxBytes, perTurnChars = 200
     if (session.turns.length > 0) sessions.push({ entry, session });
   }
   sessions.sort((a, b) => (b.session.lastAt ?? '').localeCompare(a.session.lastAt ?? ''));
-  let text = '';
-  let used = 0;
-  let count = 0;
-  let truncated = false;
-  for (const { entry, session } of sessions) {
+  const items = sessions.map(({ entry, session }) => {
     const { header, turns } = sessionBlocks(entry, session, perTurnChars);
     const blocks = turns.map((t) => `${t.label}${t.body}\n\n`);
-    const whole = header + blocks.join('');
-    if (used + bytes(whole) <= maxBytes) {
-      text += whole;
-      used += bytes(whole);
-      count++;
-      continue;
-    }
-    truncated = true;
-    if (count === 0) {
-      // The newest session alone is too large. Keep its newest turns that fit whole. When not
-      // even the newest turn fits, cut that turn further so the header and one turn fit. Only
-      // when the header line alone does not fit is the digest empty (truncated, no sessions).
-      const kept = [];
-      let size = bytes(header);
-      for (let i = blocks.length - 1; i >= 0; i--) {
-        if (size + bytes(blocks[i]) > maxBytes) break;
-        kept.unshift(blocks[i]);
-        size += bytes(blocks[i]);
-      }
-      if (kept.length === 0) {
-        const last = turns.at(-1);
-        const room = maxBytes - bytes(header) - bytes(last.label) - bytes('[cut]\n\n');
-        if (room > 0) kept.push(`${last.label}${fitBytes(last.body, room)}[cut]\n\n`);
-      }
-      if (kept.length > 0) {
-        text = header + kept.join('');
-        count = 1;
-      }
-    }
-    break;
+    const sizes = blocks.map(bytes);
+    const headerBytes = bytes(header);
+    return { header, turns, blocks, sizes, headerBytes, wholeBytes: headerBytes + sizes.reduce((a, b) => a + b, 0) };
+  });
+  let room = maxBytes;
+  const placed = [];
+  for (const item of items) {
+    item.least = leastBytes(item, LEAST_TURN_BYTES);
+    if (item.least > room && placed.length === 0) item.least = leastBytes(item, 1);
+    if (item.least > room) continue;
+    room -= item.least;
+    placed.push(item);
   }
-  return { text, sessions: count, truncated, sessionsLeftOut: sessions.length - count };
+  const need = (item) => item.wholeBytes - item.least;
+  const growing = [...placed].sort((a, b) => need(a) - need(b));
+  for (let i = 0; i < growing.length; i++) {
+    const item = growing[i];
+    const share = Math.floor(room / (growing.length - i));
+    // At least `least` bytes, for which placing it made room; what the share leaves unused goes on.
+    item.whole = need(item) <= share;
+    item.text = item.whole ? item.header + item.blocks.join('') : newestTurns(item, item.least + share);
+    room -= bytes(item.text) - item.least;
+  }
+  const text = placed.map((item) => item.text).join('');
+  const truncated = placed.length < items.length || placed.some((item) => !item.whole);
+  return { text, sessions: placed.length, truncated, sessionsLeftOut: items.length - placed.length };
 }
 
 // Top-level *.jsonl files in the Claude Code folders that changed after sinceMs.

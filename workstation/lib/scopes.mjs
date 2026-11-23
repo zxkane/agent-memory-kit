@@ -7,6 +7,7 @@ import { lstatSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { digestOfFiles, digestsOf } from './label-notes.mjs';
 import { INDEX, indexStats } from './notes.mjs';
+import { filesChangedSince, sessionFilesSince } from './transcripts.mjs';
 import { noteFiles } from './workdir.mjs';
 
 export const GLOBAL = 'global';
@@ -101,6 +102,56 @@ export const timeOf = (iso) => {
   const t = typeof iso === 'string' ? Date.parse(iso) : NaN;
   return Number.isFinite(t) ? t : null;
 };
+
+// Extract's session window of a project that was never extracted starts this far back; no window
+// reaches back further than EXTRACT_MAX_WINDOW_MS.
+export const EXTRACT_LOOKBACK_MS = 7 * DAY_MS;
+export const EXTRACT_MAX_WINDOW_MS = 28 * DAY_MS;
+
+// Where Extract's session window of a project starts at `now` (ms): at its last Extract (`entry`
+// being its record in consolidate.json, or none), EXTRACT_LOOKBACK_MS back when it was never
+// extracted; at `since` (ms), when the run was given a start, if that is earlier (a start can move
+// the window back, never forward, which would skip what it has not read); but never more than
+// EXTRACT_MAX_WINDOW_MS back (a run that stopped early keeps lastExtract, and the window must not
+// grow without end).
+export function extractWindowStart(entry, now, since = null) {
+  const last = timeOf(entry?.lastExtract);
+  const usual = last === null ? now - EXTRACT_LOOKBACK_MS : last;
+  return Math.max(since === null ? usual : Math.min(since, usual), now - EXTRACT_MAX_WINDOW_MS);
+}
+
+// The projects Extract takes and their order, for a run and for the report alike: each project of
+// `names` with a conversation file that changed since the start of its window (`sessions` maps a
+// project to its Claude Code folders, `codex` to its Codex files), as `{ scope, files, since,
+// newest, tried, last }`. The one whose model run was tried longest ago goes first (never tried
+// first, which includes state written before `lastExtractTried` existed), so that every project gets
+// its turn across runs even when one is rejected every time; then the oldest session window, then
+// the newest session. With `named` (projects named on the command line), exactly those, in their
+// order, also without files.
+export function extractCandidates({ names, sessions, codex, state, now, since = null, named = [] }) {
+  const list = [];
+  for (const scope of named.length > 0 ? named : names) {
+    const entry = state.projects[scope];
+    const start = extractWindowStart(entry, now, since);
+    const files = [
+      ...sessionFilesSince(sessions.get(scope) ?? [], start).map((file) => ({ tool: 'claude', file })),
+      ...filesChangedSince(codex.get(scope) ?? [], start).map((file) => ({ tool: 'codex', file })),
+    ];
+    if (named.length === 0 && files.length === 0) continue;
+    let newest = 0;
+    for (const { file } of files) {
+      try {
+        newest = Math.max(newest, statSync(file).mtimeMs);
+      } catch {
+        // Vanished: does not count.
+      }
+    }
+    list.push({ scope, files, since: start, newest, tried: timeOf(entry?.lastExtractTried) ?? -Infinity, last: timeOf(entry?.lastExtract) ?? -Infinity });
+  }
+  const older = (a, b) => (a === b ? 0 : a - b);
+  if (named.length === 0) list.sort((x, y) => older(x.tried, y.tried) || older(x.last, y.last) || y.newest - x.newest || byName(x.scope, y.scope));
+  return list;
+}
 
 // Whether a scope's record in consolidate.json (or none) says it was never organized: it holds no
 // time of a last organize.

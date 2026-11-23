@@ -1,8 +1,10 @@
 // `run.sh consolidate report`: what consolidation did in a window of time, for a person or a
 // program. It reads the reports in the clone's `_reports/` (every machine's: the clone holds them
 // all), this machine's run log, the clone's scope folders with consolidate.json (the backlog of
-// Organize, judged by organizeDue, the rule Organize uses) and the labels of the notes with the
-// label step's record. Read-only: no network, no model, no lock, nothing written; it loads no AWS
+// Organize, judged by organizeDue, the rule Organize uses), this machine's conversation files (the
+// backlog of Extract, by its own selection; for a Codex session it asks `git` read-only which
+// repository its folder belongs to) and the labels of the notes with the label step's record.
+// Read-only: no network, no model, no lock, nothing written; it loads no AWS
 // code and no module of the label client. A file or a line it cannot read is named in `problems`
 // and left out, never fatal.
 
@@ -15,8 +17,10 @@ import { LABEL_STOPS, LEFT_WORDS, selectTouched } from './label-run.mjs';
 import { CHANGE_KINDS, REPORT_NAME_RE, REPORT_SCHEMA_VERSION, parseReport, shown, usd } from './reports.mjs';
 import { readRunLog } from './run-log.mjs';
 import {
-  GLOBAL, cloneProblem, listProjects, liveFolder, lstatOrNull, neverOrganized, organizeDue, scopeFolder, scopeInfo,
+  EXTRACT_MAX_WINDOW_MS, GLOBAL, cloneProblem, extractCandidates, listProjects, liveFolder, lstatOrNull, neverOrganized, organizeDue,
+  scopeFolder, scopeInfo, timeOf,
 } from './scopes.mjs';
+import { codexProjectSessions, projectSessionDirs } from './transcripts.mjs';
 import { readRegular } from './workdir.mjs';
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -348,6 +352,36 @@ function readBacklog(config, scopes, state, now, problems) {
   };
 }
 
+// Extract's backlog on this machine: the projects Extract would take now (extractCandidates, the
+// selection and order of a run), each with how many conversation files changed since the start of
+// its session window, where that starts and when Extract last read and last tried it. With an
+// Extract schedule, how many runs of maxProjects projects they take (`etaRuns`). Null, with a
+// problem, when this machine's Claude Code session folders cannot be read (a machine without them
+// has none).
+function readExtractBacklog(config, names, state, now, problems) {
+  const at = now.getTime();
+  const sessionsDir = typeof config.claudeDir === 'string' ? join(config.claudeDir, 'projects') : null;
+  try {
+    if (sessionsDir !== null && lstatOrNull(sessionsDir) !== null) readdirSync(sessionsDir);
+  } catch {
+    problems.push({ file: null, problem: "the Claude Code session folders cannot be read; the Extract backlog is unknown" });
+    return null;
+  }
+  const time = (value) => (timeOf(value) === null ? null : value);
+  const candidates = extractCandidates({
+    names, sessions: projectSessionDirs(config), codex: codexProjectSessions(config, { sinceMs: at - EXTRACT_MAX_WINDOW_MS, projects: names }), state, now: at,
+  });
+  const projects = candidates.map((p) => ({
+    scope: p.scope, files: p.files.length, windowStart: new Date(p.since).toISOString(),
+    lastExtract: time(state.projects[p.scope]?.lastExtract), lastExtractTried: time(state.projects[p.scope]?.lastExtractTried),
+  }));
+  const c = config.consolidate;
+  return {
+    projects, totals: { projects: projects.length, files: projects.reduce((n, p) => n + p.files, 0) },
+    maxProjects: c?.maxProjects ?? null, etaRuns: c?.extract ? Math.ceil(projects.length / c.maxProjects) : null,
+  };
+}
+
 // The labels of the clone's notes: how many carry each label and which carry none, how many the
 // next label run takes (notes the label step's record has no entry for, or that changed since),
 // and how many Organize must repair before the step can label them.
@@ -405,7 +439,9 @@ export function consolidationReport({ config, now, since }) {
     schemaVersion: REPORT_SCHEMA_VERSION, generatedAt: now.toISOString(), host: config.host, window,
     // The timers' calendar expressions and the parts of the consolidate block, as this machine has them.
     schedule: { extract: c?.extract ?? null, organize: c?.organize ?? null }, configured: { label: !!c?.label, agents: !!c?.agents },
-    reports, runs, backlog: readBacklog(config, scopes, state, now, problems), labels: readLabels(scopes, state, problems), problems,
+    reports, runs, backlog: readBacklog(config, scopes, state, now, problems),
+    extractBacklog: clone === null ? readExtractBacklog(config, scopes.filter((s) => s.name !== GLOBAL).map((s) => s.name), state, now, problems) : null,
+    labels: readLabels(scopes, state, problems), problems,
   };
 }
 
@@ -468,6 +504,15 @@ export function reportSummary(report) {
     + ` (${b.totals.neverOrganized} never organized, ${b.totals.overLimits} over the index limits)`;
   if (b.etaRuns !== null) backlog += `; about ${b.etaRuns} Organize run(s) of ${b.maxProjects} scope(s)`;
   lines.push(backlog);
+  const e = report.extractBacklog;
+  if (e === null) {
+    lines.push('Extract backlog: unknown (see the problems)');
+  } else {
+    let pending = `Extract backlog: ${e.totals.projects} project(s) with ${e.totals.files} conversation file(s) not yet read`;
+    if (e.projects.length > 0) pending += ` (${e.projects.map((p) => `${plain(p.scope)} ${p.files}`).join(', ')})`;
+    if (e.etaRuns !== null && e.etaRuns > 0) pending += `; about ${e.etaRuns} Extract run(s) of ${e.maxProjects} project(s)`;
+    lines.push(pending);
+  }
   const c = report.labels.counts;
   lines.push(`Labels: ${c.work} work, ${c.personal} personal, ${c.general} general, ${c.unlabeled} unlabeled;`
     + ` ${report.labels.pending} note(s) for the next label run`);
