@@ -815,6 +815,55 @@ test('F3: with lastExtract 60 days ago, only the last 28 days are read', (t) => 
   assert.doesNotMatch(call.digest, /FORTY-DAYS-AGO/);
 });
 
+test('extract --since reads named projects again from an earlier start, never more than 28 days back', (t) => {
+  const f = extractFixture(t);
+  // The file last changed two days ago: before the last Extract, after the start --since gives.
+  f.typedSession('-work-q', 'h', [['FORTY-DAYS-AGO question', 40 * DAY_MS], ['TEN-DAYS-AGO question', 10 * DAY_MS], ['TWO-DAYS-AGO question', 2 * DAY_MS]], 2 * DAY_MS);
+  mkdirSync(f.state, { recursive: true });
+  const lastExtract = (ageMs) => writeFileSync(f.stateFile(), JSON.stringify({ projects: { h: { lastExtract: new Date(Date.now() - ageMs).toISOString() } } }));
+  // Extracted a day ago: without --since this session has nothing left to read.
+  lastExtract(DAY_MS);
+  assert.match(f.run('extract', '--project', 'h').stdout, /^extract h: no-session/m);
+  let r = f.run('extract', '--project', 'h', '--since', new Date(Date.now() - 12 * DAY_MS).toISOString());
+  assert.equal(r.status, 0, r.stderr);
+  let calls = f.calls();
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].digest, /TEN-DAYS-AGO[\s\S]*TWO-DAYS-AGO/);
+  assert.doesNotMatch(calls[0].digest, /FORTY-DAYS-AGO/);
+  // A day as the start: 00:00 UTC, and still at most 28 days back.
+  r = f.run('extract', '--project', 'h', '--since', new Date(Date.now() - 60 * DAY_MS).toISOString().slice(0, 10));
+  assert.equal(r.status, 0, r.stderr);
+  calls = f.calls();
+  assert.match(calls[1].digest, /TEN-DAYS-AGO/);
+  assert.doesNotMatch(calls[1].digest, /FORTY-DAYS-AGO/);
+  // A start later than the usual one never moves the window forward: what it has not read stays in it.
+  lastExtract(20 * DAY_MS);
+  r = f.run('extract', '--project', 'h', '--since', new Date(Date.now() - 3 * DAY_MS).toISOString());
+  assert.equal(r.status, 0, r.stderr);
+  calls = f.calls();
+  assert.match(calls[2].digest, /TEN-DAYS-AGO[\s\S]*TWO-DAYS-AGO/);
+});
+
+test('--since belongs to an Extract of named projects and takes a day or a time with its offset, not after now', (t) => {
+  const f = extractFixture(t);
+  const later = new Date(Date.now() + DAY_MS).toISOString();
+  for (const args of [
+    ['extract', '--since', '2026-11-01'],
+    ['organize', '--project', 'p', '--since', '2026-11-01'],
+    ['extract', '--project', 'h', '--since'],
+    ['extract', '--project', 'h', '--since', 'yesterday'],
+    ['extract', '--project', 'h', '--since', '2026-02-30'],
+    ['extract', '--project', 'h', '--since', '2026-11-01T10:00'],
+    ['extract', '--project', 'h', '--since', later],
+    ['extract', '--project', 'h', '--since', '2026-11-01', '--since', '2026-11-02'],
+  ]) {
+    const r = f.run(...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /^usage: run\.sh consolidate extract\|organize/m);
+  }
+  assert.deepEqual(f.calls(), []);
+});
+
 test('F3: a cut digest is shown in the headline, the report and lastOutcome; a whole one too', (t) => {
   const f = extractFixture(t);
   const turns = Array.from({ length: 40 }, (_, i) => [`turn ${i} ${'x'.repeat(600)}`, (50 - i) * 60 * 1000]);
@@ -2463,18 +2512,38 @@ test('a run that crashes adds its line too, with a fixed word for the failure', 
   assert.doesNotMatch(JSON.stringify(line), /EEXIST|ENOTDIR|not a folder/);
 });
 
-test('the JSON twin is written before its report: when the twin cannot be written, the report is not either', (t) => {
+test('a report name already taken today, by a report or by anything else, is never reused: the run writes the next free one', (t) => {
   const f = fixture(t);
   duplicateProject(f);
-  // A folder where today's twin would go: the twin cannot be written there.
-  f.seed({ [`_reports/${today()}-alpha-organize-p.json/x`]: 'not a twin\n' });
+  // A folder where today's twin would go, and an earlier run's report of the day under the next name.
+  f.seed({
+    [`_reports/${today()}-alpha-organize-p.json/x`]: 'not a twin\n',
+    [`_reports/${today()}-alpha-organize-p-2.md`]: 'an earlier report\n',
+  });
   f.instruct(mergeInstruction());
   const r = f.run('organize');
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^organize p: applied, 3 change\(s\)/m);
-  assert.match(r.stdout, new RegExp(`^ {2}- the report could not be written: _reports/${today()}-alpha-organize-p\\.json is not a regular file$`, 'm'));
-  // No report without its twin, so that no twin of an earlier run of the day is paired with a new report.
-  assert.equal(existsSync(join(f.repo, `_reports/${today()}-alpha-organize-p.md`)), false);
+  assert.doesNotMatch(r.stdout, /the report could not be written/);
+  assert.equal(liveText(f, `_reports/${today()}-alpha-organize-p-2.md`), 'an earlier report\n');
+  assert.equal(f.reportJson(`${today()}-alpha-organize-p-3.json`).scope, 'p');
+  assert.match(liveText(f, `_reports/${today()}-alpha-organize-p-3.md`), /^# Organize p — /);
+});
+
+test('a second run of the same day keeps the first run\'s report and twin and writes its own beside them', (t) => {
+  const f = fixture(t);
+  duplicateProject(f);
+  f.instruct(mergeInstruction());
+  assert.equal(f.run('organize').status, 0);
+  const first = liveText(f, `_reports/${today()}-alpha-organize-p.md`);
+  f.seed({ 'projects/p/d.md': note('d', 'D', 'Delta.') });
+  f.instruct({ p: { writes: { 'notes/MEMORY.md': index('a.md', 'd.md'), 'notes/d.md': note('d', 'Delta notes', 'Delta.') } } });
+  const r = f.run('organize', '--project', 'p');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(liveText(f, `_reports/${today()}-alpha-organize-p.md`), first);
+  assert.equal(f.reportJson(`${today()}-alpha-organize-p.json`).scope, 'p');
+  assert.equal(f.reportJson(`${today()}-alpha-organize-p-2.json`).scope, 'p');
+  assert.ok(existsSync(join(f.repo, `_reports/${today()}-alpha-organize-p-2.md`)));
 });
 
 test('a run log that cannot be written leaves the run and its exit code as they were, and says so', (t) => {
@@ -2687,15 +2756,16 @@ test('label-apply names a note it cannot edit', (t) => {
   assert.equal(f.subjects()[0], 'consolidate(alpha): label 1 note(s) (3 file(s))');
 });
 
-test('label-apply writes the twin before the report: when the twin cannot be written, the report is not either', (t) => {
+test('label-apply never reuses a report name taken today: it writes the next free one', (t) => {
   const f = fixture(t);
   f.seed({ [`_reports/${today()}-alpha-label.json/x`]: 'not a twin\n', 'projects/p/b.md': note('b', 'B', 'Beta.') });
   const { work, notes } = labelRead(f);
   const r = labelApply(f, work, writeLabelPlan(work, { entries: [entryFor(notes, 'projects/p/b.md', 'work')], report: '# Labels\n' }));
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.result.outcome, 'applied');
-  assert.equal(r.result.reportError, `_reports/${today()}-alpha-label.json is not a regular file`);
-  assert.equal(existsSync(join(f.repo, `_reports/${today()}-alpha-label.md`)), false);
+  assert.equal(r.result.reportError, null);
+  assert.equal(f.reportJson(`${today()}-alpha-label-2.json`).written, 1);
+  assert.match(liveText(f, `_reports/${today()}-alpha-label-2.md`), /^# Labels/);
   assert.equal(liveText(f, 'projects/p/b.md'), labeledNote('b', 'B', 'Beta.', 'work'));
 });
 
@@ -2897,7 +2967,7 @@ function labelFixture(t, { label = {}, consolidate = {}, domains = NO_EXCEPTIONS
     requests: () => (existsSync(mantleLog) ? readFileSync(mantleLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []),
     label: (...args) => f.runWith(labelEnv, 'label', ...args),
     organize: (...args) => f.runWith(labelEnv, 'organize', ...args),
-    labelReport: () => liveText(f, `_reports/${today()}-alpha-label.md`),
+    labelReport: (suffix = '') => liveText(f, `_reports/${today()}-alpha-label${suffix}.md`),
   };
 }
 
@@ -3013,9 +3083,10 @@ test('an edited note is sent again', (t) => {
   assert.equal(liveText(f, 'projects/p/a.md'), labeledNote('a', 'A', 'Alpha, now about the family.', 'personal'));
   // The record follows: the new digest of a.md, and no entry for the note that is gone.
   assert.deepEqual(f.readState().labels.notes, { 'projects/p/a.md': digestIn(f, 'projects/p/a.md') });
-  // --model names the label model of this run.
-  assert.match(f.labelReport(), /^- Model: other-label-model; requests: 1;/m);
-  assert.match(f.labelReport(), /^- projects\/p\/a\.md: work → personal — fake reason for projects\/p\/a\.md$/m);
+  // --model names the label model of this run, whose report is the day's second: the first one stays.
+  assert.match(f.labelReport(), /^- Model: example-label-model; requests: 1;/m);
+  assert.match(f.labelReport('-2'), /^- Model: other-label-model; requests: 1;/m);
+  assert.match(f.labelReport('-2'), /^- projects\/p\/a\.md: work → personal — fake reason for projects\/p\/a\.md$/m);
 });
 
 test('label --all sends every note', (t) => {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../lib/config.mjs';
@@ -239,6 +239,74 @@ test('--format md gives a short summary of the same report', (t) => {
   assert.match(plain, /^Schedule: Extract none, Organize none; neither the label step nor the agent scopes are configured$/m);
   const json = g.json();
   assert.deepEqual([json.backlog.etaRuns, json.schedule, json.configured], [null, { extract: null, organize: null }, { label: false, agents: false }]);
+});
+
+test('the Extract backlog: project folders with conversation files changed since their window start, the one tried longest ago first', (t) => {
+  const f = reportFixture(t);
+  // A Claude Code folder whose memory links to a project folder, with conversation files `daysAgo` old.
+  const folder = (slug, project, files) => {
+    const dir = join(f.tmp, 'claude', 'projects', slug);
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(join(f.repo, 'projects', project), join(dir, 'memory'));
+    for (const [name, daysAgo] of files) {
+      writeFileSync(join(dir, name), '{}\n');
+      const time = (Date.now() - daysAgo * DAY_MS) / 1000;
+      utimesSync(join(dir, name), time, time);
+    }
+  };
+  folder('-work-kept', 'kept', [['k1.jsonl', 1], ['k2.jsonl', 2], ['k0.jsonl', 9], ['notes.txt', 1]]);
+  folder('-work-big', 'big', [['b1.jsonl', 0.5]]);
+  // Never extracted: its window is the last 7 days, so a file of 10 days ago is not in it.
+  folder('-work-example', 'example-project', [['e1.jsonl', 10]]);
+  const state = JSON.parse(readFileSync(join(f.state, 'consolidate.json'), 'utf8'));
+  state.projects.kept = { ...state.projects.kept, lastExtract: at(3), lastExtractTried: at(3) };
+  writeFileSync(join(f.state, 'consolidate.json'), JSON.stringify(state));
+  const report = f.json();
+  const e = report.extractBacklog;
+  assert.deepEqual(e.projects, [
+    { scope: 'big', files: 1, windowStart: e.projects[0].windowStart, lastExtract: null, lastExtractTried: null },
+    { scope: 'kept', files: 2, windowStart: state.projects.kept.lastExtract, lastExtract: state.projects.kept.lastExtract, lastExtractTried: state.projects.kept.lastExtractTried },
+  ]);
+  assert.ok(Math.abs(Date.parse(e.projects[0].windowStart) - (Date.parse(report.generatedAt) - 7 * DAY_MS)) < 1000);
+  assert.deepEqual([e.totals, e.maxProjects, e.etaRuns], [{ projects: 2, files: 3 }, 2, 1]);
+  assert.match(f.report().stdout,
+    /^Extract backlog: 2 project\(s\) with 3 conversation file\(s\) not yet read \(big 1, kept 2\); about 1 Extract run\(s\) of 2 project\(s\)$/m);
+  // Without an Extract schedule there is no estimate; without conversation files the backlog is empty.
+  const g = reportFixture(t, { extract: null });
+  assert.deepEqual(g.json().extractBacklog, { projects: [], totals: { projects: 0, files: 0 }, maxProjects: 2, etaRuns: null });
+  assert.match(g.report().stdout, /^Extract backlog: 0 project\(s\) with 0 conversation file\(s\) not yet read$/m);
+});
+
+test('the Extract backlog is in the order of a run: never tried first, then extracted longest ago, then the newest session', (t) => {
+  const f = reportFixture(t);
+  const folder = (slug, project, daysAgo) => {
+    const dir = join(f.tmp, 'claude', 'projects', slug);
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(join(f.repo, 'projects', project), join(dir, 'memory'));
+    writeFileSync(join(dir, 's.jsonl'), '{}\n');
+    const time = (Date.now() - daysAgo * DAY_MS) / 1000;
+    utimesSync(join(dir, 's.jsonl'), time, time);
+  };
+  // None was tried (a no-session run sets lastExtract only); kept was extracted longest ago; of the
+  // two never extracted, big has the newer session.
+  folder('-work-kept', 'kept', 1);
+  folder('-work-big', 'big', 0.5);
+  folder('-work-example', 'example-project', 2);
+  const state = JSON.parse(readFileSync(join(f.state, 'consolidate.json'), 'utf8'));
+  state.projects.kept = { ...state.projects.kept, lastExtract: at(5) };
+  writeFileSync(join(f.state, 'consolidate.json'), JSON.stringify(state));
+  assert.deepEqual(f.json().extractBacklog.projects.map((p) => p.scope), ['big', 'example-project', 'kept']);
+});
+
+test('the Extract backlog is unknown, with a problem, when the Claude Code session folders cannot be read', (t) => {
+  const f = reportFixture(t);
+  // A file where the folder of session folders should be: it exists, and cannot be listed.
+  mkdirSync(join(f.tmp, 'claude'), { recursive: true });
+  writeFileSync(join(f.tmp, 'claude', 'projects'), 'not a folder\n');
+  const report = f.json();
+  assert.equal(report.extractBacklog, null);
+  assert.ok(report.problems.some((p) => p.file === null && /Claude Code session folders cannot be read/.test(p.problem)), JSON.stringify(report.problems));
+  assert.match(f.report().stdout, /^Extract backlog: unknown \(see the problems\)$/m);
 });
 
 test('consolidate report writes nothing, takes no lock and runs while a consolidation holds its lock', async (t) => {
